@@ -1,0 +1,52 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging and virtualenv
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local development databases. There is no migration path: a database from an
+# older schema version is deleted and recreated, so it is never shared.
+*.db
+*.db-wal
+*.db-shm
+ai/
+
+# 环境变量 / 密钥（最重要！）[5][8]
+.env
+.env.*
+!.env.example
+
+# 测试覆盖率
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+.tox/
+.nox/
+
+# 日志与临时文件
+*.log
+*.tmp
+*.temp
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+
+# IDE（可选：团队共享可保留 .vscode 部分配置）
+.idea/
+*.swp
+*.swo
+
+# 打包残留
+*.egg
+.Python

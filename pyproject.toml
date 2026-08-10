@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prp-runtime"
+version = "0.0.1"
+description = "Progressive Reasoning Protocol reference runtime"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE"]
+authors = [{ name = "PRP Runtime Authors" }]
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "pydantic>=2.9,<3.0",
+    "httpx>=0.27,<1.0",
+    "aiosqlite>=0.20,<1.0",
+    "uvicorn>=0.30,<1.0",
+    "jsonschema>=4.23,<5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "respx>=0.21,<1.0",
+    "ruff>=0.6,<1.0",
+    "mypy>=1.11,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/prp-runtime/prp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prp_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+files = ["src/prp_runtime"]
+python_version = "3.12"
+strict = true
+
+# jsonschema 4.x ships no py.typed marker, so strict mode cannot see its types.
+# The alternative to this override is a hand written schema validator, which is
+# what the repair removed: a checker that silently skips the keyword it was never
+# taught reports an unapplied constraint as satisfied.
+[[tool.mypy.overrides]]
+module = "jsonschema.*"
+ignore_missing_imports = true
