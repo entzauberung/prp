@@ -105,6 +105,7 @@ async def test_restart_marks_in_flight_attempts_interrupted(database_path: Path)
         report = await recover_after_restart(store)
         assert report.changed is True
         assert report.interrupted_attempt_ids == (attempt.attempt_id,)
+        assert report.failed_work_unit_ids == (unit.work_unit_id,)
         assert report.affected_run_ids == (run.run_id,)
 
         recovered = await store.get_attempt(attempt.attempt_id)
@@ -115,22 +116,28 @@ async def test_restart_marks_in_flight_attempts_interrupted(database_path: Path)
         assert recovered.usage is None
 
         events = await store.list_events(run.run_id, after_sequence=sequence_before)
-        assert len(events) == 1
+        assert len(events) == 2
         assert events[0].event_type is EventType.ATTEMPT_INTERRUPTED
         assert events[0].payload == {
             "work_unit_id": unit.work_unit_id,
             "attempt_id": attempt.attempt_id,
             "reason": RECOVERY_REASON,
         }
+        assert events[1].event_type is EventType.WORK_UNIT_FAILED
+        assert events[1].payload["work_unit_id"] == unit.work_unit_id
+        assert events[1].payload["error"] == {
+            "category": ErrorCategory.UNKNOWN.value,
+            "message": "process restart interrupted an in-flight attempt",
+        }
 
 
 @pytest.mark.asyncio
-async def test_restart_keeps_run_and_work_unit_diagnosable(database_path: Path) -> None:
+async def test_restart_fails_running_unit_without_settling_run(database_path: Path) -> None:
     async with SqliteStore(database_path) as store:
         run, unit, _ = await build_running_run(store)
         await recover_after_restart(store)
         assert (await store.get_run(run.run_id)).status is RunStatus.RUNNING
-        assert (await store.get_work_unit(unit.work_unit_id)).status is WorkUnitStatus.RUNNING
+        assert (await store.get_work_unit(unit.work_unit_id)).status is WorkUnitStatus.FAILED
         assert (await store.get_run(run.run_id)).error is None
 
 
@@ -152,6 +159,12 @@ async def test_recovery_is_idempotent(database_path: Path) -> None:
             if event.event_type is EventType.ATTEMPT_INTERRUPTED
         ]
         assert len(interrupted_events) == 1
+        failed_events = [
+            event
+            for event in await store.list_events(run.run_id)
+            if event.event_type is EventType.WORK_UNIT_FAILED
+        ]
+        assert len(failed_events) == 1
 
 
 @pytest.mark.asyncio
@@ -218,6 +231,8 @@ async def test_recovery_does_not_touch_completed_entities(database_path: Path) -
         report = await recover_after_restart(store)
 
         assert report.interrupted_attempt_ids == (running.attempt_id,)
+        assert report.failed_work_unit_ids == (unit.work_unit_id,)
+        assert (await store.get_work_unit(unit.work_unit_id)).status is WorkUnitStatus.FAILED
         assert await store.get_attempt(succeeded.attempt_id) == succeeded
         assert await store.get_attempt(failed.attempt_id) == failed
         assert (await store.get_attempt(pending.attempt_id)).status is AttemptStatus.PENDING
@@ -252,6 +267,14 @@ async def test_recovery_spans_multiple_runs_without_duplicate_sequences(
                 )
                 == expected_interrupted
             )
+            assert (
+                sum(
+                    1
+                    for event in ledger
+                    if event.event_type is EventType.WORK_UNIT_FAILED
+                )
+                == 1
+            )
 
 
 @pytest.mark.asyncio
@@ -277,6 +300,8 @@ async def test_recovery_is_atomic_when_an_event_append_fails(
 
         for attempt in attempts:
             assert (await store.get_attempt(attempt.attempt_id)).status is AttemptStatus.RUNNING
+        unit_id = attempts[0].work_unit_id
+        assert (await store.get_work_unit(unit_id)).status is WorkUnitStatus.RUNNING
         assert await store.last_sequence(run.run_id) == sequence_before
 
 
@@ -317,7 +342,10 @@ async def test_a_reconnecting_subscriber_resumes_from_its_cursor(
         assert await store.list_events(run.run_id, after_sequence=cursor) == ()
         await recover_after_restart(store)
         fresh = await store.list_events(run.run_id, after_sequence=cursor)
-        assert [event.event_type for event in fresh] == [EventType.ATTEMPT_INTERRUPTED]
+        assert [event.event_type for event in fresh] == [
+            EventType.ATTEMPT_INTERRUPTED,
+            EventType.WORK_UNIT_FAILED,
+        ]
         assert fresh[0].sequence == cursor + 1
         assert await store.list_events(run.run_id, after_sequence=fresh[-1].sequence) == ()
 

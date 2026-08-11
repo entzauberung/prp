@@ -1,0 +1,6 @@
+{
+  "system": "return a concise text answer",
+  "messages": [
+    {"role": "user", "content": "fixture messages request"}
+  ]
+}

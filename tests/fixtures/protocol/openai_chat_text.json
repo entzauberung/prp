@@ -1,0 +1,6 @@
+{
+  "messages": [
+    {"role": "system", "content": "return a concise text answer"},
+    {"role": "user", "content": "fixture chat request"}
+  ]
+}

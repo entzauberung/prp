@@ -224,11 +224,20 @@ def test_adapter_protocol_matches_a_minimal_implementation() -> None:
 def test_settings_hold_optional_leader_and_worker_profiles() -> None:
     settings = Settings()
     assert settings.profiles == ()
-    configured = Settings(leader_profile=leader_profile(), worker_profile=worker_profile())
-    assert [profile.alias for profile in configured.profiles] == ["leader", "worker"]
+    configured = Settings(
+        leader_profile=leader_profile(),
+        worker_profile=worker_profile(),
+        cascade_profiles=(worker_profile(alias="worker-large"),),
+    )
+    assert [profile.alias for profile in configured.profiles] == [
+        "leader",
+        "worker",
+        "worker-large",
+    ]
     assert configured.require_profile(ModelRole.PLANNER).model == "strong-model"
     assert configured.require_profile(ModelRole.WORKER).model == "weak-model"
     assert configured.profile_by_alias("worker").alias == "worker"
+    assert configured.profile_by_alias("worker-large").alias == "worker-large"
 
 
 def test_settings_reject_a_role_mismatch_and_duplicate_alias() -> None:
@@ -240,6 +249,18 @@ def test_settings_reject_a_role_mismatch_and_duplicate_alias() -> None:
         Settings(
             leader_profile=leader_profile(alias="same"),
             worker_profile=worker_profile(alias="same"),
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            worker_profile=worker_profile(alias="same"),
+            cascade_profiles=(worker_profile(alias="same"),),
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            cascade_profiles=(
+                worker_profile(alias="same"),
+                worker_profile(alias="same"),
+            )
         )
 
 

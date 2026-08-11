@@ -2,8 +2,9 @@
 
 A process restart leaves attempts that were in flight. Their upstream outcome
 cannot be proven, so they become ``INTERRUPTED`` instead of succeeded or failed.
-Runs and work units keep their status so the state stays diagnosable, and a
-completed entity is never rewritten.
+The corresponding running work unit becomes ``FAILED`` so a committed graph can
+propagate the interruption instead of waiting forever. Completed entities are
+never rewritten.
 
 Recovery is idempotent: a second scan finds nothing in flight and appends no
 further events.
@@ -11,22 +12,27 @@ further events.
 
 from pydantic import Field
 
-from prp_runtime.domain.enums import AttemptStatus
+from prp_runtime.domain.enums import AttemptStatus, WorkUnitStatus
 from prp_runtime.domain.events import EventType
-from prp_runtime.domain.models import Attempt, DomainModel
-from prp_runtime.domain.transitions import recover_attempt_on_restart
+from prp_runtime.domain.models import Attempt, DomainModel, ErrorCategory, ErrorInfo, WorkUnit
+from prp_runtime.domain.transitions import recover_attempt_on_restart, transition_work_unit
 from prp_runtime.domain.values import UtcTimestamp, utc_now
 from prp_runtime.storage.sqlite import SqliteStore
 
 __all__ = ["RECOVERY_REASON", "RecoveryReport", "recover_after_restart"]
 
 RECOVERY_REASON = "process_restart"
+RECOVERY_ERROR = ErrorInfo(
+    category=ErrorCategory.UNKNOWN,
+    message="process restart interrupted an in-flight attempt",
+)
 
 
 class RecoveryReport(DomainModel):
     """What one startup scan changed."""
 
     interrupted_attempt_ids: tuple[str, ...] = ()
+    failed_work_unit_ids: tuple[str, ...] = ()
     affected_run_ids: tuple[str, ...] = ()
     scanned_at: UtcTimestamp = Field(default_factory=utc_now)
 
@@ -47,7 +53,9 @@ async def recover_after_restart(store: SqliteStore) -> RecoveryReport:
 
     recovered_at = utc_now()
     interrupted: list[str] = []
+    failed_work_units: list[str] = []
     affected_runs: list[str] = []
+    running_units: dict[str, WorkUnit] = {}
     async with store.transaction():
         for attempt in in_flight:
             status = recover_attempt_on_restart(attempt.status)
@@ -73,9 +81,35 @@ async def recover_after_restart(store: SqliteStore) -> RecoveryReport:
             interrupted.append(attempt.attempt_id)
             if attempt.run_id not in affected_runs:
                 affected_runs.append(attempt.run_id)
+            if attempt.work_unit_id not in running_units:
+                unit = await store.get_work_unit(attempt.work_unit_id)
+                if unit.status is WorkUnitStatus.RUNNING:
+                    running_units[unit.work_unit_id] = unit
+
+        for unit in running_units.values():
+            failed = WorkUnit.model_validate(
+                unit.model_dump()
+                | {
+                    "status": transition_work_unit(
+                        unit.status, WorkUnitStatus.FAILED
+                    )
+                }
+            )
+            await store.update_work_unit(failed)
+            await store.append_event(
+                unit.run_id,
+                EventType.WORK_UNIT_FAILED,
+                {
+                    "work_unit_id": unit.work_unit_id,
+                    "error": RECOVERY_ERROR.model_dump(mode="json"),
+                },
+                timestamp=recovered_at,
+            )
+            failed_work_units.append(unit.work_unit_id)
 
     return RecoveryReport(
         interrupted_attempt_ids=tuple(interrupted),
+        failed_work_unit_ids=tuple(failed_work_units),
         affected_run_ids=tuple(affected_runs),
         scanned_at=recovered_at,
     )

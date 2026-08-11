@@ -59,6 +59,7 @@ MINIMAL_PAYLOADS: dict[str, object] = {
     "to_strategy": "CASCADE",
     "decision": {"action": "CANCEL"},
     "graph_version": 1,
+    "work_unit_ids": [WORK_UNIT_ID],
     "reason": "because",
     "work_unit_id": WORK_UNIT_ID,
     "attempt_id": ATTEMPT_ID,
@@ -240,6 +241,19 @@ def test_the_evidence_event_rejects_a_payload_without_a_verdict() -> None:
             sequence=1,
             event_type=EventType.EVIDENCE_RECORDED,
             payload={"work_unit_id": WORK_UNIT_ID, "evidence_id": "ev_1"},
+            timestamp=T0,
+        )
+
+
+def test_strategy_escalation_requires_an_auditable_reason() -> None:
+    required = EVENT_REQUIRED_KEYS[EventType.STRATEGY_ESCALATED]
+    assert {"from_strategy", "to_strategy", "reason"} <= required
+    with pytest.raises(ValidationError, match="reason"):
+        RunEvent(
+            run_id=RUN_ID,
+            sequence=1,
+            event_type=EventType.STRATEGY_ESCALATED,
+            payload={"from_strategy": "DIRECT", "to_strategy": "CASCADE"},
             timestamp=T0,
         )
 

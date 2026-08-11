@@ -426,6 +426,34 @@ class SqliteStore:
 
     # --- work units -------------------------------------------------------------
 
+    async def create_graph(self, work_units: Sequence[WorkUnit]) -> None:
+        """Atomically insert one complete same-run, same-version dependency graph."""
+        if not work_units:
+            raise StateError(
+                "a work graph must contain at least one work unit",
+                code=ErrorCode.ILLEGAL_STATE_TRANSITION,
+            )
+        run_ids = {unit.run_id for unit in work_units}
+        versions = {unit.graph_version for unit in work_units}
+        if len(run_ids) != 1 or len(versions) != 1:
+            raise StateError(
+                "a work graph must use one run_id and graph_version",
+                code=ErrorCode.ILLEGAL_STATE_TRANSITION,
+            )
+        work_unit_ids = {unit.work_unit_id for unit in work_units}
+        if len(work_unit_ids) != len(work_units):
+            raise DuplicateEntityError(
+                "a work graph contains duplicate work unit ids",
+                code=ErrorCode.ILLEGAL_STATE_TRANSITION,
+            )
+        for unit in work_units:
+            if not set(unit.depends_on) <= work_unit_ids:
+                raise DanglingReferenceError(
+                    "a work graph dependency points outside the graph",
+                    code=ErrorCode.ILLEGAL_STATE_TRANSITION,
+                )
+        await self.create_work_units(work_units)
+
     async def create_work_units(self, work_units: Sequence[WorkUnit]) -> None:
         """Insert work units and their edges as one graph commit."""
         async with self.transaction():

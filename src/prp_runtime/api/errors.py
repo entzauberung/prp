@@ -12,12 +12,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from prp_runtime.domain.errors import ErrorCode, ErrorDetail, ErrorFamily, PrpError
+from prp_runtime.domain.errors import (
+    DomainValidationError,
+    ErrorCode,
+    ErrorDetail,
+    ErrorFamily,
+    ProtocolError,
+    PrpError,
+)
 
 __all__ = [
     "STATUS_BY_CODE",
     "STATUS_BY_FAMILY",
     "ErrorResponse",
+    "binding_error",
     "error_response",
     "install_error_handlers",
     "status_for",
@@ -52,6 +60,28 @@ class ErrorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     error: ErrorDetail
+
+
+def binding_error(
+    code: ErrorCode,
+    message: str,
+    *,
+    field: str | None = None,
+) -> PrpError:
+    """Build a client-safe error for an inbound binding failure.
+
+    Bindings use this narrow factory so protocol limitations and invalid native
+    values retain their stable family/code mapping without exposing parser detail.
+    """
+    family = ErrorFamily.PROTOCOL if code in {
+        ErrorCode.UNSUPPORTED_FIELD,
+        ErrorCode.UNSUPPORTED_MODALITY,
+        ErrorCode.UNSUPPORTED_TOOLS,
+        ErrorCode.UNSUPPORTED_STREAM_MODE,
+    } else ErrorFamily.VALIDATION
+    if family is ErrorFamily.PROTOCOL:
+        return ProtocolError(message, code=code, field=field)
+    return DomainValidationError(message, code=code, field=field)
 
 
 def status_for(detail: ErrorDetail) -> int:

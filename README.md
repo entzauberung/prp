@@ -1,10 +1,49 @@
 # PRP Runtime
 
-Progressive Reasoning Protocol 的参考运行时。当前版本 `0.0.1`，处于 pre-0.1 开发期。
+Progressive Reasoning Protocol 的参考运行时。实现里程碑覆盖 v0.0.1-v0.0.4，包版本当前为 `0.0.1`。
 
-下面的“已实现”一节严格对应仓库中已通过测试的能力；“目标”一节描述蓝图范围，尚未实现。
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
+[![Implementation v0.0.4](https://img.shields.io/badge/implementation-v0.0.4-green)](https://github.com)
+[![Tests 1260 passed](https://img.shields.io/badge/tests-1260%20passed-green)](https://github.com)
+[![License MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache-2.0-orange)](https://github.com)
 
-## 已实现（v0.0.1）
+[简体中文](README.md) | [English](README.en.md)
+
+## 事实定位
+
+- **Package version**: `0.0.1`
+- **Implementation milestones**: `v0.0.1` - `v0.0.4`
+- 最近门禁验证：1260 tests passed (2026-08-11)
+
+PRP Runtime 是确定性执行控制层，统一管理模型调用之上的 Run、WorkUnit、Attempt、Artifact、Evidence、Event 等持久化工作流，提供 AUTO/MANUAL 路由策略。
+
+## 架构与运行链路
+
+```mermaid
+graph TD
+    A[Inbound APIs] --> B[NativeRunRequest]
+    B --> C[AUTO/MANUAL Router]
+    C --> D[RunController]
+    D --> E[Planner / Worker / Verifier]
+    E --> F[SQLite Ledger]
+    F --> G[Result / Event Replay]
+    G --> H[Final Result]
+```
+
+### 四策略说明
+
+| 策略 | 何时使用 | 做什么 |
+|------|----------|--------|
+| DIRECT | 简单请求 | 单 WorkUnit、单 Attempt；Worker 返回 Artifact 后执行 RuleVerifier |
+| CASCADE | 需要分层 | 按 profile 链条执行，逐层验证 |
+| PLANNED | 需要图调度 | 编译执行图，Planner 提出计划，Worker 执行 |
+| PROGRESSIVE | 需要证据 | 逐步推进，Verifier 做确定性校验和预算控制；失败后调用 Planner revise |
+
+### 运行链路
+
+一次请求流经：4 个入站绑定（PRP Native、OpenAI Responses、OpenAI Chat Completions、Anthropic Messages） -> Router 路由 -> RunController 决定策略和启动 -> Planner/Worker/Verifier 执行持久化到 SQLite Ledger -> 追加事件回放 -> 最终结果。
+
+## 配置
 
 - **PRP Native API**
   - `POST /v1/runs`：接受 `NativeRunRequest`（文本输入），创建并执行一个 Run，返回终态与结果。
@@ -12,17 +51,11 @@ Progressive Reasoning Protocol 的参考运行时。当前版本 `0.0.1`，处�
   - `POST /v1/runs/{run_id}/cancel`：请求取消；取消后不再创建新 Attempt；对终态 Run 无副作用。
   - `GET /v1/runs/{run_id}/events`：以 SSE 从持久账本**回放**事件，支持 `Last-Event-ID` 与 `?after=` 游标续读。
   - `GET /health`：仅报告进程存活，不检查数据库或上游。
-- **执行策略**：仅 `DIRECT`（单 WorkUnit、单 Attempt，不调用 Planner 或 Verifier）。`AUTO` 路由当前一律选择 `DIRECT` 并记录理由；显式请求 `CASCADE`/`PLANNED`/`PROGRESSIVE` 返回结构化 400，不静默降级。
+- **执行策略**：支持 `DIRECT`、`CASCADE`、`PLANNED`、`PROGRESSIVE` 以及 AUTO 路由。`AUTO` 路由根据请求动态选择策略并记录理由。
 - **持久化**：单一 SQLite schema（`runs`/`work_units`/`attempts`/`artifacts`/`evidence`/`events` 等 8 张表），外键与 WAL 开启；Run 内事件 `sequence` 单调唯一；状态变更与事件同事务提交。
 - **重启恢复**：进程启动时把仍处于 `RUNNING` 的 Attempt 标记为 `INTERRUPTED`（不假定成功或失败），Run 与 WorkUnit 状态保持可诊断。
 - **出站 Provider**：一个 OpenAI-compatible 文本适配器（Chat Completions 形状），归一化 usage、finish reason 与错误分类；上游未报告 token 时记为不可用而不猜测。
 - **错误契约**：稳定 `code` + `family` + `retryable`，响应体不含堆栈、内部路径或凭据。
-
-### 尚未实现
-
-CASCADE / PLANNED / PROGRESSIVE 策略、Planner 与 Verifier、预算强制、图调度与并行、OpenAI 与 Anthropic 入站绑定、结构化输出的模式校验、流式出站调用。
-
-## 配置
 
 全部配置来自服务端环境变量，前缀 `PRP_`；未识别的 `PRP_` 变量会直接报错而不是被忽略。
 
@@ -34,6 +67,7 @@ CASCADE / PLANNED / PROGRESSIVE 策略、Planner 与 Verifier、预算强制、�
 | `PRP_LOG_LEVEL` | `INFO` | 日志级别 |
 | `PRP_LEADER_PROFILE` | 无 | 强模型 profile（JSON，`role` 必须为 `PLANNER`） |
 | `PRP_WORKER_PROFILE` | 无 | 执行模型 profile（JSON，`role` 必须为 `WORKER`） |
+| `PRP_CASCADE_PROFILES` | 无 | CASCADE 策略使用的 profile 数组 |
 
 模型 profile 示例（`base_url` 与 `api_key` **只能**来自服务端配置，请求不得携带）：
 
@@ -43,7 +77,7 @@ CASCADE / PLANNED / PROGRESSIVE 策略、Planner 与 Verifier、预算强制、�
   "provider": "openai_compatible",
   "model": "your-model-id",
   "role": "WORKER",
-  "base_url": "https://your-endpoint/v1",
+  "base_url": "https://models.example.invalid/v1",
   "api_key": "...",
   "context_window_tokens": 32000,
   "max_output_tokens": 4000
@@ -77,19 +111,63 @@ CASCADE / PLANNED / PROGRESSIVE 策略、Planner 与 Verifier、预算强制、�
 
 各阶段的“完成”指目标特性完成，不代表生产 SLA 或稳定性承诺。
 
-## 开发入口
+## 快速开始
 
-查看包身份信息：
+### 前置条件
+- Python 3.12+ 或 uv 工具链
+- 克隆仓库并依赖安装（详见 `pyproject.toml`）
 
-```bash
-python3 -m prp_runtime
+### 最小 ASGI 示例
+创建 `server.py`：
+
+```python
+from prp_runtime.settings import Settings
+from prp_runtime.app import create_app
+
+settings = Settings.from_env()
+app = create_app(settings)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 ```
 
-运行测试：
+运行：
+
+```bash
+uv run uvicorn server:app --reload
+```
+
+**配置安全边界**：所有 LLM profile（`base_url`、`api_key` 等）仅来自环境变量 `PRP_*`；示例使用 `models.example.invalid`。
+
+### API 概览
+- `POST /v1/runs`：PRP Native Run 创建与管理
+- `POST /v1/responses`：OpenAI Responses 兼容
+- `POST /v1/chat/completions`：OpenAI Chat Completions
+- `POST /v1/messages`：Anthropic Messages 兼容
+
+### 测试与验证
+定向示例（测试已实现路径）：
+
+```bash
+uv run pytest tests/unit/control/test_direct.py -q
+```
+
+全量门禁：
 
 ```bash
 uv run pytest -q
+uv run ruff check .
+uv run mypy src/prp_runtime
 ```
+
+测试仅覆盖已实现路径，禁止真实网络调用。
+
+### 项目边界
+- 非模型训练、微调或 GPU serving 平台
+- 无 MCP、A2A、Shell、浏览器或文件写入 Agent
+- 无多租户计费、SSO、分布式队列或 Kubernetes 编排
+- 无生产 SLA 或稳定性承诺
 
 ## 许可证
 

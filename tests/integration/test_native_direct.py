@@ -193,6 +193,16 @@ def test_manual_direct_is_accepted(client: TestClient) -> None:
     assert response.json()["strategy"] == ExecutionStrategy.DIRECT.value
 
 
+def test_native_auto_routing_intent_reaches_controller(client: TestClient) -> None:
+    response = client.post(
+        "/v1/runs",
+        json={"input": "hello", "routing": {"requires_cascade": True}},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["strategy"] == ExecutionStrategy.CASCADE.value
+
+
 def test_structured_output_round_trips(tmp_path: Path) -> None:
     adapter = FakeAdapter(_ok('{"ok": true}'))
     settings = Settings(
@@ -228,6 +238,7 @@ def test_events_replay_the_whole_ledger(client: TestClient) -> None:
     assert [record["event"] for record in records] == [
         EventType.RUN_CREATED.value,
         EventType.STRATEGY_SELECTED.value,
+        EventType.CONTROLLER_DECISION.value,
         EventType.RUN_STARTED.value,
         EventType.WORK_UNIT_CREATED.value,
         EventType.WORK_UNIT_READY.value,
@@ -236,6 +247,9 @@ def test_events_replay_the_whole_ledger(client: TestClient) -> None:
         EventType.ATTEMPT_SUCCEEDED.value,
         EventType.ARTIFACT_PRODUCED.value,
         EventType.USAGE_UPDATED.value,
+        EventType.EVIDENCE_RECORDED.value,
+        EventType.EVIDENCE_RECORDED.value,
+        EventType.CONTROLLER_DECISION.value,
         EventType.WORK_UNIT_SUCCEEDED.value,
         EventType.RUN_SUCCEEDED.value,
     ]
@@ -347,27 +361,18 @@ def test_a_missing_provider_configuration_is_a_503(tmp_path: Path) -> None:
     assert response.json()["error"]["code"] == ErrorCode.PROVIDER_NOT_CONFIGURED.value
 
 
-@pytest.mark.parametrize(
-    "strategy",
-    [
-        ExecutionStrategy.CASCADE.value,
-        ExecutionStrategy.PLANNED.value,
-        ExecutionStrategy.PROGRESSIVE.value,
-    ],
-)
-def test_unimplemented_strategies_are_refused(client: TestClient, strategy: str) -> None:
+def test_progressive_requires_a_configured_planner(client: TestClient) -> None:
     response = client.post(
         "/v1/runs",
         json={
             "input": "hello",
             "routing_policy": RoutingPolicy.MANUAL.value,
-            "strategy": strategy,
+            "strategy": ExecutionStrategy.PROGRESSIVE.value,
         },
     )
-    assert response.status_code == 400
+    assert response.status_code == 503
     error = response.json()["error"]
-    assert error["code"] == ErrorCode.INVALID_REQUEST.value
-    assert error["field"] == "strategy"
+    assert error["code"] == ErrorCode.PROVIDER_NOT_CONFIGURED.value
 
 
 @pytest.mark.parametrize(
@@ -436,7 +441,7 @@ def test_a_run_survives_the_client_and_the_process(tmp_path: Path) -> None:
 
     run, event_count = run_async(inspect())
     assert run.status is RunStatus.SUCCEEDED
-    assert event_count == 12
+    assert event_count == 16
 
 
 def test_startup_recovers_an_interrupted_attempt(tmp_path: Path) -> None:
@@ -498,7 +503,7 @@ def test_error_bodies_never_carry_internals(client: TestClient) -> None:
         assert forbidden not in response.text
 
 
-def test_openapi_documents_only_the_native_surface(client: TestClient) -> None:
+def test_openapi_documents_the_complete_inbound_surface(client: TestClient) -> None:
     paths: Sequence[str] = tuple(client.get("/openapi.json").json()["paths"])
     assert set(paths) == {
         "/health",
@@ -506,4 +511,13 @@ def test_openapi_documents_only_the_native_surface(client: TestClient) -> None:
         "/v1/runs/{run_id}",
         "/v1/runs/{run_id}/cancel",
         "/v1/runs/{run_id}/events",
+        "/v1/responses",
+        "/v1/responses/{run_id}",
+        "/v1/responses/{run_id}/cancel",
+        "/v1/chat/completions",
+        "/v1/chat/completions/{run_id}",
+        "/v1/chat/completions/{run_id}/cancel",
+        "/v1/messages",
+        "/v1/messages/{run_id}",
+        "/v1/messages/{run_id}/cancel",
     }

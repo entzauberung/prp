@@ -6,9 +6,24 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import prp_runtime.app as app_module
 from prp_runtime import __version__
-from prp_runtime.app import create_app
+from prp_runtime.app import build_adapters, create_app
+from prp_runtime.domain.enums import ModelRole
+from prp_runtime.providers.base import ModelProfile
 from prp_runtime.settings import Settings
+
+
+def _profile(alias: str, role: ModelRole) -> ModelProfile:
+    return ModelProfile(
+        alias=alias,
+        provider="openai_compatible",
+        model=f"{alias}-model",
+        role=role,
+        base_url="https://models.internal/v1",
+        context_window_tokens=16_000,
+        max_output_tokens=2_000,
+    )
 
 
 def test_health_returns_version_only() -> None:
@@ -67,3 +82,67 @@ def test_create_app_does_not_touch_the_database_path(tmp_path: Path) -> None:
     app = create_app(Settings(database_path=database_path))
     assert app.state.settings.database_path == database_path
     assert not database_path.exists()
+
+
+def test_build_adapters_uses_every_configured_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(
+        leader_profile=_profile("leader", ModelRole.PLANNER),
+        worker_profile=_profile("worker", ModelRole.WORKER),
+        cascade_profiles=(
+            _profile("worker-medium", ModelRole.WORKER),
+            _profile("worker-large", ModelRole.WORKER),
+        ),
+    )
+    built_for: list[str] = []
+
+    def fake_provider(profile: ModelProfile) -> object:
+        built_for.append(profile.alias)
+        return object()
+
+    monkeypatch.setattr(app_module, "OpenAICompatibleProvider", fake_provider)
+
+    adapters = build_adapters(settings)
+
+    assert list(adapters) == ["leader", "worker", "worker-medium", "worker-large"]
+    assert built_for == list(adapters)
+
+
+def test_default_lifespan_builds_cascade_adapters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / "app.db",
+        worker_profile=_profile("worker", ModelRole.WORKER),
+        cascade_profiles=(
+            _profile("worker-medium", ModelRole.WORKER),
+            _profile("worker-large", ModelRole.WORKER),
+        ),
+    )
+    created: dict[str, object] = {}
+
+    def fake_provider(profile: ModelProfile) -> object:
+        adapter = object()
+        created[profile.alias] = adapter
+        return adapter
+
+    monkeypatch.setattr(app_module, "OpenAICompatibleProvider", fake_provider)
+    app = create_app(settings)
+
+    with TestClient(app):
+        assert app.state.adapters == created
+        assert list(app.state.adapters) == ["worker", "worker-medium", "worker-large"]
+
+    assert set(created) == {"worker", "worker-medium", "worker-large"}
+
+
+def test_create_app_registers_all_binding_routes_without_starting_lifespan() -> None:
+    app = create_app(Settings())
+    paths = set(app.openapi()["paths"])
+    assert {
+        "/v1/runs",
+        "/v1/responses",
+        "/v1/chat/completions",
+        "/v1/messages",
+    } <= paths
+    assert app.state.store is None
+    assert app.state.controller is None

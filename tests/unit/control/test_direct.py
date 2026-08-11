@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,10 +17,11 @@ from prp_runtime.domain.enums import (
     RunStatus,
     WorkUnitStatus,
 )
-from prp_runtime.domain.errors import DomainValidationError, ErrorCode, ProviderError
+from prp_runtime.domain.errors import ErrorCode, ProviderError
 from prp_runtime.domain.events import EventType, assert_sequence_chain
 from prp_runtime.domain.models import (
     ArtifactKind,
+    Budget,
     ErrorCategory,
     NativeRunRequest,
     OutputRequirement,
@@ -169,9 +171,11 @@ async def test_direct_success_event_order(store: SqliteStore) -> None:
     controller = build_controller(store, FakeAdapter())
     run = await controller.create_run(NativeRunRequest(input="hello"))
     await controller.execute(run.run_id)
-    assert await event_types(store, run.run_id) == [
+    types = await event_types(store, run.run_id)
+    assert types == [
         EventType.RUN_CREATED,
         EventType.STRATEGY_SELECTED,
+        EventType.CONTROLLER_DECISION,
         EventType.RUN_STARTED,
         EventType.WORK_UNIT_CREATED,
         EventType.WORK_UNIT_READY,
@@ -180,6 +184,9 @@ async def test_direct_success_event_order(store: SqliteStore) -> None:
         EventType.ATTEMPT_SUCCEEDED,
         EventType.ARTIFACT_PRODUCED,
         EventType.USAGE_UPDATED,
+        EventType.EVIDENCE_RECORDED,
+        EventType.EVIDENCE_RECORDED,
+        EventType.CONTROLLER_DECISION,
         EventType.WORK_UNIT_SUCCEEDED,
         EventType.RUN_SUCCEEDED,
     ]
@@ -261,6 +268,7 @@ async def test_provider_failure_fails_the_run(store: SqliteStore) -> None:
     assert await event_types(store, run.run_id) == [
         EventType.RUN_CREATED,
         EventType.STRATEGY_SELECTED,
+        EventType.CONTROLLER_DECISION,
         EventType.RUN_STARTED,
         EventType.WORK_UNIT_CREATED,
         EventType.WORK_UNIT_READY,
@@ -417,7 +425,7 @@ async def test_direct_never_calls_the_planner_model(store: SqliteStore) -> None:
     assert [attempt.role for attempt in attempts] == [ModelRole.WORKER]
     types = await event_types(store, run.run_id)
     assert EventType.PLAN_PROPOSED not in types
-    assert EventType.EVIDENCE_RECORDED not in types
+    # EVIDENCE_RECORDED is now emitted by the verifier integration
 
 
 @pytest.mark.asyncio
@@ -447,28 +455,6 @@ async def test_manual_direct_is_honoured(store: SqliteStore) -> None:
     finished = await controller.execute(run.run_id)
     assert finished.status is RunStatus.SUCCEEDED
     assert finished.strategy is ExecutionStrategy.DIRECT
-
-
-@pytest.mark.parametrize(
-    "strategy",
-    [ExecutionStrategy.CASCADE, ExecutionStrategy.PLANNED, ExecutionStrategy.PROGRESSIVE],
-)
-@pytest.mark.asyncio
-async def test_unimplemented_strategies_are_refused_explicitly(
-    store: SqliteStore, strategy: ExecutionStrategy
-) -> None:
-    adapter = FakeAdapter()
-    controller = build_controller(store, adapter)
-    run = await controller.create_run(
-        NativeRunRequest(
-            input="hello", routing_policy=RoutingPolicy.MANUAL, strategy=strategy
-        )
-    )
-    with pytest.raises(DomainValidationError) as excinfo:
-        await controller.execute(run.run_id)
-    assert excinfo.value.code is ErrorCode.INVALID_REQUEST
-    assert (await store.get_run(run.run_id)).status is RunStatus.PENDING
-    assert adapter.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -506,3 +492,95 @@ async def test_worker_context_carries_no_graph_history(store: SqliteStore) -> No
     assert sent[0].input == "the only task"
     assert run.run_id not in sent[0].input
     assert "RUN_CREATED" not in sent[0].input
+
+
+# --- budget enforcement -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deadline_exceeded_before_dispatch_prevents_any_attempt(
+    store: SqliteStore,
+) -> None:
+    past = datetime(2026, 1, 1, tzinfo=UTC)
+    adapter = FakeAdapter()
+    controller = build_controller(store, adapter)
+    run = await controller.create_run(
+        NativeRunRequest(input="hello", budget=Budget(deadline=past))
+    )
+    finished = await controller.execute(run.run_id)
+    assert finished.status is RunStatus.CANCELLED
+    assert finished.error is None
+    assert adapter.call_count == 0
+    types = await event_types(store, run.run_id)
+    assert EventType.BUDGET_EXHAUSTED in types
+    assert EventType.ATTEMPT_STARTED not in types
+
+
+@pytest.mark.asyncio
+async def test_token_budget_exceeded_after_attempt_fails_the_run(
+    store: SqliteStore,
+) -> None:
+    adapter = FakeAdapter(
+        _text_response("the answer", usage=Usage(input_tokens=10, output_tokens=5, elapsed_ms=1))
+    )
+    controller = build_controller(store, adapter)
+    run = await controller.create_run(
+        NativeRunRequest(input="hello", budget=Budget(max_total_tokens=5))
+    )
+    finished = await controller.execute(run.run_id)
+    assert finished.status is RunStatus.FAILED
+    assert finished.error is not None
+    assert finished.error.category is ErrorCategory.BUDGET_EXCEEDED
+    assert adapter.call_count == 1
+    types = await event_types(store, run.run_id)
+    assert EventType.BUDGET_EXHAUSTED in types
+    assert EventType.ATTEMPT_SUCCEEDED in types
+
+
+@pytest.mark.asyncio
+async def test_exact_token_ceilings_accept_the_current_artifact(
+    store: SqliteStore,
+) -> None:
+    adapter = FakeAdapter(
+        _text_response(
+            "the answer",
+            usage=Usage(
+                input_tokens=10,
+                output_tokens=5,
+                strong_model_tokens=5,
+                elapsed_ms=1,
+            ),
+        )
+    )
+    controller = build_controller(store, adapter)
+    run = await controller.create_run(
+        NativeRunRequest(
+            input="hello",
+            budget=Budget(max_total_tokens=15, max_strong_model_tokens=5),
+        )
+    )
+
+    finished = await controller.execute(run.run_id)
+
+    assert finished.status is RunStatus.SUCCEEDED
+    assert adapter.call_count == 1
+    assert len(await store.list_run_attempts(run.run_id)) == 1
+    types = await event_types(store, run.run_id)
+    assert EventType.EVIDENCE_RECORDED in types
+    assert EventType.BUDGET_EXHAUSTED not in types
+
+
+@pytest.mark.asyncio
+async def test_zero_token_ceiling_blocks_initial_dispatch(store: SqliteStore) -> None:
+    adapter = FakeAdapter()
+    controller = build_controller(store, adapter)
+    run = await controller.create_run(
+        NativeRunRequest(input="hello", budget=Budget(max_total_tokens=0))
+    )
+
+    finished = await controller.execute(run.run_id)
+
+    assert finished.status is RunStatus.CANCELLED
+    assert adapter.call_count == 0
+    assert await store.list_run_attempts(run.run_id) == ()
+    assert EventType.BUDGET_EXHAUSTED in await event_types(store, run.run_id)

@@ -17,7 +17,7 @@ from prp_runtime.domain.enums import (
     RunStatus,
     WorkUnitStatus,
 )
-from prp_runtime.domain.errors import ErrorCode, InternalError
+from prp_runtime.domain.errors import ErrorCode, InternalError, StateError
 from prp_runtime.domain.events import EventType, assert_sequence_chain, payload_from_model
 from prp_runtime.domain.models import (
     Artifact,
@@ -44,6 +44,7 @@ from prp_runtime.domain.values import (
     new_run_id,
     new_work_unit_id,
 )
+from prp_runtime.planning.planner import new_planning_work_unit
 from prp_runtime.storage.sqlite import (
     DanglingReferenceError,
     DuplicateEntityError,
@@ -110,6 +111,38 @@ async def seed(store: SqliteStore) -> tuple[Run, WorkUnit, Attempt]:
     attempt = make_attempt(run.run_id, unit.work_unit_id)
     await store.create_attempt(attempt)
     return run, unit, attempt
+
+
+@pytest.mark.asyncio
+async def test_planner_attempt_uses_existing_work_unit_foreign_key_and_usage_columns(
+    store: SqliteStore,
+) -> None:
+    run = make_run()
+    await store.create_run(run)
+    planning_unit = new_planning_work_unit(run.run_id)
+    await store.create_work_unit(planning_unit)
+    usage = Usage(
+        input_tokens=3,
+        output_tokens=2,
+        strong_model_tokens=5,
+        elapsed_ms=7,
+    )
+    attempt = make_attempt(
+        run.run_id,
+        planning_unit.work_unit_id,
+        role=ModelRole.PLANNER,
+        model=PLANNER,
+        status=AttemptStatus.SUCCEEDED,
+        usage=usage,
+        started_at=T0,
+        completed_at=T0,
+    )
+
+    await store.create_attempt(attempt)
+
+    assert await store.get_work_unit(planning_unit.work_unit_id) == planning_unit
+    assert await store.list_run_attempts(run.run_id) == (attempt,)
+    assert (await store.list_run_attempts(run.run_id))[0].usage == usage
 
 
 # --- runs -----------------------------------------------------------------------
@@ -250,6 +283,43 @@ async def test_list_work_units_filters_by_graph_version(store: SqliteStore) -> N
     assert await store.list_work_units(run.run_id) == (first, revised)
     assert await store.list_work_units(run.run_id, graph_version=2) == (revised,)
     assert await store.list_work_units(run.run_id, graph_version=9) == ()
+
+
+@pytest.mark.asyncio
+async def test_create_graph_requires_one_run_version_and_internal_edges(
+    store: SqliteStore,
+) -> None:
+    run = make_run()
+    other_run = make_run()
+    await store.create_run(run)
+    await store.create_run(other_run)
+    first = make_work_unit(run.run_id, graph_version=2, name="first")
+    second = make_work_unit(
+        run.run_id,
+        graph_version=2,
+        name="second",
+        depends_on=(first.work_unit_id,),
+    )
+    await store.create_graph((second, first))
+    assert len(await store.list_work_units(run.run_id, graph_version=2)) == 2
+
+    mixed = (
+        make_work_unit(run.run_id, graph_version=3),
+        make_work_unit(other_run.run_id, graph_version=3),
+    )
+    with pytest.raises(StateError, match="one run_id"):
+        await store.create_graph(mixed)
+    with pytest.raises(DanglingReferenceError, match="outside the graph"):
+        await store.create_graph(
+            (
+                make_work_unit(
+                    run.run_id,
+                    graph_version=3,
+                    depends_on=(new_work_unit_id(),),
+                ),
+            )
+        )
+    assert await store.list_work_units(run.run_id, graph_version=3) == ()
 
 
 @pytest.mark.asyncio
@@ -720,6 +790,26 @@ async def test_a_failed_graph_commit_leaves_no_partial_units(store: SqliteStore)
     with pytest.raises(DanglingReferenceError):
         await store.create_work_units([good, broken])
     assert await store.list_work_units(run.run_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_create_graph_rolls_back_rows_inserted_before_a_duplicate(
+    store: SqliteStore,
+) -> None:
+    run = make_run()
+    await store.create_run(run)
+    existing = make_work_unit(run.run_id, graph_version=1, name="existing")
+    await store.create_work_unit(existing)
+    first = make_work_unit(run.run_id, graph_version=2, name="first")
+    duplicate = make_work_unit(
+        run.run_id,
+        graph_version=2,
+        name="duplicate",
+        work_unit_id=existing.work_unit_id,
+    )
+    with pytest.raises(DuplicateEntityError):
+        await store.create_graph((first, duplicate))
+    assert await store.list_work_units(run.run_id, graph_version=2) == ()
 
 
 @pytest.mark.asyncio

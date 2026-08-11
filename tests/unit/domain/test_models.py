@@ -27,6 +27,7 @@ from prp_runtime.domain.models import (
     EvidenceKind,
     NativeRunRequest,
     OutputRequirement,
+    RoutingIntent,
     Run,
     Usage,
     VerificationResult,
@@ -59,6 +60,7 @@ ALL_CONTRACTS: tuple[type[BaseModel], ...] = (
     Evidence,
     NativeRunRequest,
     OutputRequirement,
+    RoutingIntent,
     Run,
     Usage,
     WorkUnit,
@@ -268,7 +270,22 @@ def test_request_defaults_to_auto_routing() -> None:
     request = make_request()
     assert request.routing_policy is RoutingPolicy.AUTO
     assert request.strategy is None
+    assert request.routing is None
     assert request.budget == Budget()
+
+
+def test_routing_intent_is_closed_immutable_and_contains_only_public_facts() -> None:
+    intent = RoutingIntent(requires_plan=True, desired_parallelism=2)
+    assert intent.model_dump() == {
+        "requires_cascade": False,
+        "requires_plan": True,
+        "requires_revision": False,
+        "desired_parallelism": 2,
+    }
+    with pytest.raises(ValidationError):
+        intent.requires_plan = False
+    with pytest.raises(ValidationError):
+        RoutingIntent(api_key="redacted")
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
@@ -289,6 +306,15 @@ def test_manual_routing_requires_a_strategy() -> None:
         routing_policy=RoutingPolicy.MANUAL, strategy=ExecutionStrategy.CASCADE
     )
     assert request.strategy is ExecutionStrategy.CASCADE
+
+
+def test_manual_routing_rejects_auto_routing_intent() -> None:
+    with pytest.raises(ValidationError):
+        make_request(
+            routing_policy=RoutingPolicy.MANUAL,
+            strategy=ExecutionStrategy.CASCADE,
+            routing=RoutingIntent(requires_cascade=True),
+        )
 
 
 def test_auto_routing_must_not_pin_a_strategy() -> None:

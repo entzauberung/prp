@@ -58,6 +58,7 @@ __all__ = [
     "EvidenceKind",
     "NativeRunRequest",
     "OutputRequirement",
+    "RoutingIntent",
     "Run",
     "Usage",
     "VerificationResult",
@@ -266,6 +267,15 @@ class OutputRequirement(DomainModel):
         return self
 
 
+class RoutingIntent(DomainModel):
+    """Explicit client facts used for deterministic AUTO strategy selection."""
+
+    requires_cascade: bool = False
+    requires_plan: bool = False
+    requires_revision: bool = False
+    desired_parallelism: int | None = Field(default=None, ge=1)
+
+
 class NativeRunRequest(DomainModel):
     """The single normalised request shape.
 
@@ -277,6 +287,7 @@ class NativeRunRequest(DomainModel):
     instructions: PromptText | None = None
     routing_policy: RoutingPolicy = RoutingPolicy.AUTO
     strategy: ExecutionStrategy | None = None
+    routing: RoutingIntent | None = None
     budget: Budget = Field(default_factory=Budget)
     output: OutputRequirement = Field(default_factory=OutputRequirement)
 
@@ -286,6 +297,8 @@ class NativeRunRequest(DomainModel):
             raise ValueError("manual routing requires an explicit strategy")
         if self.routing_policy is RoutingPolicy.AUTO and self.strategy is not None:
             raise ValueError("auto routing must not pin a strategy")
+        if self.routing_policy is RoutingPolicy.MANUAL and self.routing is not None:
+            raise ValueError("manual routing must not include automatic routing intent")
         return self
 
 

@@ -83,11 +83,13 @@ EVENT_REQUIRED_KEYS: Mapping[EventType, frozenset[str]] = MappingProxyType(
         EventType.RUN_CANCELLED: frozenset(),
         EventType.RUN_RESUMED: frozenset(),
         EventType.STRATEGY_SELECTED: frozenset({"strategy"}),
-        EventType.STRATEGY_ESCALATED: frozenset({"from_strategy", "to_strategy"}),
+        EventType.STRATEGY_ESCALATED: frozenset(
+            {"from_strategy", "to_strategy", "reason"}
+        ),
         EventType.CONTROLLER_DECISION: frozenset({"decision"}),
         EventType.PLAN_PROPOSED: frozenset({"graph_version"}),
-        EventType.PLAN_COMMITTED: frozenset({"graph_version"}),
-        EventType.PLAN_REJECTED: frozenset({"reason"}),
+        EventType.PLAN_COMMITTED: frozenset({"graph_version", "work_unit_ids"}),
+        EventType.PLAN_REJECTED: frozenset({"graph_version", "reason"}),
         EventType.PLAN_REVISED: frozenset({"graph_version"}),
         EventType.WORK_UNIT_CREATED: _WORK_UNIT,
         EventType.WORK_UNIT_READY: _WORK_UNIT,

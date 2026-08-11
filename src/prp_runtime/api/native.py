@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ConfigDict, Field
 
 from prp_runtime.control.controller import RunController
+from prp_runtime.control.routing import facts_from_request
 from prp_runtime.domain.enums import ExecutionStrategy, RunStatus
 from prp_runtime.domain.errors import DomainValidationError, ErrorCode
 from prp_runtime.domain.models import (
@@ -140,7 +141,10 @@ def create_router() -> APIRouter:
             )
         controller = _controller(request)
         created = await controller.create_run(body)
-        await controller.execute(created.run_id)
+        await controller.execute(
+            created.run_id,
+            routing_facts=facts_from_request(body),
+        )
         return await _envelope(_store(request), created.run_id)
 
     @router.get("/{run_id}", response_model=RunEnvelope)

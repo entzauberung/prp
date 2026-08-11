@@ -11,6 +11,13 @@ from prp_runtime.runtime.context import (
     WorkerContext,
     build_worker_context,
 )
+from prp_runtime.runtime.scheduler import (
+    Scheduler,
+    WaveOutcome,
+    WaveResult,
+    WaveStatus,
+    select_non_conflicting_batch,
+)
 from prp_runtime.runtime.worker import Worker, WorkerResult
 
 __all__ = [
@@ -20,6 +27,11 @@ __all__ = [
     "Worker",
     "WorkerContext",
     "WorkerResult",
+    "Scheduler",
+    "WaveOutcome",
+    "WaveResult",
+    "WaveStatus",
+    "select_non_conflicting_batch",
     "assemble_run_result",
     "build_worker_context",
     "find_answer_artifact",

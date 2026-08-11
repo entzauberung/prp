@@ -32,6 +32,7 @@ _ENV_FIELDS: dict[str, str] = {
     "PRP_LOG_LEVEL": "log_level",
     "PRP_LEADER_PROFILE": "leader_profile",
     "PRP_WORKER_PROFILE": "worker_profile",
+    "PRP_CASCADE_PROFILES": "cascade_profiles",
 }
 
 
@@ -47,7 +48,21 @@ def _profile_from_json(value: object) -> object:
     return value
 
 
+def _cascade_profiles_from_json(value: object) -> object:
+    """Accept a JSON array of profile objects for PRP_CASCADE_PROFILES."""
+    if isinstance(value, str):
+        parsed = strict_json_loads(value)
+        if not isinstance(parsed, list):
+            raise ValueError("PRP_CASCADE_PROFILES must be a JSON array")
+        return parsed
+    return value
+
+
 ProfileValue = Annotated[ModelProfile, BeforeValidator(_profile_from_json)]
+CascadeProfilesValue = Annotated[
+    tuple[ModelProfile, ...],
+    BeforeValidator(_cascade_profiles_from_json),
+]
 
 
 class Settings(BaseModel):
@@ -65,6 +80,7 @@ class Settings(BaseModel):
     log_level: LogLevel = "INFO"
     leader_profile: ProfileValue | None = None
     worker_profile: ProfileValue | None = None
+    cascade_profiles: CascadeProfilesValue = Field(default_factory=tuple)
 
     @model_validator(mode="after")
     def _profiles_are_consistent(self) -> "Settings":
@@ -72,20 +88,21 @@ class Settings(BaseModel):
             raise ValueError("the leader profile must declare the PLANNER role")
         if self.worker_profile is not None and self.worker_profile.role is not ModelRole.WORKER:
             raise ValueError("the worker profile must declare the WORKER role")
-        if (
-            self.leader_profile is not None
-            and self.worker_profile is not None
-            and self.leader_profile.alias == self.worker_profile.alias
-        ):
-            raise ValueError("the leader and worker profiles must use different aliases")
+        if any(profile.role is not ModelRole.WORKER for profile in self.cascade_profiles):
+            raise ValueError("cascade profiles must declare the WORKER role")
+
+        aliases = [profile.alias for profile in self.profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("all configured profiles must use different aliases")
         return self
 
     @property
     def profiles(self) -> tuple[ModelProfile, ...]:
         """Every configured model profile."""
-        return tuple(
+        primary_profiles = tuple(
             profile for profile in (self.leader_profile, self.worker_profile) if profile is not None
         )
+        return primary_profiles + self.cascade_profiles
 
     def profile_by_alias(self, alias: str) -> ModelProfile:
         """Look up a configured profile, or fail with a structured error."""

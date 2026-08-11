@@ -14,8 +14,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from prp_runtime import __version__
+from prp_runtime.api.anthropic_messages import create_router as create_anthropic_router
 from prp_runtime.api.errors import install_error_handlers
-from prp_runtime.api.native import create_router
+from prp_runtime.api.native import create_router as create_native_router
+from prp_runtime.api.openai_chat import create_router as create_openai_chat_router
+from prp_runtime.api.openai_responses import (
+    create_router as create_openai_responses_router,
+)
 from prp_runtime.control.controller import RunController
 from prp_runtime.domain.errors import ErrorCode, ErrorDetail
 from prp_runtime.providers.base import ProviderAdapter
@@ -106,6 +111,9 @@ def create_app(
         """Report process liveness only. No provider, database or network check."""
         return HealthResponse(status="ok", version=__version__)
 
-    app.include_router(create_router())
+    app.include_router(create_native_router())
+    app.include_router(create_openai_responses_router())
+    app.include_router(create_openai_chat_router())
+    app.include_router(create_anthropic_router())
 
     return app
