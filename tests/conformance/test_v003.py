@@ -78,6 +78,7 @@ def _node(key: str, **overrides: object) -> dict[str, object]:
 class PlanAdapter:
     def __init__(self, nodes: list[dict[str, object]]) -> None:
         self._nodes = nodes
+        self._final_node = str(nodes[-1]["key"])
         self.requests: list[ProviderRequest] = []
 
     @property
@@ -87,7 +88,13 @@ class PlanAdapter:
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         return ProviderResponse(
-            text=json.dumps({"summary": "fixed conformance plan", "nodes": self._nodes}),
+            text=json.dumps(
+                {
+                    "summary": "fixed conformance plan",
+                    "final_node": self._final_node,
+                    "nodes": self._nodes,
+                }
+            ),
             usage=Usage(input_tokens=1, output_tokens=1),
             finish_reason=FinishReason.STOP,
         )
@@ -98,7 +105,11 @@ class UnknownUsagePlanAdapter(PlanAdapter):
         self.requests.append(request)
         return ProviderResponse(
             text=json.dumps(
-                {"summary": "fixed conformance plan", "nodes": self._nodes}
+                {
+                    "summary": "fixed conformance plan",
+                    "final_node": self._final_node,
+                    "nodes": self._nodes,
+                }
             ),
             usage=None,
             finish_reason=FinishReason.STOP,
@@ -416,6 +427,7 @@ async def test_restart_interrupts_once_and_recomputed_frontier_never_reexecutes(
     run = await controller.create_run(_request())
     proposal = PlanProposal(
         summary="root then child",
+        final_node="child",
         nodes=(
             _node("root"),
             _node("child", depends_on=("root",)),

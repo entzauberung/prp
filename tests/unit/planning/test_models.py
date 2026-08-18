@@ -32,6 +32,7 @@ def _node(key: str = "draft", **overrides: object) -> dict[str, object]:
 def _proposal(*nodes: dict[str, object], **overrides: object) -> PlanProposal:
     values: dict[str, object] = {
         "summary": "Prepare and verify the requested result",
+        "final_node": nodes[-1]["key"] if nodes else "draft",
         "nodes": nodes or (_node(),),
     }
     values.update(overrides)
@@ -52,6 +53,8 @@ def test_valid_proposal_has_explicit_safe_defaults() -> None:
         ),
     )
     assert [node.key for node in proposal.nodes] == ["draft", "review"]
+    assert proposal.final_node == "review"
+    assert [node.lineage_key for node in proposal.nodes] == ["draft", "review"]
     assert proposal.nodes[0].depends_on == ()
     assert proposal.nodes[0].resource_claims == ()
     assert proposal.nodes[0].output.kind is ArtifactKind.TEXT
@@ -94,6 +97,15 @@ def test_proposal_requires_a_bounded_nonempty_graph() -> None:
         _proposal(*(_node(f"node_{index}") for index in range(MAX_PLAN_NODES + 1)))
 
 
+def test_proposal_requires_one_known_final_node() -> None:
+    with pytest.raises(ValidationError, match="Field required"):
+        PlanProposal.model_validate({"summary": "missing", "nodes": (_node(),)})
+    with pytest.raises(ValidationError, match="unknown plan final node"):
+        _proposal(final_node="absent")
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        _proposal(final_nodes=("draft",))
+
+
 def test_public_text_fields_have_hard_size_limits() -> None:
     with pytest.raises(ValidationError):
         _proposal(summary="s" * 4_097)
@@ -113,6 +125,14 @@ def test_duplicate_and_unknown_dependencies_are_rejected() -> None:
             _node("base"),
             _node("next", depends_on=("base", "base")),
         )
+
+
+def test_lineage_keys_are_unique_and_proposal_local() -> None:
+    with pytest.raises(ValidationError, match="duplicate plan node lineage key"):
+        _proposal(_node("first", lineage_key="same"), _node("second", lineage_key="same"))
+    for lineage_key in ("wu_old", "run_old", "art_old"):
+        with pytest.raises(ValidationError, match="proposal-local"):
+            PlanNode.model_validate(_node("node", lineage_key=lineage_key))
 
 
 @pytest.mark.parametrize(
@@ -142,6 +162,7 @@ def test_strict_json_entry_rejects_nonstandard_json_and_nonobjects() -> None:
     text = json.dumps(
         {
             "summary": "One node",
+            "final_node": "draft",
             "nodes": [_node()],
         }
     )
@@ -167,6 +188,10 @@ def test_revision_and_rejection_only_carry_public_structured_content() -> None:
     assert revision.base_graph_version == 2
     assert revision.proposal is proposal
     assert rejection.reasons == ("It references an unavailable resource",)
+    assert (
+        revision.model_validate_json(revision.model_dump_json()).proposal.nodes[0].lineage_key
+        == "draft"
+    )
     with pytest.raises(ValidationError, match="extra_forbidden"):
         PlanRevision.model_validate(revision.model_dump() | {"reasoning": "hidden"})
     with pytest.raises(ValidationError):

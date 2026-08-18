@@ -10,9 +10,17 @@ from pydantic import ValidationError
 
 from prp_runtime.control.controller import RunController
 from prp_runtime.control.progressive import (
+    ComparisonOutcome,
+    ProgressiveRound,
+    ReuseDecision,
+    ReuseDisposition,
+    ReuseReason,
     RevisionDecision,
     RevisionDisposition,
     RevisionStopReason,
+    RoundStatus,
+    compare_rounds,
+    decide_reuse,
     decide_revision,
 )
 from prp_runtime.domain.enums import RunStatus, WorkUnitStatus
@@ -22,7 +30,10 @@ from prp_runtime.domain.models import (
     Budget,
     ErrorCategory,
     ErrorInfo,
+    GlobalCheck,
+    GlobalVerificationReport,
     NativeRunRequest,
+    RunMetrics,
     Usage,
     VerificationResult,
     WorkUnit,
@@ -57,6 +68,69 @@ def report(result: VerificationResult) -> VerificationReport:
     )
 
 
+def global_report(
+    result: VerificationResult,
+    *,
+    round_id: str | None = None,
+    evidence_ids: tuple[str, ...] = (),
+    usage: Usage | None = None,
+    metrics: RunMetrics | None = None,
+) -> GlobalVerificationReport:
+    return GlobalVerificationReport(
+        run_id="run_progressive",
+        round_id=round_id,
+        graph_version=2,
+        result=result,
+        checks=(
+            GlobalCheck(
+                kind="EVIDENCE",
+                result=result,
+                detail="deterministic round fact",
+                evidence_ids=evidence_ids,
+                fact_ids=evidence_ids,
+            ),
+        ),
+        evidence_ids=evidence_ids,
+        usage=usage,
+        metrics=metrics,
+    )
+
+
+def test_progressive_round_state_requires_verified_snapshot_and_evidence() -> None:
+    planned = ProgressiveRound(
+        round_id="round_" + "a" * 32,
+        run_id="run_progressive",
+        round_index=0,
+        graph_version=1,
+        base_snapshot_id="snap_" + "b" * 32,
+        status=RoundStatus.PLANNED,
+        created_at=T0,
+    )
+    assert planned.merged_snapshot_id is None
+    with pytest.raises(ValidationError, match="merged snapshot and evidence"):
+        ProgressiveRound(
+            round_id="round_" + "c" * 32,
+            run_id="run_progressive",
+            round_index=1,
+            graph_version=2,
+            base_snapshot_id="snap_" + "d" * 32,
+            status=RoundStatus.VERIFIED,
+            created_at=T0,
+            completed_at=T0,
+        )
+    with pytest.raises(ValidationError, match="completion and reason"):
+        ProgressiveRound(
+            round_id="round_" + "e" * 32,
+            run_id="run_progressive",
+            round_index=2,
+            graph_version=3,
+            base_snapshot_id="snap_" + "f" * 32,
+            status=RoundStatus.FAILED,
+            created_at=T0,
+            completed_at=T0,
+        )
+
+
 def test_pass_never_revises_even_when_revision_budget_is_zero() -> None:
     decision = decide_revision(
         budget=Budget(max_plan_revisions=0),
@@ -70,31 +144,29 @@ def test_pass_never_revises_even_when_revision_budget_is_zero() -> None:
     assert decision.should_revise is False
 
 
-@pytest.mark.parametrize(
-    ("result", "reason"),
-    [
-        (VerificationResult.FAIL, PlanRevisionReason.VERIFICATION_FAILED),
-        (
-            VerificationResult.INCONCLUSIVE,
-            PlanRevisionReason.VERIFICATION_INCONCLUSIVE,
-        ),
-    ],
-)
-def test_verification_failure_classes_trigger_one_next_graph_version(
-    result: VerificationResult,
-    reason: PlanRevisionReason,
-) -> None:
+def test_verification_failure_triggers_one_next_graph_version() -> None:
     decision = decide_revision(
         budget=Budget(max_plan_revisions=2),
         revision_count=1,
         graph_version=4,
-        verification_result=result,
+        verification_result=VerificationResult.FAIL,
     )
 
     assert decision.disposition is RevisionDisposition.REVISE
-    assert decision.reason is reason
+    assert decision.reason is PlanRevisionReason.VERIFICATION_FAILED
     assert decision.next_graph_version == 5
     assert decision.should_revise is True
+
+
+def test_inconclusive_verification_stops_without_claiming_progress() -> None:
+    decision = decide_revision(
+        budget=Budget(max_plan_revisions=2),
+        revision_count=0,
+        verification_result=VerificationResult.INCONCLUSIVE,
+    )
+
+    assert decision.disposition is RevisionDisposition.STOP
+    assert decision.stop_reason is RevisionStopReason.INCONCLUSIVE
 
 
 def test_retryable_provider_failure_is_a_revision_trigger() -> None:
@@ -194,6 +266,92 @@ def test_contradictory_signals_and_invalid_revision_counts_are_rejected() -> Non
         decide_revision(budget=Budget(max_plan_revisions=1), revision_count=-1)
 
 
+def test_round_comparison_exposes_quality_outcome_and_measured_deltas() -> None:
+    base_usage = Usage(input_tokens=2, output_tokens=3, elapsed_ms=10)
+    candidate_usage = Usage(input_tokens=4, output_tokens=5, elapsed_ms=25)
+    base = global_report(
+        VerificationResult.PASS,
+        round_id="round_" + "a" * 32,
+        evidence_ids=("ev_" + "1" * 32,),
+        usage=base_usage,
+        metrics=RunMetrics(
+            usage=base_usage,
+            provider_elapsed_ms=10,
+            wall_clock_ms=100,
+            cost="1.25",
+        ),
+    )
+    candidate = global_report(
+        VerificationResult.PASS,
+        round_id="round_" + "b" * 32,
+        evidence_ids=("ev_" + "1" * 32,),
+        usage=candidate_usage,
+        metrics=RunMetrics(
+            usage=candidate_usage,
+            provider_elapsed_ms=25,
+            wall_clock_ms=140,
+            cost="1.75",
+        ),
+    )
+
+    comparison = compare_rounds(base, candidate)
+
+    assert comparison.outcome is ComparisonOutcome.NO_GAIN
+    assert comparison.token_delta == 4
+    assert comparison.wall_clock_delta_ms == 40
+    assert comparison.cost_delta == 0.50
+    decision = decide_revision(
+        budget=Budget(max_plan_revisions=2),
+        revision_count=0,
+        comparison=comparison,
+    )
+    assert decision.stop_reason is RevisionStopReason.PASS
+    assert decision.comparison == comparison
+
+
+def test_round_comparison_stops_regression_and_no_gain() -> None:
+    base = global_report(
+        VerificationResult.PASS,
+        round_id="round_" + "a" * 32,
+        evidence_ids=("ev_" + "1" * 32,),
+    )
+    failed = global_report(
+        VerificationResult.FAIL,
+        round_id="round_" + "b" * 32,
+        evidence_ids=("ev_" + "2" * 32,),
+    )
+    regression = compare_rounds(base, failed)
+    assert regression.outcome is ComparisonOutcome.REGRESSION
+    assert decide_revision(
+        budget=Budget(max_plan_revisions=2),
+        revision_count=0,
+        comparison=regression,
+    ).stop_reason is RevisionStopReason.REGRESSION
+
+    no_gain = compare_rounds(failed, failed)
+    assert no_gain.outcome is ComparisonOutcome.NO_GAIN
+    assert decide_revision(
+        budget=Budget(max_plan_revisions=2),
+        revision_count=0,
+        comparison=no_gain,
+    ).stop_reason is RevisionStopReason.NO_GAIN
+
+
+def test_first_failed_round_remains_a_revision_trigger_without_baseline() -> None:
+    comparison = compare_rounds(
+        None,
+        global_report(VerificationResult.FAIL, round_id="round_" + "a" * 32),
+    )
+
+    assert comparison.outcome is ComparisonOutcome.INCONCLUSIVE
+    decision = decide_revision(
+        budget=Budget(max_plan_revisions=1),
+        revision_count=0,
+        comparison=comparison,
+    )
+    assert decision.disposition is RevisionDisposition.REVISE
+
+
 def test_revision_decision_rejects_private_or_malformed_shapes() -> None:
     with pytest.raises(ValidationError):
         RevisionDecision.model_validate(
@@ -231,6 +389,7 @@ def test_cancelled_work_unit_stops_without_revising() -> None:
 def graph_proposal(name: str) -> PlanProposal:
     return PlanProposal(
         summary=f"proposal for {name}",
+        final_node=name,
         nodes=(
             PlanNode(
                 key=name,
@@ -239,6 +398,162 @@ def graph_proposal(name: str) -> PlanProposal:
             ),
         ),
     )
+
+
+def reuse_unit(
+    *,
+    lineage_key: str | None = "stable-node",
+    dependency_fingerprint: str | None = "1" * 64,
+    content_fingerprint: str | None = "a" * 64,
+    status: WorkUnitStatus = WorkUnitStatus.SUCCEEDED,
+) -> WorkUnit:
+    return WorkUnit(
+        work_unit_id="wu_reuse_candidate",
+        run_id="run_reuse",
+        graph_version=2,
+        lineage_key=lineage_key,
+        dependency_fingerprint=dependency_fingerprint,
+        content_fingerprint=content_fingerprint,
+        name="node",
+        instruction="produce node",
+        status=status,
+    )
+
+
+def test_reuse_requires_all_persisted_facts_to_match() -> None:
+    decision = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        historical_dependency_artifact_hashes=(),
+        candidate_dependency_artifact_hashes=(),
+        historical_base_snapshot_id="snap_base",
+        candidate_base_snapshot_id="snap_base",
+        historical_merged_snapshot_id="snap_merged",
+        candidate_merged_snapshot_id="snap_merged",
+        historical_merge_input_digest="digest_same",
+        candidate_merge_input_digest="digest_same",
+        historical_change_set_ids=("cs_same",),
+        candidate_change_set_ids=("cs_same",),
+        historical_evidence_ids=("ev_same",),
+        candidate_evidence_ids=("ev_same",),
+    )
+    assert decision == ReuseDecision(
+        disposition=ReuseDisposition.REUSE,
+        reason=ReuseReason.ALL_FACTS_MATCH,
+        rationale=(
+            "lineage, execution, Snapshot, Merge, ChangeSet, "
+            "Evidence, and dependency facts match"
+        ),
+        lineage_key="stable-node",
+    )
+    assert ReuseDecision.model_validate_json(decision.model_dump_json()) == decision
+
+
+def test_reuse_requires_progressive_snapshot_merge_changeset_and_evidence_facts() -> None:
+    facts = {
+        "historical_base_snapshot_id": "snap_base",
+        "candidate_base_snapshot_id": "snap_base",
+        "historical_merged_snapshot_id": "snap_merged",
+        "candidate_merged_snapshot_id": "snap_merged",
+        "historical_merge_input_digest": "digest_same",
+        "candidate_merge_input_digest": "digest_same",
+        "historical_change_set_ids": ("cs_same",),
+        "candidate_change_set_ids": ("cs_same",),
+        "historical_evidence_ids": ("ev_same",),
+        "candidate_evidence_ids": ("ev_same",),
+    }
+    decision = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        historical_dependency_artifact_hashes=(),
+        candidate_dependency_artifact_hashes=(),
+        **facts,
+    )
+    assert decision.disposition is ReuseDisposition.REUSE
+    assert "Snapshot" in decision.rationale
+
+    changed = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        historical_dependency_artifact_hashes=(),
+        candidate_dependency_artifact_hashes=(),
+        **(facts | {"candidate_change_set_ids": ("cs_changed",)}),
+    )
+    assert changed.disposition is ReuseDisposition.RECOMPUTE
+    assert changed.reason is ReuseReason.CHANGE_SET_FACTS_MISSING_OR_CHANGED
+
+
+@pytest.mark.parametrize(
+    ("historical", "candidate", "reason"),
+    [
+        (
+            reuse_unit(status=WorkUnitStatus.FAILED),
+            reuse_unit(),
+            ReuseReason.HISTORICAL_UNIT_NOT_SUCCEEDED,
+        ),
+        (reuse_unit(), reuse_unit(lineage_key="different"), ReuseReason.LINEAGE_CHANGED),
+        (
+            reuse_unit(content_fingerprint="b" * 64),
+            reuse_unit(),
+            ReuseReason.CONTENT_FINGERPRINT_CHANGED,
+        ),
+        (
+            reuse_unit(dependency_fingerprint="2" * 64),
+            reuse_unit(),
+            ReuseReason.DEPENDENCY_FINGERPRINT_CHANGED,
+        ),
+    ],
+)
+def test_reuse_recomputes_when_node_facts_change(
+    historical: WorkUnit, candidate: WorkUnit, reason: ReuseReason
+) -> None:
+    decision = decide_reuse(
+        historical,
+        candidate,
+        historical_dependency_artifact_hashes=(),
+        candidate_dependency_artifact_hashes=(),
+    )
+    assert decision.disposition is ReuseDisposition.RECOMPUTE
+    assert decision.reason is reason
+
+
+@pytest.mark.parametrize(
+    ("historical_hashes", "candidate_hashes", "reason"),
+    [
+        ((None,), ("a" * 64,), ReuseReason.DEPENDENCY_ARTIFACT_HASH_MISSING_OR_MALFORMED),
+        (("bad",), ("a" * 64,), ReuseReason.DEPENDENCY_ARTIFACT_HASH_MISSING_OR_MALFORMED),
+        (("a" * 64,), ("b" * 64,), ReuseReason.DEPENDENCY_ARTIFACT_HASH_CHANGED),
+    ],
+)
+def test_reuse_recomputes_when_dependency_artifact_facts_are_unknown_or_changed(
+    historical_hashes: tuple[str | None, ...],
+    candidate_hashes: tuple[str | None, ...],
+    reason: ReuseReason,
+) -> None:
+    decision = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        historical_dependency_artifact_hashes=historical_hashes,
+        candidate_dependency_artifact_hashes=candidate_hashes,
+    )
+    assert decision.disposition is ReuseDisposition.RECOMPUTE
+    assert decision.reason is reason
+
+
+def test_reuse_decision_rejects_private_or_inconsistent_shapes() -> None:
+    with pytest.raises(ValidationError, match="REUSE requires"):
+        ReuseDecision(
+            disposition=ReuseDisposition.REUSE,
+            reason=ReuseReason.LINEAGE_CHANGED,
+            rationale="invalid",
+        )
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        ReuseDecision(
+            disposition=ReuseDisposition.RECOMPUTE,
+            reason=ReuseReason.MISSING_LINEAGE_OR_FINGERPRINT,
+            rationale="invalid",
+            reasoning="private",
+        )
 
 
 def revision(base_graph_version: int, name: str = "replacement") -> PlanRevision:

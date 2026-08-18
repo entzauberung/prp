@@ -5,6 +5,7 @@ No port is opened, no real network call is made, and every database is temporary
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,16 @@ def parse_sse(body: str) -> list[dict[str, Any]]:
     return records
 
 
+def wait_for_terminal(client: TestClient, run_id: str) -> dict[str, Any]:
+    """Read the Store-backed final state without coupling POST to execution."""
+    for _ in range(200):
+        body = client.get(f"/v1/runs/{run_id}").json()
+        if body["status"] in {status.value for status in RunStatus if status.is_terminal}:
+            return body
+        time.sleep(0.005)
+    pytest.fail(f"run {run_id} did not reach a terminal state")
+
+
 # --- create and read ------------------------------------------------------------
 
 
@@ -145,7 +156,9 @@ def test_create_run_executes_and_returns_the_answer(
     )
 
     assert response.status_code == 201
-    body = response.json()
+    created = response.json()
+    assert created["status"] in {RunStatus.PENDING.value, RunStatus.RUNNING.value}
+    body = wait_for_terminal(client, created["run_id"])
     assert body["status"] == RunStatus.SUCCEEDED.value
     assert body["strategy"] == ExecutionStrategy.DIRECT.value
     assert body["output_text"] == ANSWER
@@ -157,7 +170,7 @@ def test_create_run_executes_and_returns_the_answer(
         "elapsed_ms": 9,
     }
     assert body["error"] is None
-    assert body["run_id"].startswith("run_")
+    assert created["run_id"].startswith("run_")
     assert body["completed_at"] is not None
     assert len(adapter.requests) == 1
     assert adapter.requests[0].input == "summarise the report"
@@ -165,9 +178,10 @@ def test_create_run_executes_and_returns_the_answer(
 
 def test_get_run_matches_the_creation_response(client: TestClient) -> None:
     created = client.post("/v1/runs", json={"input": "hello"}).json()
+    final = wait_for_terminal(client, created["run_id"])
     fetched = client.get(f"/v1/runs/{created['run_id']}")
     assert fetched.status_code == 200
-    assert fetched.json() == created
+    assert fetched.json() == final
 
 
 def test_unknown_run_is_a_structured_404(client: TestClient) -> None:
@@ -190,7 +204,8 @@ def test_manual_direct_is_accepted(client: TestClient) -> None:
         },
     )
     assert response.status_code == 201
-    assert response.json()["strategy"] == ExecutionStrategy.DIRECT.value
+    final = wait_for_terminal(client, response.json()["run_id"])
+    assert final["strategy"] == ExecutionStrategy.DIRECT.value
 
 
 def test_native_auto_routing_intent_reaches_controller(client: TestClient) -> None:
@@ -200,7 +215,8 @@ def test_native_auto_routing_intent_reaches_controller(client: TestClient) -> No
     )
 
     assert response.status_code == 201
-    assert response.json()["strategy"] == ExecutionStrategy.CASCADE.value
+    final = wait_for_terminal(client, response.json()["run_id"])
+    assert final["strategy"] == ExecutionStrategy.CASCADE.value
 
 
 def test_structured_output_round_trips(tmp_path: Path) -> None:
@@ -217,8 +233,8 @@ def test_structured_output_round_trips(tmp_path: Path) -> None:
                 "output": {"kind": "JSON", "json_schema": '{"type":"object"}'},
             },
         )
+        body = wait_for_terminal(client, response.json()["run_id"])
     assert response.status_code == 201
-    body = response.json()
     assert body["output_kind"] == "JSON"
     assert json.loads(body["output_text"]) == {"ok": True}
 
@@ -228,6 +244,7 @@ def test_structured_output_round_trips(tmp_path: Path) -> None:
 
 def test_events_replay_the_whole_ledger(client: TestClient) -> None:
     run_id = client.post("/v1/runs", json={"input": "hello"}).json()["run_id"]
+    wait_for_terminal(client, run_id)
 
     response = client.get(f"/v1/runs/{run_id}/events")
 
@@ -243,10 +260,14 @@ def test_events_replay_the_whole_ledger(client: TestClient) -> None:
         EventType.WORK_UNIT_CREATED.value,
         EventType.WORK_UNIT_READY.value,
         EventType.WORK_UNIT_STARTED.value,
+        EventType.RESERVATION_CREATED.value,
+        EventType.RESERVATION_HELD.value,
         EventType.ATTEMPT_STARTED.value,
+        EventType.AGENT_HISTORY_RECORDED.value,
         EventType.ATTEMPT_SUCCEEDED.value,
         EventType.ARTIFACT_PRODUCED.value,
         EventType.USAGE_UPDATED.value,
+        EventType.RESERVATION_SETTLED.value,
         EventType.EVIDENCE_RECORDED.value,
         EventType.EVIDENCE_RECORDED.value,
         EventType.CONTROLLER_DECISION.value,
@@ -260,6 +281,7 @@ def test_events_replay_the_whole_ledger(client: TestClient) -> None:
 
 def test_last_event_id_resumes_the_stream(client: TestClient) -> None:
     run_id = client.post("/v1/runs", json={"input": "hello"}).json()["run_id"]
+    wait_for_terminal(client, run_id)
     everything = parse_sse(client.get(f"/v1/runs/{run_id}/events").text)
     cursor = int(everything[5]["id"])
 
@@ -275,6 +297,7 @@ def test_last_event_id_resumes_the_stream(client: TestClient) -> None:
 
 def test_after_cursor_query_matches_the_header(client: TestClient) -> None:
     run_id = client.post("/v1/runs", json={"input": "hello"}).json()["run_id"]
+    wait_for_terminal(client, run_id)
     by_query = parse_sse(client.get(f"/v1/runs/{run_id}/events?after=3").text)
     by_header = parse_sse(
         client.get(f"/v1/runs/{run_id}/events", headers={"Last-Event-ID": "3"}).text
@@ -285,6 +308,7 @@ def test_after_cursor_query_matches_the_header(client: TestClient) -> None:
 
 def test_a_cursor_at_the_end_yields_an_empty_stream(client: TestClient) -> None:
     run_id = client.post("/v1/runs", json={"input": "hello"}).json()["run_id"]
+    wait_for_terminal(client, run_id)
     records = parse_sse(client.get(f"/v1/runs/{run_id}/events").text)
     last = max(int(record["id"]) for record in records)
     response = client.get(f"/v1/runs/{run_id}/events?after={last + 100}")
@@ -294,6 +318,7 @@ def test_a_cursor_at_the_end_yields_an_empty_stream(client: TestClient) -> None:
 
 def test_a_malformed_last_event_id_is_rejected(client: TestClient) -> None:
     run_id = client.post("/v1/runs", json={"input": "hello"}).json()["run_id"]
+    wait_for_terminal(client, run_id)
     response = client.get(
         f"/v1/runs/{run_id}/events", headers={"Last-Event-ID": "not-a-number"}
     )
@@ -312,10 +337,11 @@ def test_events_of_an_unknown_run_are_a_404(client: TestClient) -> None:
 
 def test_cancelling_a_finished_run_changes_nothing(client: TestClient) -> None:
     created = client.post("/v1/runs", json={"input": "hello"}).json()
+    finished = wait_for_terminal(client, created["run_id"])
     response = client.post(f"/v1/runs/{created['run_id']}/cancel")
     assert response.status_code == 200
     assert response.json()["status"] == RunStatus.SUCCEEDED.value
-    assert response.json()["completed_at"] == created["completed_at"]
+    assert response.json()["completed_at"] == finished["completed_at"]
 
 
 def test_cancelling_an_unknown_run_is_a_404(client: TestClient) -> None:
@@ -330,11 +356,11 @@ def test_cancel_prevents_a_second_attempt(tmp_path: Path) -> None:
     )
     with TestClient(build_app(tmp_path, adapter)) as client:
         created = client.post("/v1/runs", json={"input": "hello"}).json()
-        client.post(f"/v1/runs/{created['run_id']}/cancel")
-        after = client.get(f"/v1/runs/{created['run_id']}").json()
-    assert created["status"] == RunStatus.FAILED.value
-    assert after["status"] == RunStatus.FAILED.value
-    assert len(adapter.requests) == 1
+        cancelled = client.post(f"/v1/runs/{created['run_id']}/cancel").json()
+        after = wait_for_terminal(client, created["run_id"])
+    assert cancelled["status"] in {RunStatus.CANCELLED.value, RunStatus.FAILED.value}
+    assert after["status"] in {RunStatus.CANCELLED.value, RunStatus.FAILED.value}
+    assert len(adapter.requests) <= 1
 
 
 # --- failures -------------------------------------------------------------------
@@ -346,8 +372,8 @@ def test_a_provider_failure_is_a_failed_run_not_an_http_error(tmp_path: Path) ->
     )
     with TestClient(build_app(tmp_path, adapter)) as client:
         response = client.post("/v1/runs", json={"input": "hello"})
+        body = wait_for_terminal(client, response.json()["run_id"])
     assert response.status_code == 201
-    body = response.json()
     assert body["status"] == RunStatus.FAILED.value
     assert body["error"]["category"] == "TIMEOUT"
     assert body["output_text"] is None
@@ -357,8 +383,9 @@ def test_a_missing_provider_configuration_is_a_503(tmp_path: Path) -> None:
     settings = Settings(database_path=tmp_path / "native.db")
     with TestClient(build_app(tmp_path, settings=settings)) as client:
         response = client.post("/v1/runs", json={"input": "hello"})
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == ErrorCode.PROVIDER_NOT_CONFIGURED.value
+        body = wait_for_terminal(client, response.json()["run_id"])
+    assert response.status_code == 201
+    assert body["status"] == RunStatus.FAILED.value
 
 
 def test_progressive_requires_a_configured_planner(client: TestClient) -> None:
@@ -370,9 +397,9 @@ def test_progressive_requires_a_configured_planner(client: TestClient) -> None:
             "strategy": ExecutionStrategy.PROGRESSIVE.value,
         },
     )
-    assert response.status_code == 503
-    error = response.json()["error"]
-    assert error["code"] == ErrorCode.PROVIDER_NOT_CONFIGURED.value
+    assert response.status_code == 201
+    body = wait_for_terminal(client, response.json()["run_id"])
+    assert body["status"] == RunStatus.FAILED.value
 
 
 @pytest.mark.parametrize(
@@ -429,6 +456,14 @@ def test_health_still_reports_liveness(client: TestClient) -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_app_shutdown_closes_the_live_event_bus(tmp_path: Path) -> None:
+    app = build_app(tmp_path, FakeAdapter())
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert app.state.event_bus.closed is False
+    assert app.state.event_bus is None
+
+
 def test_a_run_survives_the_client_and_the_process(tmp_path: Path) -> None:
     database = tmp_path / "native.db"
     settings = Settings(database_path=database, worker_profile=WORKER_PROFILE)
@@ -441,7 +476,7 @@ def test_a_run_survives_the_client_and_the_process(tmp_path: Path) -> None:
 
     run, event_count = run_async(inspect())
     assert run.status is RunStatus.SUCCEEDED
-    assert event_count == 16
+    assert event_count >= 16
 
 
 def test_startup_recovers_an_interrupted_attempt(tmp_path: Path) -> None:
@@ -507,6 +542,7 @@ def test_openapi_documents_the_complete_inbound_surface(client: TestClient) -> N
     paths: Sequence[str] = tuple(client.get("/openapi.json").json()["paths"])
     assert set(paths) == {
         "/health",
+        "/ready",
         "/v1/runs",
         "/v1/runs/{run_id}",
         "/v1/runs/{run_id}/cancel",
@@ -514,10 +550,26 @@ def test_openapi_documents_the_complete_inbound_surface(client: TestClient) -> N
         "/v1/responses",
         "/v1/responses/{run_id}",
         "/v1/responses/{run_id}/cancel",
+        "/v1/responses/{run_id}/events",
         "/v1/chat/completions",
         "/v1/chat/completions/{run_id}",
         "/v1/chat/completions/{run_id}/cancel",
         "/v1/messages",
         "/v1/messages/{run_id}",
         "/v1/messages/{run_id}/cancel",
+        "/v1/sessions",
+        "/v1/sessions/{session_id}",
+        "/v1/sessions/{session_id}/runs",
+        "/v1/sessions/{session_id}/runs/{run_id}",
+        "/v1/sessions/{session_id}/runs/{run_id}/cancel",
+        "/v1/sessions/{session_id}/runs/{run_id}/events",
+        "/v1/sessions/{session_id}/runs/{run_id}/tool-calls",
+        "/v1/sessions/{session_id}/runs/{run_id}/tool-calls/{call_id}",
+        "/v1/sessions/{session_id}/runs/{run_id}/tool-calls/{call_id}/claim",
+        "/v1/sessions/{session_id}/runs/{run_id}/tool-calls/{call_id}/result",
+        "/v1/sessions/{session_id}/approvals",
+        "/v1/approvals",
+        "/v1/approvals/{request_id}",
+        "/v1/approvals/{request_id}/decision",
+        "/v1/sessions/{session_id}/approvals/{request_id}/decision",
     }

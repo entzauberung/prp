@@ -3,12 +3,13 @@
 import hashlib
 import heapq
 from collections import defaultdict
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import Field, StringConstraints
 
 from prp_runtime.domain.models import DomainModel, OutputRequirement
 from prp_runtime.domain.values import ResourceClaim, RunId, WorkUnitId, validate_run_id
+from prp_runtime.json_support import canonical_json_dumps
 from prp_runtime.planning.models import (
     MAX_PLAN_NODES,
     PlanNode,
@@ -49,6 +50,9 @@ class CompiledWorkUnit(DomainModel):
     run_id: RunId
     graph_version: int = Field(ge=1)
     node_key: PlanNodeKey
+    lineage_key: PlanNodeKey
+    dependency_fingerprint: str
+    content_fingerprint: str
     name: DraftName
     instruction: DraftInstruction
     acceptance_criteria: DraftName | None = None
@@ -62,6 +66,8 @@ class CompiledPlan(DomainModel):
 
     run_id: RunId
     graph_version: int = Field(ge=1)
+    final_node: PlanNodeKey
+    final_work_unit_id: WorkUnitId
     nodes: tuple[CompiledWorkUnit, ...] = Field(
         min_length=1,
         max_length=MAX_PLAN_NODES,
@@ -87,8 +93,35 @@ def _stable_work_unit_id(run_id: str, graph_version: int, node_key: str) -> str:
     return f"wu_{digest}"
 
 
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json_dumps(value).encode("utf-8")).hexdigest()
+
+
+def _fingerprints(node: PlanNode, dependency_lineages: tuple[str, ...]) -> tuple[str, str]:
+    dependency_fingerprint = _sha256_json(
+        {"dependencies": dependency_lineages}
+    )
+    content_fingerprint = _sha256_json(
+        {
+            "acceptance_criteria": node.acceptance_criteria,
+            "dependencies": dependency_lineages,
+            "dependency_fingerprint": dependency_fingerprint,
+            "instruction": node.instruction,
+            "lineage_key": node.lineage_key,
+            "output": node.output.model_dump(mode="json"),
+            "resource_claims": [
+                claim.model_dump(mode="json") for claim in node.resource_claims
+            ],
+        }
+    )
+    return dependency_fingerprint, content_fingerprint
+
+
 def _topological_order(nodes: tuple[PlanNode, ...]) -> tuple[str, ...] | PlanRejection:
     by_key = {node.key: node for node in nodes}
+    lineage_keys = tuple(getattr(node, "lineage_key", node.key) for node in nodes)
+    if len(set(lineage_keys)) != len(lineage_keys):
+        return _reject("duplicate plan node lineage key")
     if len(by_key) != len(nodes):
         return _reject("duplicate plan node key")
 
@@ -160,15 +193,29 @@ def compile_plan(
     # Construct every draft only after validation has completed. This keeps a
     # rejected graph from exposing a misleading partial compilation.
     by_key = {node.key: node for node in nodes}
+    if proposal.final_node not in by_key:
+        return _reject("unknown plan final node: " + proposal.final_node)
+    if any(proposal.final_node in node.depends_on for node in nodes):
+        return _reject("final node must have no dependents")
     node_ids = {
         key: _stable_work_unit_id(run_id, graph_version, key) for key in order
     }
+    lineage_by_key = {node.key: node.lineage_key for node in nodes}
     drafts = tuple(
         CompiledWorkUnit(
             work_unit_id=node_ids[node.key],
             run_id=run_id,
             graph_version=graph_version,
             node_key=node.key,
+            lineage_key=getattr(node, "lineage_key", node.key),
+            dependency_fingerprint=_fingerprints(
+                node,
+                tuple(lineage_by_key[dependency] for dependency in node.depends_on),
+            )[0],
+            content_fingerprint=_fingerprints(
+                node,
+                tuple(lineage_by_key[dependency] for dependency in node.depends_on),
+            )[1],
             name=node.name,
             instruction=node.instruction,
             acceptance_criteria=node.acceptance_criteria,
@@ -185,6 +232,8 @@ def compile_plan(
         return CompiledPlan(
             run_id=run_id,
             graph_version=graph_version,
+            final_node=proposal.final_node,
+            final_work_unit_id=node_ids[proposal.final_node],
             nodes=drafts,
             node_map=mapping,
         )

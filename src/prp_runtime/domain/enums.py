@@ -7,12 +7,20 @@ resource access. No third-party API field ever enters this module.
 from enum import StrEnum, unique
 
 __all__ = [
+    "AgentMode",
     "AttemptStatus",
+    "BridgeClaimStatus",
+    "ExecutionLocation",
     "ExecutionStrategy",
+    "IsolationMode",
+    "MergeLedgerStatus",
     "ModelRole",
     "ResourceAccess",
+    "ReservationStatus",
     "RoutingPolicy",
     "RunStatus",
+    "ToolCallStatus",
+    "ToolEffect",
     "WorkUnitStatus",
 ]
 
@@ -40,6 +48,106 @@ class RoutingPolicy(StrEnum):
 
 
 @unique
+class AgentMode(StrEnum):
+    """The agent's authorization posture for tool-capable execution."""
+
+    NORMAL = "NORMAL"
+    AUTO = "AUTO"
+    PLAN = "PLAN"
+    YOLO = "YOLO"
+
+
+@unique
+class IsolationMode(StrEnum):
+    """The isolation boundary used for execution."""
+
+    SANDBOXED = "SANDBOXED"
+    HOST = "HOST"
+
+
+@unique
+class MergeLedgerStatus(StrEnum):
+    """Durable merge lifecycle states, including uncertain recovery."""
+
+    PLANNED = "PLANNED"
+    RUNNING = "RUNNING"
+    MERGED = "MERGED"
+    PROMOTED = "PROMOTED"
+    CONFLICT = "CONFLICT"
+    UNKNOWN = "UNKNOWN"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            MergeLedgerStatus.PROMOTED,
+            MergeLedgerStatus.CONFLICT,
+            MergeLedgerStatus.UNKNOWN,
+        }
+
+
+@unique
+class ExecutionLocation(StrEnum):
+    """Where the agent executes relative to the cloud runtime."""
+
+    CLOUD = "CLOUD"
+    BRIDGE = "BRIDGE"
+
+
+@unique
+class ToolEffect(StrEnum):
+    """The declared side-effect class of one tool operation."""
+
+    READ = "READ"
+    WRITE = "WRITE"
+    COMMAND = "COMMAND"
+    NETWORK = "NETWORK"
+
+
+@unique
+class ToolCallStatus(StrEnum):
+    """Lifecycle of a protocol-independent tool call."""
+
+    REQUESTED = "REQUESTED"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    INTERRUPTED = "INTERRUPTED"
+    UNKNOWN = "UNKNOWN"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            ToolCallStatus.SUCCEEDED,
+            ToolCallStatus.FAILED,
+            ToolCallStatus.CANCELLED,
+            ToolCallStatus.REJECTED,
+            ToolCallStatus.INTERRUPTED,
+            ToolCallStatus.UNKNOWN,
+        }
+
+
+@unique
+class BridgeClaimStatus(StrEnum):
+    """Lifecycle of one Native Bridge claim.
+
+    ``ACTIVE`` is the only lease-bearing state. Terminal states are immutable;
+    an expired claim may be recorded for audit but can never be revived.
+    """
+
+    ACTIVE = "ACTIVE"
+    EXPIRED = "EXPIRED"
+    SETTLED = "SETTLED"
+    RELEASED = "RELEASED"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self is not BridgeClaimStatus.ACTIVE
+
+
+@unique
 class ModelRole(StrEnum):
     """The role a model plays in one call.
 
@@ -58,6 +166,25 @@ class ResourceAccess(StrEnum):
 
     READ = "READ"
     WRITE = "WRITE"
+
+
+@unique
+class ReservationStatus(StrEnum):
+    """Lifecycle of one attempt/capacity reservation."""
+
+    PENDING = "PENDING"
+    HELD = "HELD"
+    SETTLED = "SETTLED"
+    RELEASED = "RELEASED"
+    EXPIRED = "EXPIRED"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            ReservationStatus.SETTLED,
+            ReservationStatus.RELEASED,
+            ReservationStatus.EXPIRED,
+        }
 
 
 @unique

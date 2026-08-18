@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,29 +13,38 @@ from prp_runtime.domain.enums import (
     AttemptStatus,
     ExecutionStrategy,
     ModelRole,
+    ResourceAccess,
     RoutingPolicy,
     RunStatus,
+    ToolCallStatus,
     WorkUnitStatus,
 )
-from prp_runtime.domain.errors import ErrorCode, ProviderError
+from prp_runtime.domain.errors import ErrorCode, ProviderError, StateError
 from prp_runtime.domain.events import EventType, assert_sequence_chain
 from prp_runtime.domain.models import (
+    AgentToolCall,
+    AgentToolResult,
     ArtifactKind,
     Budget,
     ErrorCategory,
     NativeRunRequest,
     OutputRequirement,
+    Session,
     Usage,
+    WorkspaceGrant,
 )
+from prp_runtime.domain.values import new_session_id, new_workspace_id
 from prp_runtime.providers.base import (
     FinishReason,
     ModelProfile,
     ProviderRequest,
     ProviderResponse,
 )
+from prp_runtime.runtime.agent_loop import AgentToolContext, AgentToolExecution
 from prp_runtime.runtime.assembler import assemble_run_result
 from prp_runtime.settings import Settings
 from prp_runtime.storage.sqlite import SqliteStore
+from prp_runtime.workspace.models import Workspace, WorkspaceSource, WorkspaceSourceType
 
 WORKER_PROFILE = ModelProfile(
     alias="worker",
@@ -85,11 +94,49 @@ class FakeAdapter:
         return outcome
 
 
+class FakeToolExecutor:
+    def __init__(self, *, pause: bool = False) -> None:
+        self.pause = pause
+        self.calls: list[AgentToolCall] = []
+
+    async def execute(
+        self,
+        call: AgentToolCall,
+        *,
+        context: AgentToolContext,
+    ) -> AgentToolExecution:
+        del context
+        self.calls.append(call)
+        if self.pause:
+            return AgentToolExecution(
+                call=call,
+                awaiting_approval=True,
+                reason="approval required",
+            )
+        return AgentToolExecution(
+            call=call,
+            result=AgentToolResult(
+                call_id=call.call_id,
+                status=ToolCallStatus.SUCCEEDED,
+                result={"content": "tool output"},
+                output="tool output",
+            ),
+        )
+
+
 def _text_response(text: str, usage: Usage | None = None) -> ProviderResponse:
     return ProviderResponse(
         text=text,
         usage=Usage(input_tokens=11, output_tokens=7, elapsed_ms=12) if usage is None else usage,
         finish_reason=FinishReason.STOP,
+    )
+
+
+def _tool_response(call: AgentToolCall) -> ProviderResponse:
+    return ProviderResponse(
+        tool_calls=(call,),
+        usage=Usage(input_tokens=3, output_tokens=2, elapsed_ms=1),
+        finish_reason=FinishReason.TOOL_CALLS,
     )
 
 
@@ -100,13 +147,22 @@ async def store(tmp_path: Path) -> AsyncIterator[SqliteStore]:
 
 
 def build_controller(
-    store: SqliteStore, adapter: FakeAdapter, *, leader: FakeAdapter | None = None
+    store: SqliteStore,
+    adapter: FakeAdapter,
+    *,
+    leader: FakeAdapter | None = None,
+    tool_executor: FakeToolExecutor | None = None,
 ) -> RunController:
     settings = Settings(leader_profile=LEADER_PROFILE, worker_profile=WORKER_PROFILE)
     adapters: dict[str, object] = {"worker": adapter}
     if leader is not None:
         adapters["leader"] = leader
-    return RunController(store, settings, adapters)  # type: ignore[arg-type]
+    return RunController(
+        store,
+        settings,
+        adapters,  # type: ignore[arg-type]
+        tool_executor=tool_executor,
+    )
 
 
 async def event_types(store: SqliteStore, run_id: str) -> list[EventType]:
@@ -134,6 +190,7 @@ async def test_direct_run_completes_with_one_attempt(store: SqliteStore) -> None
     assert finished.status is RunStatus.SUCCEEDED
     assert finished.strategy is ExecutionStrategy.DIRECT
     assert finished.error is None
+    assert finished.final_work_unit_id is None
     assert finished.started_at is not None
     assert finished.completed_at is not None
 
@@ -167,6 +224,53 @@ async def test_direct_run_completes_with_one_attempt(store: SqliteStore) -> None
 
 
 @pytest.mark.asyncio
+async def test_direct_worker_reuses_bounded_agent_loop_for_tool_calls(
+    store: SqliteStore,
+) -> None:
+    call = AgentToolCall(
+        call_id="call-1",
+        tool_name="read_file",
+        arguments={"path": "src/main.py"},
+    )
+    adapter = FakeAdapter(_tool_response(call), _text_response("final answer"))
+    executor = FakeToolExecutor()
+    controller = build_controller(store, adapter, tool_executor=executor)
+    run = await controller.create_run(NativeRunRequest(input="inspect the file"))
+
+    finished = await controller.execute(run.run_id)
+
+    assert finished.status is RunStatus.SUCCEEDED
+    assert adapter.call_count == 2
+    assert executor.calls == [call]
+    assert adapter.requests[1].history[0].kind == "turn"
+    assert adapter.requests[1].history[1].kind == "tool_result"
+    units = await store.list_work_units(run.run_id)
+    artifacts = await store.list_artifacts(units[0].work_unit_id)
+    assert artifacts[0].content == "final answer"
+
+
+@pytest.mark.asyncio
+async def test_direct_approval_pause_blocks_unit_without_failing_run(
+    store: SqliteStore,
+) -> None:
+    call = AgentToolCall(call_id="call-1", tool_name="apply_patch")
+    adapter = FakeAdapter(_tool_response(call))
+    controller = build_controller(
+        store,
+        adapter,
+        tool_executor=FakeToolExecutor(pause=True),
+    )
+    run = await controller.create_run(NativeRunRequest(input="make the change"))
+
+    paused = await controller.execute(run.run_id)
+
+    assert paused.status is RunStatus.RUNNING
+    units = await store.list_work_units(run.run_id)
+    assert units[0].status is WorkUnitStatus.RUNNING
+    assert paused.error is None
+
+
+@pytest.mark.asyncio
 async def test_direct_success_event_order(store: SqliteStore) -> None:
     controller = build_controller(store, FakeAdapter())
     run = await controller.create_run(NativeRunRequest(input="hello"))
@@ -180,10 +284,14 @@ async def test_direct_success_event_order(store: SqliteStore) -> None:
         EventType.WORK_UNIT_CREATED,
         EventType.WORK_UNIT_READY,
         EventType.WORK_UNIT_STARTED,
+        EventType.RESERVATION_CREATED,
+        EventType.RESERVATION_HELD,
         EventType.ATTEMPT_STARTED,
+        EventType.AGENT_HISTORY_RECORDED,
         EventType.ATTEMPT_SUCCEEDED,
         EventType.ARTIFACT_PRODUCED,
         EventType.USAGE_UPDATED,
+        EventType.RESERVATION_SETTLED,
         EventType.EVIDENCE_RECORDED,
         EventType.EVIDENCE_RECORDED,
         EventType.CONTROLLER_DECISION,
@@ -204,6 +312,47 @@ async def test_assembled_result_reflects_persisted_facts(store: SqliteStore) -> 
     assert result.output_kind is ArtifactKind.TEXT
     assert result.usage.total_tokens == 18
     assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_expired_session_scope_stops_before_provider_dispatch(
+    store: SqliteStore,
+) -> None:
+    owner_id = "prn_tenant_owner"
+    created_at = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    workspace = Workspace(
+        workspace_id=new_workspace_id(),
+        owner_id=owner_id,
+        alias="project-main",
+        source=WorkspaceSource(
+            source_type=WorkspaceSourceType.SERVER_ALIAS,
+            server_alias="repo-main",
+        ),
+        created_at=created_at,
+    )
+    await store.create_workspace(workspace)
+    session = Session(
+        session_id=new_session_id(),
+        principal_id=owner_id,
+        workspace_id=workspace.workspace_id,
+        grant=WorkspaceGrant(
+            principal_id=owner_id,
+            workspace_id=workspace.workspace_id,
+            access=(ResourceAccess.READ,),
+            expires_at=created_at + timedelta(seconds=1),
+        ),
+        created_at=created_at,
+        expires_at=created_at + timedelta(seconds=1),
+    )
+    await store.create_session(session)
+    adapter = FakeAdapter()
+    controller = build_controller(store, adapter)
+    run = await controller.create_run(NativeRunRequest(input="inspect"))
+    await store.attach_run_to_session(session.session_id, run.run_id, principal_id=owner_id)
+
+    with pytest.raises(StateError, match="expired"):
+        await controller.execute(run.run_id, principal_id=owner_id)
+    assert adapter.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -273,8 +422,11 @@ async def test_provider_failure_fails_the_run(store: SqliteStore) -> None:
         EventType.WORK_UNIT_CREATED,
         EventType.WORK_UNIT_READY,
         EventType.WORK_UNIT_STARTED,
+        EventType.RESERVATION_CREATED,
+        EventType.RESERVATION_HELD,
         EventType.ATTEMPT_STARTED,
         EventType.ATTEMPT_FAILED,
+        EventType.RESERVATION_SETTLED,
         EventType.WORK_UNIT_FAILED,
         EventType.RUN_FAILED,
     ]
@@ -282,7 +434,9 @@ async def test_provider_failure_fails_the_run(store: SqliteStore) -> None:
 
 @pytest.mark.asyncio
 async def test_blank_completion_is_a_failure_not_an_artifact(store: SqliteStore) -> None:
-    adapter = FakeAdapter(_text_response("   \n "))
+    adapter = FakeAdapter(
+        ProviderError("blank completion", code=ErrorCode.PROVIDER_INVALID_RESPONSE)
+    )
     controller = build_controller(store, adapter)
     run = await controller.create_run(NativeRunRequest(input="hello"))
     finished = await controller.execute(run.run_id)

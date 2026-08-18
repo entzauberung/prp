@@ -20,9 +20,25 @@ EXPECTED_TABLES = {
     "work_unit_dependencies",
     "work_unit_resource_claims",
     "attempts",
+    "agent_history",
     "artifacts",
     "evidence",
+    "reservations",
     "events",
+    "workspaces",
+    "snapshots",
+    "snapshot_files",
+    "change_sets",
+    "change_set_files",
+    "tool_calls",
+    "tool_results",
+    "bridge_claims",
+    "approvals",
+    "leases",
+    "sessions",
+    "session_runs",
+    "progressive_rounds",
+    "merge_ledger",
 }
 
 EXPECTED_INDEXES = {
@@ -31,11 +47,36 @@ EXPECTED_INDEXES = {
     "idx_work_unit_dependencies_depends_on",
     "idx_work_unit_resource_claims_resource",
     "idx_attempts_run_status",
+    "idx_agent_history_run",
     "idx_artifacts_work_unit",
     "idx_artifacts_attempt",
     "idx_evidence_artifact",
     "idx_evidence_work_unit",
+    "idx_reservations_run_status",
+    "idx_reservations_work_unit",
+    "uq_reservations_active_dispatch",
     "idx_events_type",
+    "idx_workspaces_owner",
+    "idx_snapshots_workspace",
+    "idx_snapshot_files_snapshot",
+    "idx_change_sets_run",
+    "idx_change_sets_workspace",
+    "idx_change_set_files_path",
+    "idx_tool_calls_run_status",
+    "idx_tool_calls_work_unit",
+    "idx_tool_calls_workspace",
+    "idx_tool_results_status",
+    "idx_bridge_claims_call",
+    "idx_bridge_claims_owner",
+    "uq_bridge_claims_active_call",
+    "idx_approvals_owner",
+    "idx_approvals_run",
+    "idx_approvals_call",
+    "idx_leases_owner",
+    "idx_leases_run",
+    "idx_progressive_rounds_run",
+    "idx_merge_ledger_run",
+    "idx_merge_ledger_snapshot",
 }
 
 
@@ -78,6 +119,142 @@ async def _insert_work_unit(
         VALUES (?, ?, 1, 'unit', 'do it', '{}', 'PENDING', '2026-08-10T12:00:00+00:00')
         """,
         (work_unit_id, run_id),
+    )
+
+
+async def _insert_workspace(
+    store: SqliteStore,
+    workspace_id: str = "ws_1",
+    owner_id: str = "owner_1",
+    alias: str = "project-main",
+) -> None:
+    await store.connection.execute(
+        """
+        INSERT INTO workspaces (
+            workspace_id, owner_id, alias, source_type, server_alias, status, created_at
+        ) VALUES (?, ?, ?, 'SERVER_ALIAS', 'repo-main', 'ACTIVE',
+                  '2026-08-10T12:00:00+00:00')
+        """,
+        (workspace_id, owner_id, alias),
+    )
+
+
+async def _insert_snapshot(
+    store: SqliteStore,
+    snapshot_id: str = "snap_1",
+    workspace_id: str = "ws_1",
+    manifest_hash: str = "a" * 64,
+) -> None:
+    await store.connection.execute(
+        """
+        INSERT INTO snapshots (
+            snapshot_id, workspace_id, status, manifest_hash, file_count, total_size,
+            created_at
+        ) VALUES (?, ?, 'CREATING', ?, 0, 0, '2026-08-10T12:00:00+00:00')
+        """,
+        (snapshot_id, workspace_id, manifest_hash),
+    )
+
+
+async def _insert_tool_call(
+    store: SqliteStore,
+    call_id: str = "tc_1",
+    run_id: str = "run_1",
+    work_unit_id: str = "wu_1",
+    workspace_id: str = "ws_1",
+    snapshot_id: str = "snap_1",
+    idempotency_key: str = "request-1",
+    status: str = "REQUESTED",
+    started_at: str | None = None,
+    completed_at: str | None = None,
+) -> None:
+    await store.connection.execute(
+        """
+        INSERT INTO tool_calls (
+            call_id, run_id, work_unit_id, workspace_id, base_snapshot_id,
+            idempotency_key, tool_name, effect, arguments_json, status,
+            requested_at, started_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'read_file', 'READ', '{}', ?,
+                  '2026-08-10T12:00:00+00:00', ?, ?)
+        """,
+        (
+            call_id,
+            run_id,
+            work_unit_id,
+            workspace_id,
+            snapshot_id,
+            idempotency_key,
+            status,
+            started_at,
+            completed_at,
+        ),
+    )
+
+
+async def _insert_bridge_session(
+    store: SqliteStore,
+    session_id: str = "ses_1",
+    run_id: str = "run_1",
+    workspace_id: str = "ws_1",
+    owner_id: str = "owner_1",
+) -> None:
+    await store.connection.execute(
+        """
+        INSERT INTO sessions (
+            session_id, principal_id, workspace_id, access_json,
+            agent_options_json, status, created_at
+        ) VALUES (?, ?, ?, '["READ"]', '{"execution_location":"BRIDGE"}',
+                  'ACTIVE', '2026-08-10T12:00:00+00:00')
+        """,
+        (session_id, owner_id, workspace_id),
+    )
+    await store.connection.execute(
+        """
+        INSERT INTO session_runs (session_id, run_id, created_at)
+        VALUES (?, ?, '2026-08-10T12:00:00+00:00')
+        """,
+        (session_id, run_id),
+    )
+
+
+async def _insert_bridge_claim(
+    store: SqliteStore,
+    claim_id: str = "claim_1",
+    call_id: str = "tc_1",
+    run_id: str = "run_1",
+    session_id: str = "ses_1",
+    workspace_id: str = "ws_1",
+    owner_id: str = "owner_1",
+    claimant_id: str = "bridge-client-1",
+    idempotency_key: str = "claim-request-1",
+    status: str = "ACTIVE",
+    claimed_at: str = "2026-08-10T12:00:00+00:00",
+    expires_at: str = "2026-08-10T12:05:00+00:00",
+    closed_at: str | None = None,
+) -> None:
+    await store.connection.execute(
+        """
+        INSERT INTO bridge_claims (
+            claim_id, call_id, run_id, session_id, workspace_id, owner_id,
+            claimant_id, idempotency_key, fingerprint, status, claimed_at,
+            expires_at, closed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            claim_id,
+            call_id,
+            run_id,
+            session_id,
+            workspace_id,
+            owner_id,
+            claimant_id,
+            idempotency_key,
+            "a" * 64,
+            status,
+            claimed_at,
+            expires_at,
+            closed_at,
+        ),
     )
 
 
@@ -189,6 +366,344 @@ async def test_schema_covers_every_persisted_entity(database_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_workspace_snapshot_columns_and_owner_contract_are_persisted(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        assert await _columns(store, "workspaces") == {
+            "workspace_id",
+            "owner_id",
+            "alias",
+            "source_type",
+            "server_alias",
+            "bridge_grant",
+            "status",
+            "created_at",
+            "closed_at",
+        }
+        assert await _columns(store, "snapshots") == {
+            "snapshot_id",
+            "workspace_id",
+            "status",
+            "manifest_hash",
+            "file_count",
+            "total_size",
+            "created_at",
+            "completed_at",
+        }
+        assert await _columns(store, "snapshot_files") == {
+            "snapshot_id",
+            "path",
+            "sha256",
+            "size",
+            "entry_type",
+        }
+        assert await _columns(store, "change_sets") == {
+            "change_set_id",
+            "run_id",
+            "tool_call_id",
+            "workspace_id",
+            "base_snapshot_id",
+            "new_snapshot_id",
+            "patch_text",
+            "patch_sha256",
+            "created_at",
+        }
+        assert await _columns(store, "change_set_files") == {
+            "change_set_id",
+            "path",
+            "action",
+            "before_sha256",
+            "before_size",
+            "after_sha256",
+            "after_size",
+        }
+
+
+@pytest.mark.asyncio
+async def test_tool_tables_have_the_closed_call_and_result_contract(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        assert await _columns(store, "tool_calls") == {
+            "call_id",
+            "run_id",
+            "work_unit_id",
+            "workspace_id",
+            "base_snapshot_id",
+            "idempotency_key",
+            "tool_name",
+            "effect",
+            "arguments_json",
+            "status",
+            "requested_at",
+            "started_at",
+            "completed_at",
+        }
+        assert await _columns(store, "tool_results") == {
+            "call_id",
+            "status",
+            "result_json",
+            "output",
+            "truncated",
+            "changed_paths_json",
+            "exit_code",
+            "error_category",
+            "error_message",
+            "completed_at",
+        }
+        assert await _columns(store, "bridge_claims") == {
+            "claim_id",
+            "call_id",
+            "run_id",
+            "session_id",
+            "workspace_id",
+            "owner_id",
+            "claimant_id",
+            "idempotency_key",
+            "fingerprint",
+            "status",
+            "claimed_at",
+            "expires_at",
+            "closed_at",
+        }
+
+
+@pytest.mark.asyncio
+async def test_bridge_claim_scope_lease_and_terminal_constraints_are_enforced(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        await _insert_work_unit(store)
+        await _insert_workspace(store)
+        await _insert_snapshot(store)
+        await _insert_tool_call(store)
+        await _insert_bridge_session(store)
+        await store.connection.commit()
+
+        await _insert_bridge_claim(store)
+        await store.connection.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_bridge_claim(store, claim_id="claim_2", idempotency_key="claim-2")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_bridge_claim(store, claim_id="claim_3")
+
+        await store.connection.execute(
+            "UPDATE bridge_claims SET status = 'SETTLED', "
+            "closed_at = '2026-08-10T12:01:00+00:00' WHERE claim_id = 'claim_1'"
+        )
+        await store.connection.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                "UPDATE bridge_claims SET status = 'ACTIVE', closed_at = NULL "
+                "WHERE claim_id = 'claim_1'"
+            )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_bridge_claim(
+                store,
+                claim_id="claim_4",
+                call_id="tc_missing",
+                idempotency_key="claim-4",
+            )
+
+
+@pytest.mark.asyncio
+async def test_tool_call_foreign_keys_and_idempotency_are_enforced(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        await _insert_work_unit(store)
+        await _insert_workspace(store)
+        await _insert_snapshot(store)
+        await _insert_tool_call(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, call_id="tc_2")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, call_id="tc_2", idempotency_key="request-1")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, call_id="tc_3", workspace_id="ws_missing")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, call_id="tc_4", snapshot_id="snap_missing")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, call_id="tc_5", work_unit_id="wu_missing")
+
+
+@pytest.mark.asyncio
+async def test_tool_call_lifecycle_checks_reject_impossible_rows(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        await _insert_work_unit(store)
+        await _insert_workspace(store)
+        await _insert_snapshot(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, status="NOT_A_STATUS")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(store, status="RUNNING")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_tool_call(
+                store,
+                status="REQUESTED",
+                started_at="2026-08-10T12:00:01+00:00",
+            )
+        await _insert_tool_call(
+            store,
+            call_id="tc_running",
+            idempotency_key="request-running",
+            status="RUNNING",
+            started_at="2026-08-10T12:00:01+00:00",
+        )
+        await _insert_tool_call(
+            store,
+            call_id="tc_done",
+            idempotency_key="request-done",
+            status="SUCCEEDED",
+            completed_at="2026-08-10T12:00:02+00:00",
+        )
+
+
+@pytest.mark.asyncio
+async def test_tool_result_is_one_to_one_terminal_and_bounded(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        await _insert_work_unit(store)
+        await _insert_workspace(store)
+        await _insert_snapshot(store)
+        await _insert_tool_call(
+            store,
+            status="SUCCEEDED",
+            completed_at="2026-08-10T12:00:02+00:00",
+        )
+        await store.connection.execute(
+            """
+            INSERT INTO tool_results (
+                call_id, status, result_json, output, truncated,
+                changed_paths_json, completed_at
+            ) VALUES ('tc_1', 'SUCCEEDED', '{"content":"ok"}', 'ok', 0,
+                      '["src/main.py"]', '2026-08-10T12:00:02+00:00')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                "INSERT INTO tool_results (call_id, status, completed_at) "
+                "VALUES ('tc_1', 'CANCELLED', '2026-08-10T12:00:03+00:00')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                "INSERT INTO tool_results (call_id, status, completed_at) "
+                "VALUES ('tc_missing', 'SUCCEEDED', '2026-08-10T12:00:03+00:00')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                "INSERT INTO tool_results (call_id, status, completed_at) "
+                "VALUES ('tc_bad', 'PENDING', '2026-08-10T12:00:03+00:00')"
+            )
+
+
+@pytest.mark.asyncio
+async def test_tool_result_errors_and_output_limits_are_constrained(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        await _insert_work_unit(store)
+        await _insert_workspace(store)
+        await _insert_snapshot(store)
+        await _insert_tool_call(
+            store,
+            status="FAILED",
+            completed_at="2026-08-10T12:00:02+00:00",
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                "INSERT INTO tool_results (call_id, status, completed_at) "
+                "VALUES ('tc_1', 'FAILED', '2026-08-10T12:00:02+00:00')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                """
+                INSERT INTO tool_results (
+                    call_id, status, error_category, error_message, completed_at
+                ) VALUES ('tc_1', 'FAILED', NULL, 'x',
+                          '2026-08-10T12:00:02+00:00')
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                """
+                INSERT INTO tool_results (
+                    call_id, status, error_category, error_message, output, completed_at
+                ) VALUES ('tc_1', 'FAILED', 'UNKNOWN', 'failed', :output,
+                          '2026-08-10T12:00:02+00:00')
+                """,
+                {"output": "x" * 262145},
+            )
+
+
+@pytest.mark.asyncio
+async def test_workspace_snapshot_constraints_preserve_owner_and_manifest_identity(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_workspace(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_workspace(store, workspace_id="ws_2")
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                """
+                INSERT INTO workspaces (
+                    workspace_id, owner_id, alias, source_type, server_alias,
+                    bridge_grant, status, created_at
+                ) VALUES ('ws_3', 'owner_1', 'bridge', 'BRIDGE_GRANT',
+                          'repo-main', 'grant_1', 'ACTIVE',
+                          '2026-08-10T12:00:00+00:00')
+                """
+            )
+        await _insert_snapshot(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_snapshot(store, snapshot_id="snap_2")
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_snapshot(store, snapshot_id="snap_3", manifest_hash="B" * 64)
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_snapshot(store, snapshot_id="snap_4", workspace_id="ws_missing")
+
+
+@pytest.mark.asyncio
+async def test_snapshot_files_reject_unsafe_paths_and_keep_audit_rows(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_workspace(store)
+        await _insert_snapshot(store)
+        insert = """
+            INSERT INTO snapshot_files (snapshot_id, path, sha256, size, entry_type)
+            VALUES ('snap_1', ?, ?, 3, 'FILE')
+        """
+        await store.connection.execute(insert, ("src/main.py", "a" * 64))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("../secret", "b" * 64))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("/etc/passwd", "b" * 64))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("README.md", "B" * 64))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("src/main.py", "c" * 64))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                "DELETE FROM workspaces WHERE workspace_id = 'ws_1'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute("DELETE FROM snapshots WHERE snapshot_id = 'snap_1'")
+        assert await _scalar(store, "SELECT COUNT(*) FROM snapshot_files") == 1
+
+
+@pytest.mark.asyncio
 async def test_usage_columns_exist_on_runs_and_attempts(database_path: Path) -> None:
     usage_columns = {
         "usage_input_tokens",
@@ -201,6 +716,118 @@ async def test_usage_columns_exist_on_runs_and_attempts(database_path: Path) -> 
             async with store.connection.execute(f"PRAGMA table_info({table})") as cursor:
                 columns = {str(row["name"]) for row in await cursor.fetchall()}
             assert usage_columns <= columns
+
+
+@pytest.mark.asyncio
+async def test_reservation_schema_has_the_admission_and_settlement_columns(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        assert await _columns(store, "reservations") == {
+            "reservation_id",
+            "run_id",
+            "work_unit_id",
+            "dispatch_key",
+            "attempt_units",
+            "estimated_input_tokens",
+            "estimated_output_tokens",
+            "token_upper_bound",
+            "strong_token_upper_bound",
+            "capacity_key",
+            "status",
+            "created_at",
+            "held_at",
+            "completed_at",
+            "measured_input_tokens",
+            "measured_output_tokens",
+            "measured_strong_model_tokens",
+            "measured_elapsed_ms",
+        }
+
+
+@pytest.mark.asyncio
+async def test_reservation_schema_rejects_duplicate_dispatch_and_invalid_lifecycle(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        await _insert_work_unit(store)
+        insert = """
+            INSERT INTO reservations (
+                reservation_id, run_id, work_unit_id, dispatch_key, attempt_units,
+                status, created_at
+            ) VALUES (?, 'run_1', 'wu_1', ?, 1, ?, '2026-08-10T12:00:00+00:00')
+        """
+        await store.connection.execute(insert, ("res_1", "dispatch-1", "PENDING"))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("res_2", "dispatch-1", "PENDING"))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("res_3", "dispatch-2", "UNKNOWN"))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(insert, ("res_4", "   ", "PENDING"))
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                """
+                INSERT INTO reservations (
+                    reservation_id, run_id, work_unit_id, dispatch_key, attempt_units,
+                    status, created_at, held_at, completed_at
+                ) VALUES ('res_5', 'run_1', 'wu_1', 'dispatch-3', 1, 'SETTLED',
+                          '2026-08-10T12:00:00+00:00', NULL,
+                          '2026-08-10T12:00:01+00:00')
+                """
+            )
+
+
+@pytest.mark.asyncio
+async def test_reservation_schema_enforces_run_and_work_unit_foreign_keys(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                """
+                INSERT INTO reservations (
+                    reservation_id, run_id, work_unit_id, dispatch_key, attempt_units,
+                    status, created_at
+                ) VALUES ('res_missing', 'run_1', 'wu_missing', 'dispatch-1', 1,
+                          'PENDING', '2026-08-10T12:00:00+00:00')
+                """
+            )
+
+
+@pytest.mark.asyncio
+async def test_runs_store_final_work_unit_id_and_work_units_have_same_graph_key(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        assert {"final_work_unit_id"} <= await _columns(store, "runs")
+        assert {"work_unit_id", "run_id", "graph_version"} <= await _columns(
+            store, "work_units"
+        )
+        assert {
+            "lineage_key",
+            "dependency_fingerprint",
+            "content_fingerprint",
+        } <= await _columns(store, "work_units")
+
+
+@pytest.mark.asyncio
+async def test_work_unit_schema_rejects_malformed_fingerprints(database_path: Path) -> None:
+    async with SqliteStore(database_path) as store:
+        await _insert_run(store)
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.connection.execute(
+                """
+                INSERT INTO work_units (
+                    work_unit_id, run_id, graph_version, lineage_key,
+                    dependency_fingerprint, content_fingerprint, name, instruction,
+                    output_json, status, created_at
+                ) VALUES ('wu_bad', 'run_1', 1, 'node', 'bad', :content,
+                          'unit', 'do it', '{}', 'PENDING', '2026-08-10T12:00:00+00:00')
+                """,
+                {"content": "0" * 64},
+            )
 
 
 @pytest.mark.asyncio

@@ -276,7 +276,7 @@ def test_every_row_the_verifier_writes_is_a_complete_verdict() -> None:
 
 
 def test_the_schema_version_is_the_repaired_one() -> None:
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 11
 
 
 def test_the_stored_shape_has_no_boolean_column() -> None:

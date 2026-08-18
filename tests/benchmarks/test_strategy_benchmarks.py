@@ -52,6 +52,7 @@ class BenchmarkAdapter:
             text = json.dumps(
                 {
                     "summary": "one fixed benchmark node",
+                    "final_node": "answer",
                     "nodes": [
                         {
                             "key": "answer",
@@ -134,7 +135,7 @@ async def test_four_strategy_relative_samples_have_stable_fact_shapes(
                 ),
             )
         )
-        assert finished.status is RunStatus.SUCCEEDED
+        assert finished.status is RunStatus.SUCCEEDED, (strategy, finished.error)
 
     assert [sample.strategy for sample in samples] == list(ExecutionStrategy)
     assert all(sample.wall_time_ns >= 0 for sample in samples)

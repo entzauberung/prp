@@ -62,6 +62,14 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         yield opened
 
 
+def wait_for_response(client: TestClient, run_id: str) -> dict[str, object]:
+    for _ in range(200):
+        body = client.get(f"/v1/responses/{run_id}").json()
+        if body["status"] in {"completed", "failed", "cancelled"}:
+            return body
+    raise AssertionError("Responses run did not reach a terminal state")
+
+
 def test_responses_create_query_and_cancel_share_one_envelope(
     client: TestClient,
 ) -> None:
@@ -69,8 +77,10 @@ def test_responses_create_query_and_cancel_share_one_envelope(
         "/v1/responses",
         json={"input": "hello", "instructions": "be terse"},
     )
-    assert created.status_code == 200
-    body = created.json()
+    assert created.status_code == 202
+    created_body = created.json()
+    assert created_body["status"] in {"pending", "in_progress", "completed"}
+    body = wait_for_response(client, created_body["id"])
     assert body["object"] == "response"
     assert body["status"] == "completed"
     assert body["output_text"] == "bound answer"
@@ -80,6 +90,10 @@ def test_responses_create_query_and_cancel_share_one_envelope(
 
     run_id = body["id"]
     assert client.get(f"/v1/responses/{run_id}").json() == body
+    events = client.get(f"/v1/responses/{run_id}/events")
+    assert events.status_code == 200
+    assert events.headers["content-type"].startswith("text/event-stream")
+    assert "response.run_created" in events.text
     cancelled = client.post(f"/v1/responses/{run_id}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "completed"
@@ -156,8 +170,13 @@ def test_external_routing_intent_reaches_controller(
 ) -> None:
     created = client.post(path, json=payload)
 
-    assert created.status_code == 200
-    native = client.get(f"/v1/runs/{created.json()['id']}")
+    if path == "/v1/responses":
+        assert created.status_code == 202
+        body = wait_for_response(client, created.json()["id"])
+    else:
+        assert created.status_code == 200
+        body = created.json()
+    native = client.get(f"/v1/runs/{body['id']}")
     assert native.status_code == 200
     assert native.json()["strategy"] == "CASCADE"
 

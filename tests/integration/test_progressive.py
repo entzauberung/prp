@@ -66,11 +66,38 @@ def _settings() -> Settings:
 def _proposal(key: str) -> PlanProposal:
     return PlanProposal(
         summary=f"plan {key}",
+        final_node=key,
         nodes=(
             {
                 "key": key,
                 "name": key.title(),
                 "instruction": f"produce {key}",
+                "output": {"kind": "JSON", "json_schema": RESULT_SCHEMA},
+            },
+        ),
+    )
+
+
+def _chain_proposal(*, changed_tail: bool = False) -> PlanProposal:
+    return PlanProposal(
+        summary="chain revision",
+        final_node="tail",
+        nodes=(
+            {
+                "key": "root",
+                "lineage_key": "root-lineage",
+                "name": "Root",
+                "instruction": "produce root",
+                "output": {"kind": "JSON", "json_schema": RESULT_SCHEMA},
+            },
+            {
+                "key": "tail",
+                "lineage_key": "tail-lineage",
+                "name": "Tail",
+                "instruction": (
+                    "produce changed tail" if changed_tail else "produce tail"
+                ),
+                "depends_on": ["root"],
                 "output": {"kind": "JSON", "json_schema": RESULT_SCHEMA},
             },
         ),
@@ -174,7 +201,7 @@ async def test_fail_evidence_revises_once_and_isolates_old_graph(
 
     finished = await controller.execute(run.run_id)
 
-    assert finished.status is RunStatus.SUCCEEDED
+    assert finished.status is RunStatus.SUCCEEDED, finished.error
     assert finished.strategy is ExecutionStrategy.PROGRESSIVE
     assert finished.graph_version == 3
     assert finished.usage == Usage(
@@ -186,10 +213,22 @@ async def test_fail_evidence_revises_once_and_isolates_old_graph(
     assert len(worker.requests) == 2
     old_units = await store.list_work_units(run.run_id, graph_version=2)
     new_units = await store.list_work_units(run.run_id, graph_version=3)
+    persisted = await store.get_run(run.run_id)
+    assert persisted.final_work_unit_id == new_units[0].work_unit_id
+    assert persisted.final_work_unit_id != old_units[0].work_unit_id
     assert old_units[0].status is WorkUnitStatus.FAILED
     assert new_units[0].status is WorkUnitStatus.SUCCEEDED
     assert len(await store.list_evidence(old_units[0].work_unit_id)) == 4
     assert len(await store.list_evidence(new_units[0].work_unit_id)) == 4
+    rounds = await store.list_rounds(run.run_id)
+    assert [round_fact.round_index for round_fact in rounds] == [0, 1]
+    assert [round_fact.graph_version for round_fact in rounds] == [2, 3]
+    assert [round_fact.status.value for round_fact in rounds] == ["FAILED", "VERIFIED"]
+    assert rounds[0].merged_snapshot_id is None
+    assert rounds[1].merged_snapshot_id is not None
+    assert rounds[0].base_snapshot_id == rounds[1].base_snapshot_id
+    assert rounds[1].revision_of_round_id == rounds[0].round_id
+    assert rounds[1].evidence_ids
     attempts = await store.list_run_attempts(run.run_id)
     planner_attempts = tuple(
         attempt for attempt in attempts if attempt.role is ModelRole.PLANNER
@@ -210,6 +249,17 @@ async def test_fail_evidence_revises_once_and_isolates_old_graph(
     assert all(unit.status is WorkUnitStatus.SUCCEEDED for unit in planning_units)
     events = await store.list_events(run.run_id)
     assert EventType.PLAN_REVISED in {event.event_type for event in events}
+    global_reports = [
+        event
+        for event in events
+        if event.event_type is EventType.CONTROLLER_DECISION
+        and "global_report" in event.payload
+    ]
+    assert [event.payload["global_report"]["result"] for event in global_reports] == [
+        "FAIL",
+        "PASS",
+    ]
+    assert global_reports[1].payload["comparison"]["outcome"] == "IMPROVED"
     assert events[-1].event_type is EventType.RUN_SUCCEEDED
     assert assert_sequence_chain(events) is None
 
@@ -227,9 +277,92 @@ async def test_progressive_pass_never_calls_revision_planner(store: SqliteStore)
     assert finished.graph_version == 2
     assert len(planner.requests) == 1
     assert len(worker.requests) == 1
+    rounds = await store.list_rounds(run.run_id)
+    assert len(rounds) == 1
+    assert rounds[0].status.value == "VERIFIED"
+    assert rounds[0].graph_version == 2
+    assert rounds[0].merged_snapshot_id is not None
+    assert rounds[0].evidence_ids
     assert EventType.PLAN_REVISED not in {
         event.event_type for event in await store.list_events(run.run_id)
     }
+    reports = [
+        event
+        for event in await store.list_events(run.run_id)
+        if event.event_type is EventType.CONTROLLER_DECISION
+        and "global_report" in event.payload
+    ]
+    assert len(reports) == 1
+    assert reports[0].payload["global_report"]["result"] == "PASS"
+    assert reports[0].payload["comparison"]["outcome"] == "BASELINE"
+    global_report = reports[0].payload["global_report"]
+    assert global_report["round_id"] == rounds[0].round_id
+    candidate_checks = [
+        check for check in global_report["checks"] if check["kind"] == "CANDIDATE"
+    ]
+    assert len(candidate_checks) == 1
+    assert rounds[0].merged_snapshot_id in candidate_checks[0]["fact_ids"]
+    assert set(rounds[0].evidence_ids).issubset(candidate_checks[0]["fact_ids"])
+
+
+@pytest.mark.asyncio
+async def test_revision_reuses_unchanged_root_and_recomputes_changed_tail(
+    store: SqliteStore,
+) -> None:
+    initial = _chain_proposal()
+    revised = PlanRevision(
+        base_graph_version=2,
+        reason=PlanRevisionReason.VERIFICATION_FAILED,
+        summary="change only the tail",
+        proposal=_chain_proposal(changed_tail=True),
+    )
+    planner = RevisionPlannerAdapter(initial, revised)
+    worker = RevisionWorkerAdapter(
+        ('{"ok":true}', '{"ok":false}', '{"ok":true}')
+    )
+    controller = RunController(
+        store,
+        _settings(),
+        {"planner": planner, "worker": worker},
+    )
+    run = await controller.create_run(_run_request(max_attempts=8))
+
+    finished = await controller.execute(run.run_id)
+
+    assert finished.status is RunStatus.SUCCEEDED, finished.error
+    assert len(worker.requests) == 3
+    old_units = await store.list_work_units(run.run_id, graph_version=2)
+    new_units = await store.list_work_units(run.run_id, graph_version=3)
+    old_by_lineage = {unit.lineage_key: unit for unit in old_units}
+    new_by_lineage = {unit.lineage_key: unit for unit in new_units}
+    old_root_artifacts = await store.list_artifacts(old_by_lineage["root-lineage"].work_unit_id)
+    old_tail_artifacts = await store.list_artifacts(old_by_lineage["tail-lineage"].work_unit_id)
+    new_root_artifacts = await store.list_artifacts(new_by_lineage["root-lineage"].work_unit_id)
+    new_tail_artifacts = await store.list_artifacts(new_by_lineage["tail-lineage"].work_unit_id)
+
+    assert old_by_lineage["root-lineage"].status is WorkUnitStatus.SUCCEEDED
+    assert old_by_lineage["tail-lineage"].status is WorkUnitStatus.FAILED
+    assert new_by_lineage["root-lineage"].status is WorkUnitStatus.SUCCEEDED
+    assert new_by_lineage["tail-lineage"].status is WorkUnitStatus.SUCCEEDED
+    assert [artifact.content for artifact in old_root_artifacts] == ["{\"ok\":true}"]
+    assert [artifact.content for artifact in old_tail_artifacts] == ["{\"ok\":false}"]
+    assert [artifact.content for artifact in new_root_artifacts] == ["{\"ok\":true}"]
+    assert [artifact.content for artifact in new_tail_artifacts] == ["{\"ok\":true}"]
+    assert old_root_artifacts[0].artifact_id != new_root_artifacts[0].artifact_id
+    assert old_tail_artifacts[0].artifact_id != new_tail_artifacts[0].artifact_id
+
+    events = await store.list_events(run.run_id)
+    reused = [event for event in events if event.event_type is EventType.WORK_UNIT_REUSED]
+    invalidated = [
+        event for event in events if event.event_type is EventType.WORK_UNIT_INVALIDATED
+    ]
+    assert len(reused) == 1
+    assert reused[0].payload["source_work_unit_id"] == old_by_lineage["root-lineage"].work_unit_id
+    assert reused[0].payload["work_unit_id"] == new_by_lineage["root-lineage"].work_unit_id
+    assert any(
+        event.payload["work_unit_id"] == old_by_lineage["tail-lineage"].work_unit_id
+        for event in invalidated
+    )
 
 
 @pytest.mark.asyncio
@@ -249,6 +382,11 @@ async def test_revision_budget_zero_stops_after_first_failed_graph(
     assert len(planner.requests) == 1
     assert len(worker.requests) == 1
     assert finished.graph_version == 2
+    rounds = await store.list_rounds(run.run_id)
+    assert len(rounds) == 1
+    assert rounds[0].status.value == "FAILED"
+    assert rounds[0].merged_snapshot_id is None
+    assert rounds[0].evidence_ids == ()
 
 
 @pytest.mark.asyncio
@@ -440,3 +578,11 @@ async def test_cancel_during_progressive_worker_skips_revision_call(
     assert finished.status is RunStatus.CANCELLED
     assert len(planner.requests) == 1
     assert len(worker.requests) == 1
+    rounds = await store.list_rounds(run.run_id)
+    assert len(rounds) == 1
+    assert rounds[0].status.value == "CANCELLED"
+    assert rounds[0].merged_snapshot_id is None
+    assert rounds[0].failure_reason
+    events = await store.list_events(run.run_id)
+    assert events[-1].event_type is EventType.RUN_CANCELLED
+    assert sum(event.event_type is EventType.ROUND_FAILED for event in events) == 1

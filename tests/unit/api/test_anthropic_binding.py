@@ -3,6 +3,11 @@
 import pytest
 
 from prp_runtime.api.anthropic_messages import _normalize
+from prp_runtime.api.tool_bindings import (
+    anthropic_messages_to_native_tool_turn,
+    native_tool_turn_to_anthropic_content,
+)
+from prp_runtime.domain.enums import ToolCallStatus
 from prp_runtime.domain.errors import ErrorCode, PrpError
 
 
@@ -82,3 +87,34 @@ def test_missing_messages_and_unknown_role_are_invalid() -> None:
         _normalize({"messages": [{"role": "system", "content": "no"}]})
     assert missing.value.code is ErrorCode.INVALID_REQUEST
     assert role.value.code is ErrorCode.INVALID_REQUEST
+
+
+def test_anthropic_tool_blocks_round_trip_through_shared_turn() -> None:
+    turn = anthropic_messages_to_native_tool_turn(
+        (
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-anthropic",
+                        "name": "read_file",
+                        "input": {"path": "README.md"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-anthropic",
+                        "content": "safe",
+                    }
+                ],
+            },
+        )
+    )
+    assert turn is not None
+    assert turn.tool_results[0].status is ToolCallStatus.SUCCEEDED
+    assert native_tool_turn_to_anthropic_content(turn)[1]["tool_use_id"] == "call-anthropic"

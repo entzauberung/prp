@@ -73,12 +73,20 @@ class PlanNode(PlanningModel):
     """One proposal-local unit before persistent WorkUnit IDs are assigned."""
 
     key: PlanNodeKey
+    lineage_key: PlanNodeKey
     name: PlanText
     instruction: PlanInstruction
     acceptance_criteria: PlanText | None = None
     output: OutputRequirement = Field(default_factory=OutputRequirement)
     depends_on: tuple[PlanNodeKey, ...] = ()
     resource_claims: tuple[ResourceClaim, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_lineage_to_local_key(cls, value: object) -> object:
+        if isinstance(value, dict) and "lineage_key" not in value and "key" in value:
+            return {**value, "lineage_key": value["key"]}
+        return value
 
     @model_validator(mode="after")
     def _references_and_claims_are_sane(self) -> "PlanNode":
@@ -96,6 +104,7 @@ class PlanProposal(PlanningModel):
     """A bounded public summary plus structured graph input."""
 
     summary: PlanText
+    final_node: PlanNodeKey
     nodes: tuple[PlanNode, ...] = Field(min_length=1, max_length=MAX_PLAN_NODES)
 
     @model_validator(mode="after")
@@ -103,6 +112,9 @@ class PlanProposal(PlanningModel):
         keys = tuple(node.key for node in self.nodes)
         if len(set(keys)) != len(keys):
             raise ValueError("duplicate plan node key")
+        lineage_keys = tuple(node.lineage_key for node in self.nodes)
+        if len(set(lineage_keys)) != len(lineage_keys):
+            raise ValueError("duplicate plan node lineage key")
         known = set(keys)
         unknown = sorted(
             {
@@ -114,6 +126,8 @@ class PlanProposal(PlanningModel):
         )
         if unknown:
             raise ValueError("unknown plan node dependency: " + ", ".join(unknown))
+        if self.final_node not in known:
+            raise ValueError("unknown plan final node: " + self.final_node)
         return self
 
 

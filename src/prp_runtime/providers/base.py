@@ -5,9 +5,12 @@ response. Endpoint and credential come from server-side configuration only: a
 caller can never supply a base URL or an API key, which keeps request-driven
 SSRF and credential injection impossible.
 
-This layer declares no tool calling and no multimodal capability.
+Tool descriptors are protocol-neutral public metadata. They never contain
+handlers, effect decisions, executables, credentials or workspace roots.
 """
 
+import json
+from decimal import Decimal
 from enum import StrEnum, unique
 from typing import Annotated, Protocol, runtime_checkable
 
@@ -15,15 +18,33 @@ from pydantic import ConfigDict, Field, SecretStr, StringConstraints, model_vali
 
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.domain.errors import DomainValidationError, ErrorCode
-from prp_runtime.domain.models import DomainModel, Usage
+from prp_runtime.domain.models import (
+    MAX_AGENT_HISTORY_ITEMS,
+    MAX_PROVIDER_TOOL_COUNT,
+    MAX_PROVIDER_TOOLS_BYTES,
+    AgentHistoryItem,
+    AgentToolCall,
+    AgentTurn,
+    AttemptCost,
+    DomainModel,
+    Money,
+    NonBlankText,
+    PromptText,
+    ProviderToolDescriptor,
+    Usage,
+)
 from prp_runtime.domain.values import ModelRef
 
 __all__ = [
     "FinishReason",
+    "AgentToolCall",
+    "AgentTurn",
+    "AttemptCost",
     "ModelProfile",
     "ProviderAdapter",
     "ProviderRequest",
     "ProviderResponse",
+    "ProviderToolDescriptor",
 ]
 
 Alias = Annotated[
@@ -46,6 +67,7 @@ class FinishReason(StrEnum):
     STOP = "STOP"
     LENGTH = "LENGTH"
     CONTENT_FILTER = "CONTENT_FILTER"
+    TOOL_CALLS = "TOOL_CALLS"
     OTHER = "OTHER"
 
 
@@ -67,8 +89,8 @@ class ModelProfile(DomainModel):
     supports_structured_output: bool = False
     context_window_tokens: int = Field(gt=0)
     max_output_tokens: int = Field(gt=0)
-    input_price_per_million_tokens: float = Field(default=0.0, ge=0.0)
-    output_price_per_million_tokens: float = Field(default=0.0, ge=0.0)
+    input_price_per_million_tokens: Money = Decimal("0")
+    output_price_per_million_tokens: Money = Decimal("0")
     max_concurrency: int = Field(default=1, ge=1)
     timeout_seconds: float = Field(default=60.0, gt=0.0)
 
@@ -83,6 +105,14 @@ class ModelProfile(DomainModel):
         """The domain reference recorded on every attempt using this profile."""
         return ModelRef(provider=self.provider, model=self.model)
 
+    def cost_for_usage(self, usage: Usage | None) -> AttemptCost | None:
+        """Calculate exact cost, preserving unknown Provider usage."""
+        return AttemptCost.from_usage(
+            usage,
+            input_price_per_million_tokens=self.input_price_per_million_tokens,
+            output_price_per_million_tokens=self.output_price_per_million_tokens,
+        )
+
 
 class ProviderRequest(DomainModel):
     """One normalised outbound text request.
@@ -93,11 +123,46 @@ class ProviderRequest(DomainModel):
 
     alias: Alias
     model: Name
-    input: str = Field(min_length=1)
-    instructions: str | None = None
+    input: PromptText
+    instructions: PromptText | None = None
     max_output_tokens: int = Field(gt=0)
     json_schema: str | None = None
     timeout_seconds: float = Field(gt=0.0)
+    history: tuple[AgentHistoryItem, ...] = ()
+    tools: tuple[ProviderToolDescriptor, ...] = ()
+
+    @model_validator(mode="after")
+    def _request_is_bounded(self) -> "ProviderRequest":
+        if len(self.history) > MAX_AGENT_HISTORY_ITEMS:
+            raise ValueError("provider history has too many items")
+        known_calls: dict[str, AgentToolCall] = {}
+        for item in self.history:
+            if isinstance(item, AgentTurn):
+                for call in item.tool_calls:
+                    previous = known_calls.get(call.call_id)
+                    if previous is not None and previous != call:
+                        raise ValueError("provider history reuses a tool call id differently")
+                    known_calls[call.call_id] = call
+            elif item.call_id not in known_calls:
+                raise ValueError("provider history contains an orphaned tool result")
+        if len(self.tools) > MAX_PROVIDER_TOOL_COUNT:
+            raise ValueError("provider request has too many tools")
+        names = [tool.name for tool in self.tools]
+        if len(names) != len(set(names)):
+            raise ValueError("provider request tool names must be unique")
+        try:
+            encoded = json.dumps(
+                [tool.model_dump(mode="json") for tool in self.tools],
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ValueError("provider tools must contain standard JSON") from error
+        if len(encoded) > MAX_PROVIDER_TOOLS_BYTES:
+            raise ValueError("provider request tools exceed the size limit")
+        return self
 
     @classmethod
     def for_profile(
@@ -108,6 +173,8 @@ class ProviderRequest(DomainModel):
         instructions: str | None = None,
         json_schema: str | None = None,
         max_output_tokens: int | None = None,
+        history: tuple[AgentHistoryItem, ...] = (),
+        tools: tuple[ProviderToolDescriptor, ...] = (),
     ) -> "ProviderRequest":
         """Build a request for a profile, rejecting capabilities it does not have."""
         if json_schema is not None and not profile.supports_structured_output:
@@ -131,20 +198,41 @@ class ProviderRequest(DomainModel):
             json_schema=json_schema,
             max_output_tokens=limit,
             timeout_seconds=profile.timeout_seconds,
+            history=history,
+            tools=tools,
         )
 
 
 class ProviderResponse(DomainModel):
-    """One normalised outbound text response.
+    """One normalised text or tool-call response.
 
     ``usage`` is ``None`` when the upstream did not report token counts. Zero is a
     measurement, so an unreported count is never recorded as zero.
     """
 
-    text: str
+    text: NonBlankText | None = None
+    tool_calls: tuple[AgentToolCall, ...] = ()
     usage: Usage | None = None
     finish_reason: FinishReason
     provider_request_id: str | None = None
+
+    @model_validator(mode="after")
+    def _response_has_one_turn_shape(self) -> "ProviderResponse":
+        if (self.text is None) == (not self.tool_calls):
+            raise ValueError("provider response must contain text or tool_calls, exclusively")
+        call_ids = [call.call_id for call in self.tool_calls]
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("provider response tool call ids must be unique")
+        if self.tool_calls and self.finish_reason is not FinishReason.TOOL_CALLS:
+            raise ValueError("provider tool calls require the TOOL_CALLS finish reason")
+        if self.text is not None and self.finish_reason is FinishReason.TOOL_CALLS:
+            raise ValueError("provider text cannot use the TOOL_CALLS finish reason")
+        return self
+
+    @property
+    def turn(self) -> AgentTurn:
+        """Expose the provider result as the protocol-neutral AgentTurn contract."""
+        return AgentTurn(text=self.text, tool_calls=self.tool_calls)
 
 
 @runtime_checkable
@@ -163,6 +251,13 @@ class ProviderAdapter(Protocol):
     @property
     def name(self) -> str:
         """The provider name recorded on attempts."""
+
+    async def aclose(self) -> None:
+        """Close resources owned by this adapter, exactly once semantically.
+
+        Injected clients or other host-owned resources remain the host's
+        responsibility; implementations must make this operation idempotent.
+        """
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         """Produce one completion for one request."""

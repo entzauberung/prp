@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable
 from pathlib import Path
 
@@ -64,6 +65,9 @@ class FakeAdapter:
         assert isinstance(outcome, ProviderResponse)
         return outcome
 
+    async def aclose(self) -> None:
+        return None
+
 
 def _response(text: str, *, tokens: int = 5) -> ProviderResponse:
     return ProviderResponse(
@@ -81,6 +85,15 @@ def _event_records(client: TestClient, run_id: str) -> list[dict[str, object]]:
         if line.startswith("data: "):
             records.append(json.loads(line.removeprefix("data: ")))
     return records
+
+
+def _wait_for_terminal(client: TestClient, run_id: str) -> dict[str, object]:
+    for _ in range(200):
+        body = client.get(f"/v1/runs/{run_id}").json()
+        if body["status"] in {status.value for status in RunStatus if status.is_terminal}:
+            return body
+        time.sleep(0.005)
+    pytest.fail(f"run {run_id} did not reach a terminal state")
 
 
 def test_native_cascade_verification_failure_then_success_has_consistent_facts(
@@ -119,13 +132,14 @@ def test_native_cascade_verification_failure_then_success_has_consistent_facts(
             },
         )
         assert response.status_code == 201
-        body = response.json()
+        body = _wait_for_terminal(client, response.json()["run_id"])
         assert body["status"] == RunStatus.SUCCEEDED.value
         assert body["strategy"] == ExecutionStrategy.CASCADE.value
         assert json.loads(body["output_text"]) == {"ok": True}
         assert body["usage"]["input_tokens"] == 6
         assert body["usage"]["output_tokens"] == 4
         event_records = _event_records(client, body["run_id"])
+        body = client.get(f"/v1/runs/{body['run_id']}").json()
 
     async def inspect() -> tuple[int, int, int, int, int]:
         async with SqliteStore(database) as store:
@@ -183,6 +197,7 @@ def test_native_cascade_attempt_budget_blocks_the_second_adapter(tmp_path: Path)
         event_types = [
             record["event_type"] for record in _event_records(client, body["run_id"])
         ]
+        body = client.get(f"/v1/runs/{body['run_id']}").json()
 
     assert response.status_code == 201
     assert body["status"] == RunStatus.FAILED.value
@@ -219,6 +234,8 @@ def test_native_cascade_nonretryable_provider_error_stops_immediately(
             },
         )
         body = response.json()
+        _event_records(client, body["run_id"])
+        body = client.get(f"/v1/runs/{body['run_id']}").json()
 
     assert response.status_code == 201
     assert body["status"] == RunStatus.FAILED.value
@@ -242,6 +259,8 @@ def test_native_direct_token_budget_still_uses_one_attempt(tmp_path: Path) -> No
             json={"input": "hello", "budget": {"max_total_tokens": 10}},
         )
         body = response.json()
+        _event_records(client, body["run_id"])
+        body = client.get(f"/v1/runs/{body['run_id']}").json()
 
     assert response.status_code == 201
     assert body["strategy"] == ExecutionStrategy.DIRECT.value

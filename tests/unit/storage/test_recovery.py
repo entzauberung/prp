@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from prp_runtime.control.reservations import ReservationRequest
 from prp_runtime.domain.enums import (
     AttemptStatus,
     ModelRole,
+    ReservationStatus,
     RunStatus,
     WorkUnitStatus,
 )
@@ -91,6 +93,25 @@ async def build_running_run(
     return run, unit, tuple(attempts)
 
 
+async def create_held_reservation(
+    store: SqliteStore,
+    run: Run,
+    unit: WorkUnit,
+    *,
+    dispatch_key: str = "recovery-dispatch",
+) -> str:
+    reservation = await store.reserve_reservation(
+        ReservationRequest(
+            run_id=run.run_id,
+            work_unit_id=unit.work_unit_id,
+            dispatch_key=dispatch_key,
+        ),
+        created_at=T0,
+        held_at=T0,
+    )
+    return reservation.reservation_id
+
+
 # --- restart semantics ----------------------------------------------------------
 
 
@@ -107,6 +128,8 @@ async def test_restart_marks_in_flight_attempts_interrupted(database_path: Path)
         assert report.interrupted_attempt_ids == (attempt.attempt_id,)
         assert report.failed_work_unit_ids == (unit.work_unit_id,)
         assert report.affected_run_ids == (run.run_id,)
+        assert report.recoverable_run_ids == ()
+        assert report.blocked_run_ids == (run.run_id,)
 
         recovered = await store.get_attempt(attempt.attempt_id)
         assert recovered.status is AttemptStatus.INTERRUPTED
@@ -174,6 +197,137 @@ async def test_recovery_on_a_clean_database_changes_nothing(database_path: Path)
         assert report.changed is False
         assert report.interrupted_attempt_ids == ()
         assert report.affected_run_ids == ()
+        assert report.released_reservation_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_recovery_reports_pending_runs_that_were_never_dispatched(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        run = Run(
+            run_id=new_run_id(),
+            request=NativeRunRequest(input="resume pending work"),
+            created_at=T0,
+        )
+        await store.create_run(run)
+
+        first = await recover_after_restart(store)
+        second = await recover_after_restart(store)
+
+        assert first.recoverable_run_ids == (run.run_id,)
+        assert first.blocked_run_ids == ()
+        assert second.recoverable_run_ids == (run.run_id,)
+        assert second.blocked_run_ids == ()
+        assert second.changed is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_blocks_pending_run_with_dispatched_attempt(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        run = Run(
+            run_id=new_run_id(),
+            request=NativeRunRequest(input="diagnose inconsistent state"),
+            created_at=T0,
+        )
+        await store.create_run(run)
+        unit = WorkUnit(
+            work_unit_id=new_work_unit_id(),
+            run_id=run.run_id,
+            name="unit",
+            instruction="do the work",
+            status=WorkUnitStatus.PENDING,
+            created_at=T0,
+        )
+        await store.create_work_unit(unit)
+        attempt = Attempt(
+            attempt_id=new_attempt_id(),
+            run_id=run.run_id,
+            work_unit_id=unit.work_unit_id,
+            attempt_index=1,
+            role=ModelRole.WORKER,
+            model=WORKER,
+            status=AttemptStatus.RUNNING,
+            created_at=T0,
+            started_at=T0,
+        )
+        await store.create_attempt(attempt)
+
+        report = await recover_after_restart(store)
+
+        assert report.recoverable_run_ids == ()
+        assert report.blocked_run_ids == (run.run_id,)
+        assert (await store.get_run(run.run_id)).status is RunStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_restart_releases_held_reservation_without_inflight_attempt(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        run = Run(
+            run_id=new_run_id(),
+            request=NativeRunRequest(input="reserve work"),
+            status=RunStatus.RUNNING,
+            created_at=T0,
+            started_at=T0,
+        )
+        await store.create_run(run)
+        unit = WorkUnit(
+            work_unit_id=new_work_unit_id(),
+            run_id=run.run_id,
+            name="unit",
+            instruction="do the work",
+            status=WorkUnitStatus.READY,
+            created_at=T0,
+        )
+        await store.create_work_unit(unit)
+        await store.append_event(run.run_id, EventType.RUN_CREATED, {"request": {"input": "x"}})
+        await store.append_event(run.run_id, EventType.RUN_STARTED)
+        reservation_id = await create_held_reservation(store, run, unit)
+        before = await store.last_sequence(run.run_id)
+
+    async with SqliteStore(database_path) as store:
+        first = await recover_after_restart(store)
+        assert first.released_reservation_ids == (reservation_id,)
+        assert first.changed is True
+        released = await store.get_reservation(reservation_id)
+        assert released.status is ReservationStatus.RELEASED
+        events = await store.list_events(run.run_id, after_sequence=before)
+        assert [event.event_type for event in events] == [
+            EventType.RESERVATION_RELEASED
+        ]
+
+        second = await recover_after_restart(store)
+        assert second.released_reservation_ids == ()
+        assert second.changed is False
+        assert await store.last_sequence(run.run_id) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_held_reservation_with_running_attempt(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        run, unit, (attempt,) = await build_running_run(store)
+        reservation_id = await create_held_reservation(store, run, unit)
+
+        report = await recover_after_restart(store)
+
+        assert report.released_reservation_ids == ()
+        assert report.interrupted_attempt_ids == (attempt.attempt_id,)
+        assert (await store.get_reservation(reservation_id)).status is ReservationStatus.HELD
+        assert not any(
+            event.event_type is EventType.RESERVATION_RELEASED
+            for event in await store.list_events(run.run_id)
+        )
+
+        second = await recover_after_restart(store)
+        assert second.changed is False
+        assert second.released_reservation_ids == ()
+        assert (await store.get_reservation(reservation_id)).status is ReservationStatus.HELD
 
 
 @pytest.mark.asyncio

@@ -51,8 +51,9 @@ PLANNING_WORK_UNIT_NAME = "internal-planner-call"
 _PLANNER_INSTRUCTIONS = (
     "Propose a bounded work graph for the objective. Return only strict JSON matching "
     "the supplied schema. Include public summaries, dependencies, resources, output "
-    "requirements, and acceptance criteria. Do not include reasoning, chain-of-thought, "
-    "code, commands, provider configuration, credentials, or persistent IDs."
+    "requirements, acceptance criteria, and exactly one final_node identifying the "
+    "user-facing output node. Do not include reasoning, chain-of-thought, code, "
+    "commands, provider configuration, credentials, or persistent IDs."
 )
 
 
@@ -249,6 +250,8 @@ class Planner:
                 error=_planner_error("Planner provider response did not finish normally"),
             )
         try:
+            if response.text is None:
+                raise ValueError("Planner response did not contain text")
             proposal = PlanProposal.from_json(response.text)
         except (StrictJsonError, ValidationError, ValueError):
             return self._rejected_call(
@@ -296,7 +299,8 @@ class Planner:
             input=summary.model_dump_json(),
             instructions=(
                 "Revise the bounded work graph using only the public failure facts. "
-                "Return strict JSON matching the PlanRevision schema. Do not include "
+                "Return strict JSON matching the PlanRevision schema, including exactly "
+                "one final_node identifying the user-facing output node. Do not include "
                 "reasoning, chain-of-thought, credentials, or persisted IDs."
             ),
             json_schema=_PLAN_REVISION_SCHEMA,
@@ -369,6 +373,8 @@ class Planner:
                 error=_planner_error("Planner provider response did not finish normally"),
             )
         try:
+            if response.text is None:
+                raise ValueError("Planner revision response did not contain text")
             proposal = PlanRevision.from_json(response.text)
         except (StrictJsonError, ValidationError, ValueError):
             return self._rejected_call(

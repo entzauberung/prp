@@ -103,6 +103,11 @@ def test_unavailable_target_is_a_structured_rejection_not_direct_fallback() -> N
     assert decision.rejection.code is RouteRejectionCode.STRATEGY_UNAVAILABLE
 
 
+def test_strategy_decision_rejects_an_empty_outcome() -> None:
+    with pytest.raises(ValueError, match="accepted or rejected"):
+        StrategyDecision(reason="no decision")
+
+
 def test_budget_rejects_progressive_and_parallelism_before_selection() -> None:
     progressive = route(
         request(budget=Budget(max_plan_revisions=0)),

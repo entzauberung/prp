@@ -21,6 +21,7 @@ from typing import Any, Final
 __all__ = [
     "NON_STANDARD_JSON_CONSTANTS",
     "StrictJsonError",
+    "canonical_json_dumps",
     "strict_json_loads",
 ]
 
@@ -80,3 +81,14 @@ def strict_json_loads(text: str) -> Any:
         raise
     except json.JSONDecodeError as error:
         raise StrictJsonError(f"invalid JSON: {error.msg}") from error
+
+
+def canonical_json_dumps(value: Any) -> str:
+    """Render JSON-compatible public facts deterministically."""
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )

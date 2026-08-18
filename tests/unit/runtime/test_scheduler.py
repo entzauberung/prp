@@ -2,18 +2,23 @@
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from prp_runtime.domain.enums import ResourceAccess, WorkUnitStatus
 from prp_runtime.domain.models import ErrorCategory, ErrorInfo, WorkUnit
 from prp_runtime.domain.values import ResourceClaim
+from prp_runtime.runtime.conflicts import ConflictFacts
 from prp_runtime.runtime.scheduler import (
     Scheduler,
+    SlotDispatcher,
     WaveOutcome,
     WaveStatus,
     select_non_conflicting_batch,
+    select_non_conflicting_batch_with_reasons,
 )
+from prp_runtime.workspace.isolation import LocalIsolationBackend
 
 T0 = datetime(2026, 8, 11, tzinfo=UTC)
 
@@ -120,6 +125,76 @@ async def test_wave_failure_calls_failed_callback_once() -> None:
     assert started == ["wu_one"]
     assert finished == []
     assert failed == ["wu_one"]
+
+
+@pytest.mark.asyncio
+async def test_wave_honors_the_coordinator_eligible_batch() -> None:
+    result, started, finished, failed = await run_wave(
+        (unit("first"), unit("second")),
+        max_concurrency=2,
+    )
+
+    assert result.started == ("wu_first", "wu_second")
+    assert started == list(result.started)
+    assert finished == list(result.succeeded)
+    assert failed == []
+
+    eligible = ("wu_second",)
+
+    async def execute(value: WorkUnit) -> WaveOutcome:
+        return WaveOutcome.success()
+
+    async def on_started(value: WorkUnit) -> WorkUnit:
+        return value.model_copy(update={"status": WorkUnitStatus.RUNNING})
+
+    async def on_succeeded(value: WorkUnit) -> None:
+        return None
+
+    async def on_failed(value: WorkUnit, error: ErrorInfo) -> None:
+        raise AssertionError(error.message)
+
+    selected = await Scheduler().run_wave(
+        (unit("first"), unit("second")),
+        graph_version=1,
+        max_concurrency=2,
+        eligible_work_unit_ids=eligible,
+        execute=execute,
+        on_started=on_started,
+        on_succeeded=on_succeeded,
+        on_failed=on_failed,
+    )
+    assert selected.ready == eligible
+    assert selected.started == selected.succeeded == eligible
+
+
+@pytest.mark.asyncio
+async def test_wave_converts_executor_exception_to_one_failed_unit() -> None:
+    failed: list[str] = []
+
+    async def on_started(value: WorkUnit) -> WorkUnit:
+        return value.model_copy(update={"status": WorkUnitStatus.RUNNING})
+
+    async def execute(value: WorkUnit) -> WaveOutcome:
+        raise RuntimeError("fixture failure")
+
+    async def on_succeeded(value: WorkUnit) -> None:
+        raise AssertionError("the fixture must fail")
+
+    async def on_failed(value: WorkUnit, error: ErrorInfo) -> None:
+        failed.append(value.work_unit_id)
+        assert error.category is ErrorCategory.UNKNOWN
+
+    result = await Scheduler().run_wave(
+        (unit("exception"),),
+        graph_version=1,
+        execute=execute,
+        on_started=on_started,
+        on_succeeded=on_succeeded,
+        on_failed=on_failed,
+    )
+
+    assert result.failed == ("wu_exception",)
+    assert failed == ["wu_exception"]
 
 
 @pytest.mark.asyncio
@@ -270,6 +345,107 @@ async def test_max_concurrency_one_never_starts_two_tasks() -> None:
     assert max_active == 1
 
 
+@pytest.mark.asyncio
+async def test_slot_dispatcher_gives_parallel_units_private_roots_and_cleans_them(
+    tmp_path: Path,
+) -> None:
+    backend = LocalIsolationBackend(tmp_path / "isolation")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "base.txt").write_text("base\n", encoding="utf-8")
+    snapshot = backend.create_base_snapshot(source, "ws_scheduler")
+    dispatcher = SlotDispatcher(
+        backend,
+        snapshot_id=snapshot.snapshot_id,
+        owner_id="owner_scheduler",
+    )
+    roots: dict[str, Path] = {}
+
+    async def execute_in_slot(value: WorkUnit, context) -> WaveOutcome:
+        roots[value.work_unit_id] = context.path
+        (context.path / f"{value.work_unit_id}.txt").write_text(
+            value.work_unit_id,
+            encoding="utf-8",
+        )
+        return WaveOutcome.success()
+
+    async def on_started(value: WorkUnit) -> WorkUnit:
+        return value.model_copy(update={"status": WorkUnitStatus.RUNNING})
+
+    async def execute(value: WorkUnit) -> WaveOutcome:
+        raise AssertionError("slot-aware callback must receive dispatched units")
+
+    async def on_succeeded(value: WorkUnit) -> None:
+        return None
+
+    async def on_failed(value: WorkUnit, error: ErrorInfo) -> None:
+        raise AssertionError(error.message)
+
+    result = await Scheduler().run_wave(
+        (unit("a"), unit("b")),
+        graph_version=1,
+        max_concurrency=2,
+        execute=execute,
+        execute_in_slot=execute_in_slot,
+        slot_dispatcher=dispatcher,
+        on_started=on_started,
+        on_succeeded=on_succeeded,
+        on_failed=on_failed,
+    )
+
+    assert result.succeeded == ("wu_a", "wu_b")
+    assert roots["wu_a"] != roots["wu_b"]
+    assert backend.active_slot_count == 0
+
+
 def test_invalid_max_concurrency_is_rejected() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         select_non_conflicting_batch((unit("a"),), max_concurrency=0)
+
+
+def test_actual_changesets_defer_overlapping_writes_with_reason() -> None:
+    base = "snap_" + "a" * 32
+    facts = {
+        "wu_a": ConflictFacts(changed_paths=("src/main.py",), base_snapshot_id=base),
+        "wu_b": ConflictFacts(changed_paths=("src//main.py",), base_snapshot_id=base),
+    }
+
+    result = select_non_conflicting_batch_with_reasons(
+        (unit("b"), unit("a")), max_concurrency=2, actual_changesets=facts
+    )
+
+    assert tuple(value.work_unit_id for value in result.selected) == ("wu_a",)
+    assert tuple(value.work_unit_id for value in result.deferred) == ("wu_b",)
+    assert result.deferred_reasons == (
+        ("wu_b", "deferred by wu_a: PATH - write paths overlap"),
+    )
+
+
+def test_actual_disjoint_writes_run_together_and_unknown_is_deferred() -> None:
+    base = "snap_" + "a" * 32
+    disjoint = {
+        "wu_a": ConflictFacts(changed_paths=("a.txt",), base_snapshot_id=base),
+        "wu_b": ConflictFacts(changed_paths=("b.txt",), base_snapshot_id=base),
+    }
+    parallel = select_non_conflicting_batch_with_reasons(
+        (unit("b"), unit("a")), max_concurrency=2, actual_changesets=disjoint
+    )
+    assert tuple(value.work_unit_id for value in parallel.selected) == ("wu_a", "wu_b")
+    assert parallel.deferred_reasons == ()
+
+    unknown = select_non_conflicting_batch_with_reasons(
+        (unit("a"), unit("b")), max_concurrency=2, actual_changesets={"wu_a": disjoint["wu_a"]}
+    )
+    assert tuple(value.work_unit_id for value in unknown.selected) == ("wu_a",)
+    assert unknown.deferred_reasons[0][0] == "wu_b"
+    assert "UNKNOWN" in unknown.deferred_reasons[0][1]
+
+
+@pytest.mark.asyncio
+async def test_wave_result_retains_deferred_reasons() -> None:
+    result, _, _, _ = await run_wave(
+        (unit("a"), unit("b")),
+        max_concurrency=1,
+    )
+
+    assert result.deferred_reasons == (("wu_b", "deferred: max concurrency reached"),)

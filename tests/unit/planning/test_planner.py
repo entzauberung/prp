@@ -48,6 +48,7 @@ def _profile(**overrides: object) -> ModelProfile:
 def _proposal_text(**overrides: object) -> str:
     values: dict[str, object] = {
         "summary": "Draft then review the result",
+        "final_node": "review",
         "nodes": [
             {
                 "key": "draft",
@@ -115,6 +116,9 @@ async def test_planner_builds_one_structured_request_and_returns_a_proposal() ->
     assert sent.alias == "planner"
     assert sent.json_schema is not None
     assert isinstance(strict_json_loads(sent.json_schema), dict)
+    schema = strict_json_loads(sent.json_schema)
+    assert schema["required"] == ["summary", "final_node", "nodes"]
+    assert schema["additionalProperties"] is False
     summary = strict_json_loads(sent.input)
     assert summary == {
         "objective": "prepare a report",
@@ -238,6 +242,8 @@ def test_internal_planning_work_unit_is_generic_and_graph_isolated() -> None:
         _proposal_text(api_key="test-token-must-not-be-retained"),
         _proposal_text(tools=[{"type": "shell"}]),
         _proposal_text(nodes=[]),
+        _proposal_text(final_node="missing"),
+        _proposal_text(final_node=None),
         _proposal_text(
             nodes=[
                 {

@@ -12,8 +12,20 @@ from prp_runtime.control.budget import (
     check_token_budget_postflight,
     check_token_budget_preflight,
 )
+from prp_runtime.control.reservations import (
+    Reservation,
+    ReservationOutcome,
+    ReservationReason,
+    ReservationRequest,
+    decide_hold,
+    hold_reservation,
+    release_reservation,
+    reservation_delta,
+    settle_reservation,
+)
 from prp_runtime.domain.errors import ErrorCode
 from prp_runtime.domain.models import Budget, Usage
+from prp_runtime.domain.values import new_reservation_id
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -269,3 +281,93 @@ def test_all_dimensions_allow_on_zero_consumption_no_budget() -> None:
     assert check_token_budget(NO_BUDGET, Usage()).allowed is True
     assert check_attempt_budget(NO_BUDGET, 0).allowed is True
     assert check_deadline(NO_BUDGET, T0).allowed is True
+
+
+# ---------------------------------------------------------------------------
+# Reservation admission and settlement
+# ---------------------------------------------------------------------------
+
+
+def _reservation_request(**overrides: object) -> ReservationRequest:
+    data: dict[str, object] = {
+        "run_id": "run_budget_reservation",
+        "work_unit_id": "wu_budget_reservation",
+        "dispatch_key": "dispatch-1",
+        "token_upper_bound": 4,
+        "strong_token_upper_bound": 2,
+    }
+    data.update(overrides)
+    return ReservationRequest(**data)  # type: ignore[arg-type]
+
+
+def _reservation(**overrides: object) -> Reservation:
+    data: dict[str, object] = {
+        "reservation_id": new_reservation_id(),
+        "request": _reservation_request(),
+        "created_at": T0,
+    }
+    data.update(overrides)
+    return Reservation(**data)  # type: ignore[arg-type]
+
+
+def test_reservation_hold_hard_reserves_attempts_before_dispatch() -> None:
+    request = _reservation_request()
+    allowed = decide_hold(
+        request,
+        Budget(max_attempts=2),
+        completed_attempt_units=1,
+    )
+    assert allowed.outcome is ReservationOutcome.ALLOW
+    assert allowed.projected_attempts == 2
+
+    rejected = decide_hold(
+        request,
+        Budget(max_attempts=2),
+        completed_attempt_units=1,
+        held_attempt_units=1,
+    )
+    assert rejected.outcome is ReservationOutcome.REJECT
+    assert rejected.reason is ReservationReason.ATTEMPT_CEILING
+
+
+def test_reservation_hold_requires_provable_usage_and_upper_bounds() -> None:
+    unknown_usage = decide_hold(
+        _reservation_request(),
+        Budget(max_total_tokens=10),
+    )
+    assert unknown_usage.reason is ReservationReason.UNKNOWN_MEASURED_USAGE
+
+    unknown_upper = decide_hold(
+        _reservation_request(token_upper_bound=None),
+        Budget(max_total_tokens=10),
+        measured_usage=Usage(input_tokens=1),
+    )
+    assert unknown_upper.reason is ReservationReason.UNKNOWN_TOKEN_UPPER_BOUND
+
+    exact = decide_hold(
+        _reservation_request(token_upper_bound=4),
+        Budget(max_total_tokens=10),
+        measured_usage=Usage(input_tokens=6),
+    )
+    assert exact.outcome is ReservationOutcome.ALLOW
+    assert exact.projected_token_upper_bound == 10
+
+
+def test_reservation_settlement_keeps_unknown_usage_unknown_and_releases_delta() -> None:
+    held = hold_reservation(_reservation(), held_at=T0)
+    settled = settle_reservation(
+        held,
+        completed_at=T0 + timedelta(seconds=1),
+        measured_usage=None,
+    )
+    delta = reservation_delta(settled)
+    assert settled.measured_usage is None
+    assert delta.measured_usage is None
+    assert delta.released_attempt_units == 1
+    assert delta.released_token_upper_bound == 4
+
+    released = release_reservation(
+        held,
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    assert reservation_delta(released).measured_usage is None

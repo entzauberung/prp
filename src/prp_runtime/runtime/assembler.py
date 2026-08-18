@@ -16,7 +16,7 @@ from prp_runtime.domain.models import (
 )
 from prp_runtime.domain.values import RunId
 from prp_runtime.runtime.context import ANSWER_ARTIFACT_NAME
-from prp_runtime.storage.sqlite import SqliteStore
+from prp_runtime.storage.sqlite import MissingEntityError, SqliteStore
 
 __all__ = ["RunResult", "assemble_run_result", "find_answer_artifact"]
 
@@ -36,15 +36,33 @@ class RunResult(DomainModel):
 
 
 async def find_answer_artifact(store: SqliteStore, run: Run) -> Artifact | None:
-    """The most recent answer artifact of the run's current graph version."""
-    latest: Artifact | None = None
-    for work_unit in await store.list_work_units(run.run_id, graph_version=run.graph_version):
-        for artifact in await store.list_artifacts(work_unit.work_unit_id):
-            if artifact.name != ANSWER_ARTIFACT_NAME:
-                continue
-            if latest is None or artifact.created_at >= latest.created_at:
-                latest = artifact
-    return latest
+    """Read the answer artifact from the run's explicit final work unit."""
+    if run.final_work_unit_id is not None:
+        try:
+            work_unit = await store.get_work_unit(run.final_work_unit_id)
+        except MissingEntityError:
+            return None
+        if work_unit.run_id != run.run_id or work_unit.graph_version != run.graph_version:
+            return None
+        work_unit_id = work_unit.work_unit_id
+    else:
+        work_units = await store.list_work_units(
+            run.run_id, graph_version=run.graph_version
+        )
+        if len(work_units) != 1:
+            return None
+        work_unit_id = work_units[0].work_unit_id
+    artifacts = await store.list_artifacts(work_unit_id)
+    return next(
+        (
+            artifact
+            for artifact in reversed(artifacts)
+            if artifact.name == ANSWER_ARTIFACT_NAME
+            and artifact.run_id == run.run_id
+            and artifact.work_unit_id == work_unit_id
+        ),
+        None,
+    )
 
 
 async def assemble_run_result(store: SqliteStore, run_id: str) -> RunResult:

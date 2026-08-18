@@ -5,33 +5,46 @@ import itertools
 import pytest
 
 from prp_runtime.domain.enums import (
+    AgentMode,
     AttemptStatus,
     ExecutionStrategy,
+    ReservationStatus,
     RoutingPolicy,
     RunStatus,
+    ToolCallStatus,
     WorkUnitStatus,
 )
 from prp_runtime.domain.transitions import (
     ATTEMPT_TRANSITIONS,
+    RESERVATION_TRANSITIONS,
     RUN_TRANSITIONS,
+    TOOL_CALL_TRANSITIONS,
     WORK_UNIT_TRANSITIONS,
     AttemptNotAllowedError,
     DomainTransitionError,
     IllegalStatusTransitionError,
+    RecoveryAction,
     RunCompletionNotAllowedError,
     StrategyEscalationNotAllowedError,
     assert_can_start_attempt,
     can_escalate_strategy,
     can_start_attempt,
     can_transition_attempt,
+    can_transition_reservation,
     can_transition_run,
     can_transition_work_unit,
     control_strength,
+    decide_attempt_recovery,
+    decide_reservation_recovery,
+    decide_run_recovery,
+    decide_tool_call_recovery,
+    decide_work_unit_recovery,
     escalate_strategy,
     mark_attempt_unconfirmed,
     recover_attempt_on_restart,
     resolve_run_outcome,
     transition_attempt,
+    transition_reservation,
     transition_run,
     transition_work_unit,
 )
@@ -43,6 +56,8 @@ def test_every_status_has_a_transition_entry() -> None:
     assert set(RUN_TRANSITIONS) == set(RunStatus)
     assert set(WORK_UNIT_TRANSITIONS) == set(WorkUnitStatus)
     assert set(ATTEMPT_TRANSITIONS) == set(AttemptStatus)
+    assert set(RESERVATION_TRANSITIONS) == set(ReservationStatus)
+    assert set(TOOL_CALL_TRANSITIONS) == set(ToolCallStatus)
 
 
 def test_terminal_statuses_have_no_outgoing_transition() -> None:
@@ -54,6 +69,9 @@ def test_terminal_statuses_have_no_outgoing_transition() -> None:
     for status in AttemptStatus:
         if status.is_terminal:
             assert ATTEMPT_TRANSITIONS[status] == frozenset()
+    for status in ToolCallStatus:
+        if status.is_terminal:
+            assert TOOL_CALL_TRANSITIONS[status] == frozenset()
 
 
 def test_no_status_transitions_to_itself() -> None:
@@ -63,6 +81,49 @@ def test_no_status_transitions_to_itself() -> None:
         assert status not in WORK_UNIT_TRANSITIONS[status]
     for status in AttemptStatus:
         assert status not in ATTEMPT_TRANSITIONS[status]
+    for status in ReservationStatus:
+        assert status not in RESERVATION_TRANSITIONS[status]
+
+
+RESERVATION_ALLOWED: frozenset[tuple[ReservationStatus, ReservationStatus]] = frozenset(
+    {
+        (ReservationStatus.PENDING, ReservationStatus.HELD),
+        (ReservationStatus.HELD, ReservationStatus.SETTLED),
+        (ReservationStatus.HELD, ReservationStatus.RELEASED),
+        (ReservationStatus.HELD, ReservationStatus.EXPIRED),
+    }
+)
+
+
+@pytest.mark.parametrize(
+    ("current", "target"), itertools.product(ReservationStatus, ReservationStatus)
+)
+def test_reservation_transition_table(
+    current: ReservationStatus, target: ReservationStatus
+) -> None:
+    expected = (current, target) in RESERVATION_ALLOWED
+    assert can_transition_reservation(current, target) is expected
+    if expected:
+        assert transition_reservation(current, target) is target
+    else:
+        with pytest.raises(IllegalStatusTransitionError) as excinfo:
+            transition_reservation(current, target)
+        assert excinfo.value.entity == "reservation"
+        assert excinfo.value.current == current.value
+        assert excinfo.value.target == target.value
+
+
+def test_reservation_terminal_replay_is_explicitly_idempotent() -> None:
+    assert (
+        transition_reservation(
+            ReservationStatus.SETTLED,
+            ReservationStatus.SETTLED,
+            idempotent_terminal=True,
+        )
+        is ReservationStatus.SETTLED
+    )
+    with pytest.raises(IllegalStatusTransitionError):
+        transition_reservation(ReservationStatus.SETTLED, ReservationStatus.RELEASED)
 
 
 # --- run transitions ------------------------------------------------------------
@@ -201,6 +262,146 @@ def test_unconfirmed_cancellation_maps_running_to_unknown() -> None:
         mark_attempt_unconfirmed(AttemptStatus.PENDING)
 
 
+def test_tool_recovery_never_guesses_an_unconfirmed_side_effect() -> None:
+    running = decide_tool_call_recovery(ToolCallStatus.RUNNING)
+    assert running.action is RecoveryAction.INTERRUPT
+    assert running.target_status is ToolCallStatus.UNKNOWN
+
+    awaiting = decide_tool_call_recovery(ToolCallStatus.AWAITING_APPROVAL)
+    assert awaiting.action is RecoveryAction.CONTINUE
+    assert awaiting.target_status is ToolCallStatus.AWAITING_APPROVAL
+    assert awaiting.retry_allowed is True
+
+    missing_approval = decide_tool_call_recovery(
+        ToolCallStatus.AWAITING_APPROVAL,
+        has_approval=False,
+    )
+    assert missing_approval.action is RecoveryAction.BLOCK
+
+    unknown = decide_tool_call_recovery(ToolCallStatus.UNKNOWN)
+    assert unknown.action is RecoveryAction.BLOCK
+    assert unknown.target_status is ToolCallStatus.UNKNOWN
+
+    terminal = decide_tool_call_recovery(
+        ToolCallStatus.SUCCEEDED,
+        has_result=True,
+        has_history_result=False,
+    )
+    assert terminal.action is RecoveryAction.PRESERVE
+    assert terminal.target_status is ToolCallStatus.SUCCEEDED
+
+    conflict = decide_tool_call_recovery(
+        ToolCallStatus.REQUESTED,
+        has_conflict=True,
+    )
+    assert conflict.action is RecoveryAction.BLOCK
+
+
+def test_recovery_decision_covers_attempt_outcome_boundaries() -> None:
+    pending = decide_attempt_recovery(AttemptStatus.PENDING)
+    assert pending.action is RecoveryAction.CONTINUE
+    assert pending.target_status is AttemptStatus.PENDING
+    assert pending.can_continue is True
+
+    running = decide_attempt_recovery(AttemptStatus.RUNNING)
+    assert running.action is RecoveryAction.INTERRUPT
+    assert running.target_status is AttemptStatus.INTERRUPTED
+    assert running.retry_allowed is False
+
+    unknown = decide_attempt_recovery(AttemptStatus.UNKNOWN)
+    assert unknown.action is RecoveryAction.PRESERVE
+    assert unknown.target_status is AttemptStatus.UNKNOWN
+    assert unknown.can_continue is False
+
+    for terminal in (
+        AttemptStatus.SUCCEEDED,
+        AttemptStatus.FAILED,
+        AttemptStatus.CANCELLED,
+        AttemptStatus.INTERRUPTED,
+    ):
+        decision = decide_attempt_recovery(terminal)
+        assert decision.action is RecoveryAction.PRESERVE
+        assert decision.target_status is terminal
+
+
+def test_recovery_decision_classifies_run_conflicts_and_terminal_states() -> None:
+    assert (
+        decide_run_recovery(RunStatus.PENDING).action is RecoveryAction.CONTINUE
+    )
+    conflict = decide_run_recovery(
+        RunStatus.PENDING,
+        has_dispatched_attempt=True,
+    )
+    assert conflict.action is RecoveryAction.BLOCK
+    assert conflict.target_status is RunStatus.PENDING
+
+    cancelling = decide_run_recovery(RunStatus.CANCELLING)
+    assert cancelling.action is RecoveryAction.PRESERVE
+    assert cancelling.retry_allowed is False
+
+    terminal = decide_run_recovery(RunStatus.SUCCEEDED)
+    assert terminal.action is RecoveryAction.PRESERVE
+    assert terminal.target_status is RunStatus.SUCCEEDED
+
+    terminal_conflict = decide_run_recovery(
+        RunStatus.SUCCEEDED,
+        has_dispatched_attempt=True,
+    )
+    assert terminal_conflict.action is RecoveryAction.BLOCK
+
+
+def test_recovery_decision_blocks_work_unit_fact_conflicts() -> None:
+    pending = decide_work_unit_recovery(WorkUnitStatus.PENDING)
+    assert pending.action is RecoveryAction.CONTINUE
+    assert pending.can_continue is True
+
+    dispatched = decide_work_unit_recovery(
+        WorkUnitStatus.READY,
+        has_dispatched_attempt=True,
+    )
+    assert dispatched.action is RecoveryAction.BLOCK
+    assert dispatched.target_status is WorkUnitStatus.BLOCKED
+
+    interrupted = decide_work_unit_recovery(
+        WorkUnitStatus.RUNNING,
+        has_running_attempt=True,
+    )
+    assert interrupted.action is RecoveryAction.TERMINATE
+    assert interrupted.target_status is WorkUnitStatus.FAILED
+
+    unknown = decide_work_unit_recovery(
+        WorkUnitStatus.RUNNING,
+        has_unconfirmed_attempt=True,
+    )
+    assert unknown.action is RecoveryAction.BLOCK
+    assert unknown.target_status is WorkUnitStatus.RUNNING
+
+    succeeded = decide_work_unit_recovery(WorkUnitStatus.SUCCEEDED)
+    assert succeeded.action is RecoveryAction.PRESERVE
+    assert succeeded.target_status is WorkUnitStatus.SUCCEEDED
+
+
+def test_recovery_decision_never_releases_an_uncertain_reservation() -> None:
+    pending = decide_reservation_recovery(ReservationStatus.PENDING)
+    assert pending.action is RecoveryAction.CONTINUE
+
+    orphan = decide_reservation_recovery(ReservationStatus.HELD)
+    assert orphan.action is RecoveryAction.RELEASE
+    assert orphan.target_status is ReservationStatus.RELEASED
+
+    for kwargs in (
+        {"has_inflight_attempt": True},
+        {"has_unconfirmed_attempt": True},
+    ):
+        held = decide_reservation_recovery(ReservationStatus.HELD, **kwargs)
+        assert held.action is RecoveryAction.PRESERVE
+        assert held.target_status is ReservationStatus.HELD
+
+    settled = decide_reservation_recovery(ReservationStatus.SETTLED)
+    assert settled.action is RecoveryAction.PRESERVE
+    assert settled.target_status is ReservationStatus.SETTLED
+
+
 # --- new attempt admission ------------------------------------------------------
 
 
@@ -303,6 +504,20 @@ def test_control_strength_is_strictly_increasing() -> None:
         )
     ]
     assert strengths == sorted(set(strengths))
+
+
+def test_agent_modes_do_not_expand_strategy_control_ordering() -> None:
+    strategies = tuple(ExecutionStrategy)
+    assert strategies == (
+        ExecutionStrategy.DIRECT,
+        ExecutionStrategy.CASCADE,
+        ExecutionStrategy.PLANNED,
+        ExecutionStrategy.PROGRESSIVE,
+    )
+    assert {mode.value for mode in AgentMode}.isdisjoint(
+        {strategy.value for strategy in strategies}
+    )
+    assert [control_strength(strategy) for strategy in strategies] == [0, 1, 2, 3]
 
 
 def test_escalation_is_one_directional() -> None:

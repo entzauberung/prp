@@ -2,7 +2,7 @@
 
 from enum import StrEnum, unique
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from prp_runtime.domain.enums import ExecutionStrategy, RoutingPolicy
 from prp_runtime.domain.models import DomainModel, NativeRunRequest
@@ -70,6 +70,12 @@ class StrategyDecision(DomainModel):
     strategy: ExecutionStrategy | None = None
     reason: str = Field(min_length=1)
     rejection: RouteRejection | None = None
+
+    @model_validator(mode="after")
+    def _outcome_is_closed(self) -> "StrategyDecision":
+        if self.strategy is None and self.rejection is None:
+            raise ValueError("strategy decision must be accepted or rejected")
+        return self
 
     @property
     def accepted(self) -> bool:

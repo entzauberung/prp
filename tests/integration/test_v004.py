@@ -73,14 +73,17 @@ def test_protocol_fixture_uses_one_persisted_run_fact(
     adapter = FakeAdapter("fixture answer")
     with TestClient(_app(tmp_path, adapter)) as client:
         response = client.post(path, json=payload)
-        assert response.status_code == 200
-        body = response.json()
-        run_id = body["id"]
+        assert response.status_code == (202 if path == "/v1/responses" else 200)
+        created = response.json()
+        run_id = created["id"]
+        if path == "/v1/responses":
+            events = client.get(f"{path}/{run_id}/events")
+            assert events.status_code == 200
         queried = client.get(f"{path}/{run_id}")
+        body = queried.json()
 
     assert body["status"] == "completed"
     assert queried.status_code == 200
-    assert queried.json() == body
     assert body["error"] is None
     assert "strategy" not in body
     assert len(adapter.requests) == 1

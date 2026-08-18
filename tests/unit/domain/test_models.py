@@ -1,23 +1,39 @@
 """Targeted tests for the native domain contracts."""
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from prp_runtime.control.reservations import Reservation, ReservationRequest
 from prp_runtime.domain.enums import (
+    AgentMode,
     AttemptStatus,
+    ExecutionLocation,
     ExecutionStrategy,
+    IsolationMode,
     ModelRole,
+    ReservationStatus,
     ResourceAccess,
     RoutingPolicy,
     RunStatus,
+    ToolCallStatus,
     WorkUnitStatus,
 )
 from prp_runtime.domain.models import (
+    MAX_AGENT_HISTORY_ITEMS,
+    MAX_ARTIFACT_CONTENT_BYTES,
+    MAX_PUBLIC_TEXT_CHARS,
+    AgentHistoryRecord,
+    AgentRequestOptions,
+    AgentToolCall,
+    AgentToolResult,
+    AgentTurn,
     Artifact,
     ArtifactKind,
     Attempt,
+    AttemptCost,
     Budget,
     ControllerAction,
     ControllerDecision,
@@ -25,12 +41,19 @@ from prp_runtime.domain.models import (
     ErrorInfo,
     Evidence,
     EvidenceKind,
+    ExecutionScope,
     NativeRunRequest,
     OutputRequirement,
+    Principal,
     RoutingIntent,
     Run,
+    RunMetrics,
+    Session,
+    SessionCreateRequest,
+    SessionStatus,
     Usage,
     VerificationResult,
+    WorkspaceGrant,
     WorkUnit,
     new_artifact_id,
     new_evidence_id,
@@ -39,8 +62,12 @@ from prp_runtime.domain.values import (
     ModelRef,
     ResourceClaim,
     new_attempt_id,
+    new_principal_id,
+    new_reservation_id,
     new_run_id,
+    new_session_id,
     new_work_unit_id,
+    new_workspace_id,
 )
 
 T0 = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
@@ -49,9 +76,33 @@ WORK_UNIT_ID = new_work_unit_id()
 ATTEMPT_ID = new_attempt_id()
 ARTIFACT_ID = new_artifact_id()
 EVIDENCE_ID = new_evidence_id()
+RESERVATION_ID = new_reservation_id()
 WORKER_MODEL = ModelRef(provider="openai_compatible", model="weak-model")
 
+
+@pytest.mark.parametrize(
+    ("enum_type", "values"),
+    [
+        (AgentMode, ("NORMAL", "AUTO", "PLAN", "YOLO")),
+        (IsolationMode, ("SANDBOXED", "HOST")),
+        (ExecutionLocation, ("CLOUD", "BRIDGE")),
+    ],
+)
+def test_agent_execution_vocabularies_are_closed_and_json_stable(
+    enum_type: type[AgentMode | IsolationMode | ExecutionLocation],
+    values: tuple[str, ...],
+) -> None:
+    assert tuple(member.value for member in enum_type) == values
+    adapter = TypeAdapter(enum_type)
+    for value in values:
+        member = enum_type(value)
+        assert adapter.validate_json(adapter.dump_json(member)) is member
+    with pytest.raises(ValueError):
+        enum_type("UNKNOWN")
+
 ALL_CONTRACTS: tuple[type[BaseModel], ...] = (
+    AgentRequestOptions,
+    Principal,
     Artifact,
     Attempt,
     Budget,
@@ -61,6 +112,9 @@ ALL_CONTRACTS: tuple[type[BaseModel], ...] = (
     NativeRunRequest,
     OutputRequirement,
     RoutingIntent,
+    Session,
+    SessionCreateRequest,
+    WorkspaceGrant,
     Run,
     Usage,
     WorkUnit,
@@ -71,6 +125,72 @@ def make_request(**overrides: object) -> NativeRunRequest:
     data: dict[str, object] = {"input": "summarise the report"}
     data.update(overrides)
     return NativeRunRequest(**data)  # type: ignore[arg-type]
+
+
+def make_history_record(**overrides: object) -> AgentHistoryRecord:
+    data: dict[str, object] = {
+        "run_id": RUN_ID,
+        "work_unit_id": WORK_UNIT_ID,
+        "attempt_id": ATTEMPT_ID,
+        "sequence": 1,
+        "idempotency_key": "turn-1",
+        "item": AgentTurn(text="public answer"),
+        "created_at": T0,
+    }
+    data.update(overrides)
+    return AgentHistoryRecord(**data)  # type: ignore[arg-type]
+
+
+def test_agent_history_record_is_bounded_public_and_discriminated() -> None:
+    record = make_history_record()
+    assert AgentHistoryRecord.model_validate_json(record.model_dump_json()) == record
+    result_record = make_history_record(
+        item=AgentToolResult(
+            call_id="call-1",
+            status=ToolCallStatus.SUCCEEDED,
+            result={"content": "safe"},
+        )
+    )
+    assert result_record.item.kind == "tool_result"
+    with pytest.raises(ValidationError):
+        make_history_record(sequence=MAX_AGENT_HISTORY_ITEMS + 1)
+    with pytest.raises(ValidationError, match="history"):
+        make_history_record(
+            item=AgentTurn(
+                tool_calls=(
+                    AgentToolCall(
+                        call_id="call-secret",
+                        tool_name="read_file",
+                        arguments={"token": "must not persist"},
+                    ),
+                )
+            )
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_public_tool_json_rejects_non_finite_numbers(value: float) -> None:
+    with pytest.raises(ValidationError):
+        AgentToolCall(
+            call_id="call-finite",
+            tool_name="read_file",
+            arguments={"value": value},
+        )
+    with pytest.raises(ValidationError):
+        AgentToolResult(
+            call_id="call-finite",
+            status=ToolCallStatus.SUCCEEDED,
+            result={"value": value},
+        )
+
+
+def test_public_text_and_artifact_payloads_are_bounded() -> None:
+    with pytest.raises(ValidationError):
+        make_request(input="x" * (MAX_PUBLIC_TEXT_CHARS + 1))
+    # Keep the character count below the text limit while exceeding the byte
+    # limit, so multibyte content cannot bypass the persisted payload bound.
+    with pytest.raises(ValidationError):
+        make_artifact(content="界" * (MAX_ARTIFACT_CONTENT_BYTES // 3 + 1))
 
 
 def make_run(**overrides: object) -> Run:
@@ -92,6 +212,72 @@ def make_work_unit(**overrides: object) -> WorkUnit:
     }
     data.update(overrides)
     return WorkUnit(**data)  # type: ignore[arg-type]
+
+
+def test_work_unit_lineage_is_optional_for_legacy_single_unit_paths() -> None:
+    assert make_work_unit().lineage_key is None
+    assert make_work_unit(
+        lineage_key="stable-node",
+        dependency_fingerprint="a" * 64,
+        content_fingerprint="b" * 64,
+    ).lineage_key == "stable-node"
+    with pytest.raises(ValidationError, match="proposal-local"):
+        make_work_unit(lineage_key="wu_old")
+
+
+def test_session_grant_is_principal_and_workspace_scoped() -> None:
+    principal_id = new_principal_id()
+    workspace_id = new_workspace_id()
+    session = Session(
+        session_id=new_session_id(),
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        grant=WorkspaceGrant(
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            access=(ResourceAccess.READ, ResourceAccess.WRITE),
+        ),
+        expires_at=T0 + timedelta(hours=1),
+        created_at=T0,
+    )
+    assert session.status is SessionStatus.ACTIVE
+    assert (
+        SessionCreateRequest(workspace_id=workspace_id).agent_options.agent_mode
+        is AgentMode.NORMAL
+    )
+    assert "host_path" not in Session.model_fields
+    with pytest.raises(ValidationError, match="match the session principal"):
+        Session(
+            session_id=new_session_id(),
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            grant=WorkspaceGrant(
+                principal_id=new_principal_id(),
+                workspace_id=workspace_id,
+            ),
+            created_at=T0,
+        )
+
+
+def test_execution_scope_is_owner_scoped_and_contains_no_host_root() -> None:
+    principal_id = new_principal_id()
+    workspace_id = new_workspace_id()
+    scope = ExecutionScope(
+        run_id=new_run_id(),
+        session_id=new_session_id(),
+        principal_id=principal_id,
+        workspace_id=workspace_id,
+        grant=WorkspaceGrant(
+            principal_id=principal_id,
+            workspace_id=workspace_id,
+            access=(ResourceAccess.READ,),
+        ),
+    )
+
+    assert ExecutionScope.model_validate_json(scope.model_dump_json()) == scope
+    assert "root" not in scope.model_fields
+    with pytest.raises(ValidationError):
+        scope.workspace_id = new_workspace_id()  # type: ignore[misc]
 
 
 def make_attempt(**overrides: object) -> Attempt:
@@ -159,6 +345,67 @@ def test_usage_defaults_and_total() -> None:
     assert Usage(input_tokens=10, output_tokens=5).total_tokens == 15
 
 
+def test_attempt_cost_distinguishes_unknown_usage_from_measured_zero() -> None:
+    assert AttemptCost.from_usage(
+        None,
+        input_price_per_million_tokens=Decimal("3"),
+        output_price_per_million_tokens=Decimal("15"),
+    ) is None
+    zero = AttemptCost.from_usage(
+        Usage(input_tokens=0, output_tokens=0),
+        input_price_per_million_tokens=Decimal("3"),
+        output_price_per_million_tokens=Decimal("15"),
+    )
+    assert zero is not None
+    assert zero.total_cost == Decimal("0")
+
+
+def test_run_metrics_separate_provider_elapsed_and_run_wall_clock() -> None:
+    metrics = RunMetrics.from_attempt(
+        usage=Usage(input_tokens=2, output_tokens=1, elapsed_ms=40),
+        wall_clock_ms=100,
+    )
+    assert metrics.provider_elapsed_ms == 40
+    assert metrics.wall_clock_ms == 100
+    assert metrics.provider_elapsed_ms != metrics.wall_clock_ms
+    assert RunMetrics.model_validate_json(metrics.model_dump_json()) == metrics
+
+
+def test_run_metrics_addition_propagates_unknown_facts_and_exact_cost() -> None:
+    known_cost = AttemptCost.from_usage(
+        Usage(input_tokens=1, output_tokens=1, elapsed_ms=10),
+        input_price_per_million_tokens=Decimal("0.1"),
+        output_price_per_million_tokens=Decimal("0.2"),
+    )
+    assert known_cost is not None
+    known_cost_usage = Usage(input_tokens=1, output_tokens=1, elapsed_ms=10)
+    first = RunMetrics.from_attempt(
+        usage=known_cost_usage, cost=known_cost, wall_clock_ms=30
+    )
+    second = RunMetrics.from_attempt(
+        usage=Usage(input_tokens=2, output_tokens=3, elapsed_ms=20),
+        cost=AttemptCost.from_usage(
+            Usage(input_tokens=2, output_tokens=3, elapsed_ms=20),
+            input_price_per_million_tokens=Decimal("0.1"),
+            output_price_per_million_tokens=Decimal("0.2"),
+        ),
+        wall_clock_ms=50,
+    )
+    total = first + second
+    assert total.usage == known_cost_usage + Usage(input_tokens=2, output_tokens=3, elapsed_ms=20)
+    assert total.provider_elapsed_ms == 30
+    assert total.wall_clock_ms == 80
+    assert total.cost == Decimal("0.0000011")
+    assert (total + RunMetrics.from_attempt(usage=None)).cost is None
+
+
+def test_run_metrics_reject_inconsistent_or_fabricated_cost_facts() -> None:
+    with pytest.raises(ValidationError):
+        RunMetrics(cost=Decimal("0.01"))
+    with pytest.raises(ValidationError):
+        RunMetrics(usage=Usage(elapsed_ms=3), provider_elapsed_ms=4)
+
+
 def test_usage_addition_is_component_wise() -> None:
     first = Usage(input_tokens=10, output_tokens=5, strong_model_tokens=3, elapsed_ms=100)
     second = Usage(input_tokens=1, output_tokens=2, strong_model_tokens=1, elapsed_ms=50)
@@ -221,6 +468,86 @@ def test_budget_deadline_must_be_timezone_aware() -> None:
     assert Budget(deadline=T0).deadline == T0
 
 
+# --- reservation ---------------------------------------------------------------
+
+
+def make_reservation_request(**overrides: object) -> ReservationRequest:
+    data: dict[str, object] = {
+        "run_id": RUN_ID,
+        "work_unit_id": WORK_UNIT_ID,
+        "dispatch_key": "run-dispatch-1",
+    }
+    data.update(overrides)
+    return ReservationRequest(**data)  # type: ignore[arg-type]
+
+
+def make_reservation(**overrides: object) -> Reservation:
+    data: dict[str, object] = {
+        "reservation_id": RESERVATION_ID,
+        "request": make_reservation_request(),
+        "created_at": T0,
+    }
+    data.update(overrides)
+    return Reservation(**data)  # type: ignore[arg-type]
+
+
+def test_reservation_id_and_lifecycle_vocabularies_are_closed() -> None:
+    assert RESERVATION_ID.startswith("res_")
+    assert tuple(member.value for member in ReservationStatus) == (
+        "PENDING",
+        "HELD",
+        "SETTLED",
+        "RELEASED",
+        "EXPIRED",
+    )
+    assert ReservationStatus.SETTLED.is_terminal is True
+    assert ReservationStatus.HELD.is_terminal is False
+
+
+def test_reservation_request_rejects_blank_or_unbounded_dispatch_facts() -> None:
+    with pytest.raises(ValidationError):
+        make_reservation_request(dispatch_key="   ")
+    with pytest.raises(ValidationError):
+        make_reservation_request(attempt_units=0)
+    with pytest.raises(ValidationError):
+        make_reservation_request(
+            estimated_input_tokens=8,
+            estimated_output_tokens=4,
+            token_upper_bound=11,
+        )
+    with pytest.raises(ValidationError):
+        make_reservation_request(extra_fact=True)
+
+
+def test_reservation_lifecycle_requires_consistent_public_facts() -> None:
+    assert make_reservation().status is ReservationStatus.PENDING
+    with pytest.raises(ValidationError, match="held_at"):
+        make_reservation(status=ReservationStatus.HELD)
+    with pytest.raises(ValidationError, match="completed_at"):
+        make_reservation(
+            status=ReservationStatus.RELEASED,
+            held_at=T0,
+        )
+    with pytest.raises(ValidationError, match="precede"):
+        make_reservation(
+            status=ReservationStatus.EXPIRED,
+            held_at=T0,
+            completed_at=T0 - timedelta(seconds=1),
+        )
+
+
+def test_held_and_terminal_reservations_round_trip_without_io() -> None:
+    held = make_reservation(status=ReservationStatus.HELD, held_at=T0)
+    settled = make_reservation(
+        status=ReservationStatus.SETTLED,
+        held_at=T0,
+        completed_at=T0 + timedelta(seconds=1),
+        measured_usage=Usage(input_tokens=3, output_tokens=2),
+    )
+    assert Reservation.model_validate_json(held.model_dump_json()) == held
+    assert Reservation.model_validate_json(settled.model_dump_json()) == settled
+
+
 # --- output requirement ---------------------------------------------------------
 
 
@@ -271,7 +598,54 @@ def test_request_defaults_to_auto_routing() -> None:
     assert request.routing_policy is RoutingPolicy.AUTO
     assert request.strategy is None
     assert request.routing is None
+    assert request.agent_options == AgentRequestOptions()
     assert request.budget == Budget()
+
+
+def test_agent_request_options_keep_dimensions_independent() -> None:
+    request = make_request(
+        agent_options=AgentRequestOptions(
+            agent_mode=AgentMode.YOLO,
+            isolation_mode=IsolationMode.HOST,
+            execution_location=ExecutionLocation.BRIDGE,
+            user_explicit=True,
+        )
+    )
+    assert request.agent_options.model_dump() == {
+        "agent_mode": "YOLO",
+        "isolation_mode": "HOST",
+        "execution_location": "BRIDGE",
+        "user_explicit": True,
+    }
+    assert NativeRunRequest.model_validate_json(request.model_dump_json()) == request
+
+
+def test_agent_request_options_do_not_derive_permissions_from_routing_intent() -> None:
+    request = make_request(routing=RoutingIntent(requires_plan=True))
+    assert request.agent_options == AgentRequestOptions()
+
+
+def test_host_yolo_requires_an_explicit_user_fact() -> None:
+    with pytest.raises(ValidationError, match="user_explicit"):
+        AgentRequestOptions(agent_mode=AgentMode.YOLO, isolation_mode=IsolationMode.HOST)
+    options = AgentRequestOptions(
+        agent_mode=AgentMode.YOLO,
+        isolation_mode=IsolationMode.HOST,
+        user_explicit=True,
+    )
+    assert options.user_explicit is True
+
+
+def test_user_explicit_is_a_strict_boolean_fact() -> None:
+    with pytest.raises(ValidationError):
+        AgentRequestOptions(user_explicit="true")
+
+
+def test_agent_request_options_reject_unknown_values_and_fields() -> None:
+    with pytest.raises(ValidationError):
+        AgentRequestOptions(agent_mode="ELEVATED")
+    with pytest.raises(ValidationError):
+        AgentRequestOptions(allow_all=True)
 
 
 def test_routing_intent_is_closed_immutable_and_contains_only_public_facts() -> None:

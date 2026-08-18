@@ -11,7 +11,6 @@ from fastapi.testclient import TestClient
 from prp_runtime.app import create_app
 from prp_runtime.control.controller import RunController
 from prp_runtime.domain.enums import ExecutionStrategy, ModelRole, RoutingPolicy, RunStatus
-from prp_runtime.domain.errors import ErrorCode
 from prp_runtime.domain.events import EventType
 from prp_runtime.domain.models import Budget, NativeRunRequest, Run, Usage
 from prp_runtime.providers.base import FinishReason, ModelProfile, ProviderRequest, ProviderResponse
@@ -48,6 +47,7 @@ class FixedAdapter:
             text = json.dumps(
                 {
                     "summary": "one bounded task",
+                    "final_node": "answer",
                     "nodes": [
                         {
                             "key": "answer",
@@ -117,8 +117,9 @@ def test_public_auto_dispatches_each_strategy_and_records_selection(
         assert response.status_code == 201
         body = response.json()
         events_response = client.get(f"/v1/runs/{body['run_id']}/events")
+        body = client.get(f"/v1/runs/{body['run_id']}").json()
 
-    assert body["status"] == RunStatus.SUCCEEDED.value
+    assert body["status"] == RunStatus.SUCCEEDED.value, body
     assert body["strategy"] == expected.value
     assert body["graph_version"] == graph_version
     event_records = [
@@ -165,7 +166,7 @@ async def test_manual_keeps_each_pinned_strategy(
 
     finished = await controller.execute(run.run_id)
 
-    assert finished.status is RunStatus.SUCCEEDED
+    assert finished.status is RunStatus.SUCCEEDED, finished.error
     assert finished.strategy is strategy
 
 
@@ -194,10 +195,13 @@ def test_public_auto_rejects_progressive_budget_without_direct_fallback(
             json={"input": "needs revision", "routing": {"requires_revision": True}},
         )
         pending = client.get(f"/v1/runs/{created_ids[0]}")
+        events = client.get(f"/v1/runs/{created_ids[0]}/events")
+        final = client.get(f"/v1/runs/{created_ids[0]}")
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == ErrorCode.INVALID_REQUEST.value
+    assert response.status_code == 201
     assert pending.json()["status"] == RunStatus.PENDING.value
+    assert events.status_code == 200
+    assert final.json()["status"] == RunStatus.FAILED.value
     assert adapter.requests == []
 
 
@@ -227,8 +231,11 @@ def test_public_auto_capability_failure_is_not_silently_downgraded(
             json={"input": "needs a plan", "routing": {"requires_plan": True}},
         )
         pending = client.get(f"/v1/runs/{created_ids[0]}")
+        events = client.get(f"/v1/runs/{created_ids[0]}/events")
+        final = client.get(f"/v1/runs/{created_ids[0]}")
 
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == ErrorCode.PROVIDER_NOT_CONFIGURED.value
+    assert response.status_code == 201
     assert pending.json()["status"] == RunStatus.PENDING.value
+    assert events.status_code == 200
+    assert final.json()["status"] == RunStatus.FAILED.value
     assert worker.requests == []

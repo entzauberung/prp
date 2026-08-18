@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from enum import StrEnum, unique
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from prp_runtime.api.errors import binding_error
 from prp_runtime.domain.errors import ErrorCode
@@ -48,6 +48,15 @@ class BindingNormalizationResult(BaseModel):
     operation: BindingOperation
     request: NativeRunRequest | None = None
     run_id: RunId | None = None
+
+    @model_validator(mode="after")
+    def _operation_payload_matches(self) -> "BindingNormalizationResult":
+        if self.operation is BindingOperation.CREATE:
+            if self.request is None or self.run_id is not None:
+                raise ValueError("CREATE normalization requires a request only")
+        elif self.request is not None or self.run_id is None:
+            raise ValueError("control normalization requires a run_id only")
+        return self
 
     @property
     def native_request(self) -> NativeRunRequest | None:

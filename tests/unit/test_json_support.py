@@ -8,6 +8,7 @@ import pytest
 from prp_runtime.json_support import (
     NON_STANDARD_JSON_CONSTANTS,
     StrictJsonError,
+    canonical_json_dumps,
     strict_json_loads,
 )
 
@@ -40,6 +41,18 @@ def test_standard_json_is_returned_unchanged(text: str, expected: object) -> Non
 def test_nested_structures_keep_their_shape() -> None:
     text = '{"a": [1, {"b": null}], "c": {"d": [true, false]}}'
     assert strict_json_loads(text) == json.loads(text)
+
+
+def test_canonical_json_sorts_keys_and_uses_compact_standard_encoding() -> None:
+    assert canonical_json_dumps({"b": 2, "a": {"d": 4, "c": 3}}) == (
+        '{"a":{"c":3,"d":4},"b":2}'
+    )
+    assert canonical_json_dumps({"text": "秘密"}) == '{"text":"\\u79d8\\u5bc6"}'
+
+
+def test_canonical_json_rejects_non_finite_values() -> None:
+    with pytest.raises(ValueError):
+        canonical_json_dumps({"value": float("nan")})
 
 
 def test_integers_stay_int_and_fractions_stay_float() -> None:

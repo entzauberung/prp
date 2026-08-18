@@ -13,6 +13,7 @@ from prp_runtime.api.bindings import (
     reject_unsupported_fields,
 )
 from prp_runtime.api.errors import binding_error
+from prp_runtime.api.tool_bindings import anthropic_messages_to_native_tool_turn
 from prp_runtime.control.routing import facts_from_request
 from prp_runtime.domain.enums import RunStatus
 from prp_runtime.domain.errors import ErrorCode
@@ -92,6 +93,9 @@ def _normalize(payload: Mapping[str, object]) -> BindingNormalizationResult:
             "Anthropic messages must be a list",
             field="messages",
         )
+    anthropic_messages_to_native_tool_turn(
+        tuple(message for message in messages if isinstance(message, Mapping))
+    )
     input_parts: list[str] = []
     for message in messages:
         if not isinstance(message, Mapping):

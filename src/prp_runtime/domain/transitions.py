@@ -7,13 +7,18 @@ new graph version instead of rewriting history.
 """
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from types import MappingProxyType
 
 from prp_runtime.domain.enums import (
     AttemptStatus,
     ExecutionStrategy,
+    MergeLedgerStatus,
+    ReservationStatus,
     RoutingPolicy,
     RunStatus,
+    ToolCallStatus,
     WorkUnitStatus,
 )
 
@@ -22,7 +27,12 @@ __all__ = [
     "AttemptNotAllowedError",
     "DomainTransitionError",
     "IllegalStatusTransitionError",
+    "TOOL_CALL_TRANSITIONS",
     "RUN_TRANSITIONS",
+    "RESERVATION_TRANSITIONS",
+    "MERGE_TRANSITIONS",
+    "RecoveryAction",
+    "RecoveryDecision",
     "RunCompletionNotAllowedError",
     "STRATEGY_CONTROL_STRENGTH",
     "StrategyEscalationNotAllowedError",
@@ -31,17 +41,71 @@ __all__ = [
     "can_escalate_strategy",
     "can_start_attempt",
     "can_transition_attempt",
+    "can_transition_tool_call",
     "can_transition_run",
+    "can_transition_reservation",
+    "can_transition_merge",
     "can_transition_work_unit",
     "control_strength",
+    "decide_attempt_recovery",
+    "decide_reservation_recovery",
+    "decide_run_recovery",
+    "decide_tool_call_recovery",
+    "decide_work_unit_recovery",
     "escalate_strategy",
     "mark_attempt_unconfirmed",
     "recover_attempt_on_restart",
     "resolve_run_outcome",
     "transition_attempt",
+    "transition_tool_call",
     "transition_run",
+    "transition_reservation",
+    "transition_merge",
     "transition_work_unit",
 ]
+
+
+class RecoveryAction(StrEnum):
+    """The safe operation selected for one persisted entity on restart."""
+
+    CONTINUE = "continue"
+    INTERRUPT = "interrupt"
+    TERMINATE = "terminate"
+    PRESERVE = "preserve"
+    RELEASE = "release"
+    BLOCK = "block"
+
+
+RecoveryStatus = (
+    RunStatus
+    | WorkUnitStatus
+    | AttemptStatus
+    | ReservationStatus
+    | ToolCallStatus
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryDecision:
+    """A pure, explainable restart decision.
+
+    ``target_status`` is the only status a recovery worker may write.  A
+    ``BLOCK`` decision keeps the recorded status and requires diagnosis rather
+    than guessing a retry or an upstream outcome.
+    """
+
+    action: RecoveryAction
+    target_status: RecoveryStatus
+    reason: str
+    retry_allowed: bool = False
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.action is RecoveryAction.BLOCK
+
+    @property
+    def can_continue(self) -> bool:
+        return self.action is RecoveryAction.CONTINUE and self.retry_allowed
 
 
 class DomainTransitionError(ValueError):
@@ -148,6 +212,43 @@ WORK_UNIT_TRANSITIONS: Mapping[WorkUnitStatus, frozenset[WorkUnitStatus]] = Mapp
     }
 )
 
+RESERVATION_TRANSITIONS: Mapping[
+    ReservationStatus, frozenset[ReservationStatus]
+] = MappingProxyType(
+    {
+        ReservationStatus.PENDING: frozenset({ReservationStatus.HELD}),
+        ReservationStatus.HELD: frozenset(
+            {
+                ReservationStatus.SETTLED,
+                ReservationStatus.RELEASED,
+                ReservationStatus.EXPIRED,
+            }
+        ),
+        ReservationStatus.SETTLED: frozenset(),
+        ReservationStatus.RELEASED: frozenset(),
+        ReservationStatus.EXPIRED: frozenset(),
+    }
+)
+
+MERGE_TRANSITIONS: Mapping[
+    MergeLedgerStatus, frozenset[MergeLedgerStatus]
+] = MappingProxyType(
+    {
+        MergeLedgerStatus.PLANNED: frozenset(
+            {MergeLedgerStatus.RUNNING, MergeLedgerStatus.CONFLICT, MergeLedgerStatus.UNKNOWN}
+        ),
+        MergeLedgerStatus.RUNNING: frozenset(
+            {MergeLedgerStatus.MERGED, MergeLedgerStatus.CONFLICT, MergeLedgerStatus.UNKNOWN}
+        ),
+        MergeLedgerStatus.MERGED: frozenset(
+            {MergeLedgerStatus.PROMOTED, MergeLedgerStatus.UNKNOWN}
+        ),
+        MergeLedgerStatus.PROMOTED: frozenset(),
+        MergeLedgerStatus.CONFLICT: frozenset(),
+        MergeLedgerStatus.UNKNOWN: frozenset(),
+    }
+)
+
 ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = MappingProxyType(
     {
         AttemptStatus.PENDING: frozenset({AttemptStatus.RUNNING, AttemptStatus.CANCELLED}),
@@ -165,6 +266,43 @@ ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = MappingP
         AttemptStatus.CANCELLED: frozenset(),
         AttemptStatus.INTERRUPTED: frozenset(),
         AttemptStatus.UNKNOWN: frozenset(),
+    }
+)
+
+TOOL_CALL_TRANSITIONS: Mapping[
+    ToolCallStatus, frozenset[ToolCallStatus]
+] = MappingProxyType(
+    {
+        ToolCallStatus.REQUESTED: frozenset(
+            {
+                ToolCallStatus.AWAITING_APPROVAL,
+                ToolCallStatus.RUNNING,
+                ToolCallStatus.CANCELLED,
+                ToolCallStatus.REJECTED,
+            }
+        ),
+        ToolCallStatus.AWAITING_APPROVAL: frozenset(
+            {
+                ToolCallStatus.RUNNING,
+                ToolCallStatus.CANCELLED,
+                ToolCallStatus.REJECTED,
+            }
+        ),
+        ToolCallStatus.RUNNING: frozenset(
+            {
+                ToolCallStatus.SUCCEEDED,
+                ToolCallStatus.FAILED,
+                ToolCallStatus.CANCELLED,
+                ToolCallStatus.INTERRUPTED,
+                ToolCallStatus.UNKNOWN,
+            }
+        ),
+        ToolCallStatus.SUCCEEDED: frozenset(),
+        ToolCallStatus.FAILED: frozenset(),
+        ToolCallStatus.CANCELLED: frozenset(),
+        ToolCallStatus.REJECTED: frozenset(),
+        ToolCallStatus.INTERRUPTED: frozenset(),
+        ToolCallStatus.UNKNOWN: frozenset(),
     }
 )
 
@@ -202,6 +340,51 @@ def transition_work_unit(current: WorkUnitStatus, target: WorkUnitStatus) -> Wor
     return target
 
 
+def can_transition_reservation(
+    current: ReservationStatus, target: ReservationStatus
+) -> bool:
+    """Whether a reservation may move to a different lifecycle state."""
+    return target in RESERVATION_TRANSITIONS[current]
+
+
+def transition_reservation(
+    current: ReservationStatus,
+    target: ReservationStatus,
+    *,
+    idempotent_terminal: bool = False,
+) -> ReservationStatus:
+    """Return a legal reservation state, optionally replaying one terminal state.
+
+    Normal transitions reject self-transitions. A caller replaying the same
+    terminal operation may opt into idempotence; a different terminal target is
+    still rejected and never silently rewritten.
+    """
+    if idempotent_terminal and current is target and current.is_terminal:
+        return current
+    if not can_transition_reservation(current, target):
+        raise IllegalStatusTransitionError("reservation", current.value, target.value)
+    return target
+
+
+def can_transition_merge(current: MergeLedgerStatus, target: MergeLedgerStatus) -> bool:
+    """Whether a merge lifecycle may move to a different status."""
+    return target in MERGE_TRANSITIONS[current]
+
+
+def transition_merge(
+    current: MergeLedgerStatus,
+    target: MergeLedgerStatus,
+    *,
+    idempotent_terminal: bool = False,
+) -> MergeLedgerStatus:
+    """Return a legal merge status without reopening an uncertain terminal fact."""
+    if idempotent_terminal and current is target and current.is_terminal:
+        return current
+    if not can_transition_merge(current, target):
+        raise IllegalStatusTransitionError("merge", current.value, target.value)
+    return target
+
+
 def can_transition_attempt(current: AttemptStatus, target: AttemptStatus) -> bool:
     """Whether an attempt may move from ``current`` to ``target``."""
     return target in ATTEMPT_TRANSITIONS[current]
@@ -211,6 +394,35 @@ def transition_attempt(current: AttemptStatus, target: AttemptStatus) -> Attempt
     """Return ``target`` if the attempt transition is legal, otherwise raise."""
     if not can_transition_attempt(current, target):
         raise IllegalStatusTransitionError("attempt", current.value, target.value)
+    return target
+
+
+def can_transition_tool_call(current: ToolCallStatus, target: ToolCallStatus) -> bool:
+    """Whether a tool call may move from ``current`` to ``target``."""
+    return target in TOOL_CALL_TRANSITIONS[current]
+
+
+def transition_tool_call(
+    current: ToolCallStatus,
+    target: ToolCallStatus,
+    *,
+    approved: bool | None = None,
+    idempotent_terminal: bool = False,
+) -> ToolCallStatus:
+    """Return a legal tool-call state, with explicit approval and replay rules."""
+    if idempotent_terminal and current is target and current.is_terminal:
+        return current
+    if current is ToolCallStatus.AWAITING_APPROVAL and target is ToolCallStatus.RUNNING:
+        if approved is not True:
+            raise IllegalStatusTransitionError(
+                "tool_call", current.value, f"{target.value} without approval"
+            )
+    elif approved is True and current is ToolCallStatus.REQUESTED:
+        raise IllegalStatusTransitionError(
+            "tool_call", current.value, "RUNNING with approval bypass"
+        )
+    if not can_transition_tool_call(current, target):
+        raise IllegalStatusTransitionError("tool_call", current.value, target.value)
     return target
 
 
@@ -239,15 +451,265 @@ def assert_can_start_attempt(run_status: RunStatus, work_unit_status: WorkUnitSt
     raise AttemptNotAllowedError(reason, run_status, work_unit_status)
 
 
+def decide_attempt_recovery(current: AttemptStatus) -> RecoveryDecision:
+    """Classify one persisted attempt without consulting process memory.
+
+    A pending attempt has no recorded dispatch and may be admitted again. A
+    running attempt is interrupted, but never retried automatically because
+    its provider-side outcome is unknown.
+    """
+    if current is AttemptStatus.PENDING:
+        return RecoveryDecision(
+            action=RecoveryAction.CONTINUE,
+            target_status=current,
+            reason="attempt was not dispatched before restart",
+            retry_allowed=True,
+        )
+    if current is AttemptStatus.RUNNING:
+        return RecoveryDecision(
+            action=RecoveryAction.INTERRUPT,
+            target_status=AttemptStatus.INTERRUPTED,
+            reason="provider outcome is unknown after restart",
+        )
+    if current in (AttemptStatus.UNKNOWN, AttemptStatus.INTERRUPTED):
+        return RecoveryDecision(
+            action=RecoveryAction.PRESERVE,
+            target_status=current,
+            reason="provider outcome remains unconfirmed; retry requires diagnosis",
+        )
+    return RecoveryDecision(
+        action=RecoveryAction.PRESERVE,
+        target_status=current,
+        reason="terminal attempt history is immutable",
+    )
+
+
+def decide_tool_call_recovery(
+    current: ToolCallStatus,
+    *,
+    has_history_call: bool = True,
+    has_pending_history: bool = True,
+    has_approval: bool = True,
+    has_result: bool | None = None,
+    has_history_result: bool = False,
+    has_conflict: bool = False,
+) -> RecoveryDecision:
+    """Classify one ToolCall without assuming an unconfirmed side effect.
+
+    ``RUNNING`` is interrupted to ``UNKNOWN``. A pending request may continue
+    only when its public history and approval facts agree. Terminal facts are
+    preserved; a missing public result is a replay concern, never a new tool
+    execution.
+    """
+    if has_conflict or not has_history_call:
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="tool call facts do not match public history",
+        )
+    if current is ToolCallStatus.RUNNING:
+        if has_result is True:
+            return RecoveryDecision(
+                action=RecoveryAction.BLOCK,
+                target_status=current,
+                reason="running tool call has a conflicting terminal result",
+            )
+        return RecoveryDecision(
+            action=RecoveryAction.INTERRUPT,
+            target_status=ToolCallStatus.UNKNOWN,
+            reason="tool side effect is unconfirmed after restart",
+        )
+    if current in (ToolCallStatus.UNKNOWN, ToolCallStatus.INTERRUPTED):
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="tool side effect remains unconfirmed; retry is forbidden",
+        )
+    if current in (ToolCallStatus.REQUESTED, ToolCallStatus.AWAITING_APPROVAL):
+        if has_result is True:
+            return RecoveryDecision(
+                action=RecoveryAction.BLOCK,
+                target_status=current,
+                reason="non-terminal tool call has a conflicting terminal result",
+            )
+        if not has_pending_history or (
+            current is ToolCallStatus.AWAITING_APPROVAL and not has_approval
+        ):
+            return RecoveryDecision(
+                action=RecoveryAction.BLOCK,
+                target_status=current,
+                reason="pending tool call is missing approval or history facts",
+            )
+        return RecoveryDecision(
+            action=RecoveryAction.CONTINUE,
+            target_status=current,
+            reason=(
+                "approval wait remains resumable"
+                if current is ToolCallStatus.AWAITING_APPROVAL
+                else "requested tool call was not dispatched"
+            ),
+            retry_allowed=True,
+        )
+    if has_result is False:
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="terminal tool call has no persisted result",
+        )
+    if has_result and not has_history_result:
+        return RecoveryDecision(
+            action=RecoveryAction.PRESERVE,
+            target_status=current,
+            reason="terminal tool result is preserved for public history replay",
+        )
+    return RecoveryDecision(
+        action=RecoveryAction.PRESERVE,
+        target_status=current,
+        reason="terminal tool call status is immutable",
+    )
+
+
+def decide_run_recovery(
+    current: RunStatus,
+    *,
+    has_dispatched_attempt: bool = False,
+    has_conflict: bool = False,
+) -> RecoveryDecision:
+    """Classify a persisted run using only durable restart facts."""
+    if has_conflict or (current is RunStatus.PENDING and has_dispatched_attempt):
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="run status conflicts with its dispatched attempt history",
+        )
+    if current.is_terminal:
+        if has_dispatched_attempt:
+            return RecoveryDecision(
+                action=RecoveryAction.BLOCK,
+                target_status=current,
+                reason="terminal run has an unaccounted dispatched attempt",
+            )
+        return RecoveryDecision(
+            action=RecoveryAction.PRESERVE,
+            target_status=current,
+            reason="terminal run status is immutable",
+        )
+    if current is RunStatus.CANCELLING:
+        return RecoveryDecision(
+            action=RecoveryAction.PRESERVE,
+            target_status=current,
+            reason="cancellation is already in progress",
+        )
+    return RecoveryDecision(
+        action=RecoveryAction.CONTINUE,
+        target_status=current,
+        reason="run may continue from durable pending work",
+        retry_allowed=True,
+    )
+
+
+def decide_work_unit_recovery(
+    current: WorkUnitStatus,
+    *,
+    has_running_attempt: bool = False,
+    has_unconfirmed_attempt: bool = False,
+    has_dispatched_attempt: bool = False,
+    has_conflict: bool = False,
+) -> RecoveryDecision:
+    """Classify a work unit and reject contradictory durable facts."""
+    if has_conflict:
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="work unit facts conflict and cannot be reconciled safely",
+        )
+    if current in (WorkUnitStatus.PENDING, WorkUnitStatus.READY):
+        if has_dispatched_attempt:
+            return RecoveryDecision(
+                action=RecoveryAction.BLOCK,
+                target_status=WorkUnitStatus.BLOCKED,
+                reason="dispatch history conflicts with a not-started work unit",
+            )
+        return RecoveryDecision(
+            action=RecoveryAction.CONTINUE,
+            target_status=current,
+            reason="work unit has no dispatched attempt and may be queued",
+            retry_allowed=True,
+        )
+    if current is WorkUnitStatus.RUNNING:
+        if has_unconfirmed_attempt:
+            return RecoveryDecision(
+                action=RecoveryAction.BLOCK,
+                target_status=current,
+                reason="work unit has an unconfirmed provider outcome",
+            )
+        if has_running_attempt:
+            return RecoveryDecision(
+                action=RecoveryAction.TERMINATE,
+                target_status=WorkUnitStatus.FAILED,
+                reason="running attempt was interrupted by restart",
+            )
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="running work unit has no durable attempt outcome",
+        )
+    return RecoveryDecision(
+        action=RecoveryAction.PRESERVE,
+        target_status=current,
+        reason="work unit status is not automatically rewritten on restart",
+    )
+
+
+def decide_reservation_recovery(
+    current: ReservationStatus,
+    *,
+    has_inflight_attempt: bool = False,
+    has_unconfirmed_attempt: bool = False,
+    has_conflict: bool = False,
+) -> RecoveryDecision:
+    """Classify a reservation without releasing an uncertain side effect."""
+    if has_conflict or (
+        current.is_terminal and (has_inflight_attempt or has_unconfirmed_attempt)
+    ):
+        return RecoveryDecision(
+            action=RecoveryAction.BLOCK,
+            target_status=current,
+            reason="reservation lifecycle conflicts with attempt history",
+        )
+    if current is ReservationStatus.PENDING:
+        return RecoveryDecision(
+            action=RecoveryAction.CONTINUE,
+            target_status=current,
+            reason="reservation was not held before restart",
+            retry_allowed=True,
+        )
+    if current is ReservationStatus.HELD:
+        if has_inflight_attempt or has_unconfirmed_attempt:
+            return RecoveryDecision(
+                action=RecoveryAction.PRESERVE,
+                target_status=current,
+                reason="reservation belongs to an unconfirmed attempt",
+            )
+        return RecoveryDecision(
+            action=RecoveryAction.RELEASE,
+            target_status=ReservationStatus.RELEASED,
+            reason="held reservation has no corresponding attempt",
+        )
+    return RecoveryDecision(
+        action=RecoveryAction.PRESERVE,
+        target_status=current,
+        reason="terminal reservation status is immutable",
+    )
+
+
 def recover_attempt_on_restart(current: AttemptStatus) -> AttemptStatus:
     """Map an attempt status to its post-restart status.
 
     A running attempt becomes ``INTERRUPTED``: the process cannot prove success or
     failure. Every other status is kept as recorded.
     """
-    if current is AttemptStatus.RUNNING:
-        return AttemptStatus.INTERRUPTED
-    return current
+    return decide_attempt_recovery(current).target_status  # type: ignore[return-value]
 
 
 def mark_attempt_unconfirmed(current: AttemptStatus) -> AttemptStatus:

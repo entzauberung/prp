@@ -1,13 +1,20 @@
 """Targeted tests for the provider contract and server-side model profiles."""
 
 import json
+from decimal import Decimal
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.domain.errors import DomainValidationError, ErrorCode, ProviderError
-from prp_runtime.domain.models import Usage
+from prp_runtime.domain.models import (
+    MAX_PROVIDER_TOOL_COUNT,
+    MAX_PROVIDER_TOOL_DESCRIPTOR_BYTES,
+    AgentToolCall,
+    ProviderToolDescriptor,
+    Usage,
+)
 from prp_runtime.providers.base import (
     FinishReason,
     ModelProfile,
@@ -64,6 +71,27 @@ def test_profile_exposes_the_domain_model_reference() -> None:
     assert profile.model_ref.identifier == "openai_compatible/weak-model"
     assert profile.timeout_seconds == 60.0
     assert profile.supports_structured_output is False
+    assert profile.input_price_per_million_tokens == Decimal("0")
+    assert profile.output_price_per_million_tokens == Decimal("0")
+
+
+def test_profile_cost_uses_exact_decimal_arithmetic_and_preserves_unknown_usage() -> None:
+    profile = worker_profile(
+        input_price_per_million_tokens=Decimal("0.1"),
+        output_price_per_million_tokens=Decimal("0.2"),
+    )
+    first = profile.cost_for_usage(Usage(input_tokens=1, output_tokens=2))
+    second = profile.cost_for_usage(Usage(input_tokens=3, output_tokens=4))
+    assert first is not None and second is not None
+    assert first.total_cost + second.total_cost == Decimal("0.0000016")
+    assert profile.cost_for_usage(None) is None
+
+
+def test_profile_prices_round_trip_as_decimal_values() -> None:
+    profile = worker_profile(input_price_per_million_tokens=Decimal("0.10"))
+    restored = ModelProfile.model_validate_json(profile.model_dump_json())
+    assert restored == profile
+    assert restored.input_price_per_million_tokens == Decimal("0.10")
 
 
 def test_api_key_never_leaks_into_repr_or_serialisation() -> None:
@@ -149,6 +177,70 @@ def test_request_for_profile_uses_server_side_values() -> None:
     assert request.max_output_tokens == profile.max_output_tokens
     assert request.timeout_seconds == profile.timeout_seconds
     assert request.json_schema is None
+    assert request.tools == ()
+
+
+def test_provider_tool_descriptor_is_public_metadata_only_and_json_serialisable() -> None:
+    descriptor = ProviderToolDescriptor(
+        name="read_file",
+        description="Read one relative file.",
+        input_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    )
+    request = ProviderRequest.for_profile(worker_profile(), input="x", tools=(descriptor,))
+
+    assert request.tools == (descriptor,)
+    assert request.model_dump(mode="json")["tools"] == [descriptor.model_dump(mode="json")]
+    assert "handler" not in descriptor.model_dump(mode="json")
+    assert "effect" not in descriptor.model_dump(mode="json")
+    assert "executable" not in descriptor.model_dump(mode="json")
+    assert "path_root" not in descriptor.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("field", ["handler", "effect", "executable", "path_root", "api_key"])
+def test_provider_tool_descriptor_rejects_execution_and_secret_fields(field: str) -> None:
+    with pytest.raises(ValidationError):
+        ProviderToolDescriptor(name="read_file", **{field: "forbidden"})  # type: ignore[arg-type]
+
+
+def test_provider_tool_descriptor_is_frozen_and_rejects_oversized_schema() -> None:
+    descriptor = ProviderToolDescriptor(name="read_file")
+    with pytest.raises(ValidationError):
+        descriptor.name = "other"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        ProviderToolDescriptor(
+            name="read_file",
+            input_schema={"description": "x" * MAX_PROVIDER_TOOL_DESCRIPTOR_BYTES},
+        )
+
+
+def test_provider_request_rejects_duplicate_and_unbounded_tools() -> None:
+    descriptor = ProviderToolDescriptor(name="read_file")
+    with pytest.raises(ValidationError, match="unique"):
+        ProviderRequest.for_profile(
+            worker_profile(), input="x", tools=(descriptor, descriptor)
+        )
+    with pytest.raises(ValidationError, match="too many"):
+        ProviderRequest.for_profile(
+            worker_profile(),
+            input="x",
+            tools=tuple(
+                ProviderToolDescriptor(name=f"tool_{index}")
+                for index in range(MAX_PROVIDER_TOOL_COUNT + 1)
+            ),
+        )
+    with pytest.raises(ValidationError, match="size limit"):
+        ProviderRequest.for_profile(
+            worker_profile(),
+            input="x",
+            tools=tuple(
+                ProviderToolDescriptor(name=f"tool_{index}", description="x" * 1_000)
+                for index in range(MAX_PROVIDER_TOOL_COUNT)
+            ),
+        )
 
 
 def test_request_rejects_structured_output_when_unsupported() -> None:
@@ -190,6 +282,7 @@ def test_response_carries_text_usage_finish_reason_and_request_id() -> None:
     )
     assert set(ProviderResponse.model_fields) == {
         "text",
+        "tool_calls",
         "usage",
         "finish_reason",
         "provider_request_id",
@@ -199,8 +292,41 @@ def test_response_carries_text_usage_finish_reason_and_request_id() -> None:
         "STOP",
         "LENGTH",
         "CONTENT_FILTER",
+        "TOOL_CALLS",
         "OTHER",
     ]
+
+
+def test_provider_response_rejects_blank_or_mislabeled_tool_turns() -> None:
+    call = ProviderToolDescriptor(name="read_file")
+    tool_call = AgentToolCall(call_id="call-1", tool_name=call.name)
+    with pytest.raises(ValidationError):
+        ProviderResponse(text=" \n", finish_reason=FinishReason.STOP)
+    with pytest.raises(ValidationError):
+        ProviderResponse(tool_calls=(tool_call,), finish_reason=FinishReason.STOP)
+    with pytest.raises(ValidationError):
+        ProviderResponse(
+            tool_calls=(tool_call, tool_call),
+            finish_reason=FinishReason.TOOL_CALLS,
+        )
+
+
+def test_provider_request_rejects_orphaned_tool_results() -> None:
+    with pytest.raises(ValidationError, match="orphaned"):
+        ProviderRequest(
+            alias="worker",
+            model="model",
+            input="continue",
+            max_output_tokens=10,
+            timeout_seconds=5,
+            history=(
+                {
+                    "kind": "tool_result",
+                    "call_id": "call-1",
+                    "status": "SUCCEEDED",
+                },
+            ),
+        )
 
 
 def test_adapter_protocol_matches_a_minimal_implementation() -> None:
@@ -208,6 +334,9 @@ def test_adapter_protocol_matches_a_minimal_implementation() -> None:
         @property
         def name(self) -> str:
             return "stub"
+
+        async def aclose(self) -> None:
+            return None
 
         async def complete(self, request: ProviderRequest) -> ProviderResponse:
             return ProviderResponse(

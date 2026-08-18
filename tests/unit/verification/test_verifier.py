@@ -8,17 +8,22 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 
+from prp_runtime.analysis.syntax import SyntaxReport
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.domain.errors import DomainValidationError, ErrorCode
 from prp_runtime.domain.models import (
     Artifact,
     ArtifactKind,
     Attempt,
+    Budget,
     Evidence,
     EvidenceKind,
+    GlobalVerificationReport,
     NativeRunRequest,
     OutputRequirement,
     Run,
+    RunMetrics,
+    Usage,
     VerificationResult,
     WorkUnit,
     new_artifact_id,
@@ -28,9 +33,11 @@ from prp_runtime.domain.values import (
     ModelRef,
     new_attempt_id,
     new_run_id,
+    new_snapshot_id,
     new_work_unit_id,
 )
 from prp_runtime.storage.sqlite import SqliteStore
+from prp_runtime.tools.command import CommandResult
 from prp_runtime.verification.rules import (
     SUPPORTED_SCHEMA_KEYWORDS,
     VerificationCheck,
@@ -40,9 +47,12 @@ from prp_runtime.verification.rules import (
 )
 from prp_runtime.verification.verifier import (
     CheckOutcome,
+    GlobalCheckKind,
+    GlobalVerifier,
     RuleVerifier,
     VerificationReport,
     aggregate,
+    verify_global,
 )
 
 RUN_ID = new_run_id()
@@ -52,6 +62,8 @@ ATTEMPT_ID = new_attempt_id()
 PASS = VerificationResult.PASS
 FAIL = VerificationResult.FAIL
 UNDECIDED = VerificationResult.INCONCLUSIVE
+
+
 
 
 def artifact(content: str, kind: ArtifactKind = ArtifactKind.TEXT) -> Artifact:
@@ -615,6 +627,170 @@ def test_aggregation_never_upgrades_a_doubt_to_a_pass(
     results: tuple[VerificationResult, ...], expected: VerificationResult
 ) -> None:
     assert aggregate(results) is expected
+
+
+def test_global_report_requires_final_artifact_and_evidence() -> None:
+    produced = json_artifact({"title": "t", "score": 3})
+    evidence = verify(
+        produced,
+        VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT),
+        VerificationCheck(
+            rule=VerificationRule.OUTPUT_KIND_MATCHES,
+            expected_kind=ArtifactKind.JSON,
+        ),
+    ).to_evidence()
+    usage = Usage(input_tokens=1, output_tokens=1)
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        round_id="round_" + "r" * 32,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        budget=Budget(max_total_tokens=2),
+        usage=usage,
+        metrics=RunMetrics(
+            usage=usage,
+            provider_elapsed_ms=usage.elapsed_ms,
+            wall_clock_ms=4,
+        ),
+        attempt_count=1,
+    )
+
+    assert isinstance(report, GlobalVerificationReport)
+    assert report.result is PASS
+    assert report.passed is True
+    assert report.summary() == "PASS: 4 passed, 0 failed, 0 undecided"
+    assert GlobalVerifier().verify(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+    ).result is PASS
+    assert GlobalVerificationReport.model_validate_json(report.model_dump_json()) == report
+
+
+def test_global_report_missing_evidence_is_inconclusive() -> None:
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(artifact("answer"),),
+    )
+
+    assert report.result is UNDECIDED
+    assert [check.kind for check in report.checks] == [
+        GlobalCheckKind.FINAL_ARTIFACT.value,
+        GlobalCheckKind.EVIDENCE.value,
+    ]
+
+
+def test_candidate_verification_requires_round_and_candidate_linkage() -> None:
+    produced = artifact("answer")
+    evidence = verify(
+        produced, VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT)
+    ).to_evidence()
+    round_id = "round_" + "r" * 32
+    candidate_id = new_snapshot_id()
+
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        round_id=round_id,
+        candidate_snapshot_id=candidate_id,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        required_checks=(
+            GlobalCheckKind.FINAL_ARTIFACT,
+            GlobalCheckKind.EVIDENCE,
+            GlobalCheckKind.CANDIDATE,
+        ),
+    )
+
+    assert report.result is PASS
+    candidate_check = next(
+        check for check in report.checks if check.kind == GlobalCheckKind.CANDIDATE.value
+    )
+    assert {candidate_id, round_id, evidence[0].evidence_id}.issubset(
+        candidate_check.fact_ids
+    )
+
+    missing_candidate = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        round_id=round_id,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        required_checks=(GlobalCheckKind.CANDIDATE,),
+    )
+    assert missing_candidate.result is UNDECIDED
+
+
+def test_stale_evidence_cannot_pass_candidate_verification() -> None:
+    produced = artifact("current")
+    stale_artifact = artifact("stale")
+    evidence = verify(
+        produced, VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT)
+    ).to_evidence()[0].model_copy(update={"artifact_id": stale_artifact.artifact_id})
+
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        round_id="round_" + "s" * 32,
+        candidate_snapshot_id=new_snapshot_id(),
+        final_artifacts=(produced,),
+        evidence=(evidence,),
+        required_checks=(GlobalCheckKind.CANDIDATE,),
+    )
+
+    assert report.result is UNDECIDED
+    assert any(
+        check.kind == GlobalCheckKind.EVIDENCE.value
+        and check.result is UNDECIDED
+        for check in report.checks
+    )
+
+
+def test_global_report_does_not_upgrade_unknown_ast_or_command_facts() -> None:
+    produced = artifact("answer")
+    evidence = verify(
+        produced, VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT)
+    ).to_evidence()
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        syntax_reports=(SyntaxReport(parse_ok=True, unknown=True),),
+        command_results=(
+            CommandResult(exit_code=None, stdout="", stderr="", duration_ms=1),
+        ),
+    )
+
+    assert report.result is UNDECIDED
+    assert {check.kind for check in report.checks} >= {
+        GlobalCheckKind.AST.value,
+        GlobalCheckKind.COMMAND.value,
+    }
+
+
+def test_global_report_fails_on_command_failure_or_budget_overrun() -> None:
+    produced = artifact("answer")
+    evidence = verify(
+        produced, VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT)
+    ).to_evidence()
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        command_results=(
+            CommandResult(exit_code=1, stdout="", stderr="", duration_ms=1),
+        ),
+        budget=Budget(max_total_tokens=1),
+        usage=Usage(input_tokens=1, output_tokens=1),
+    )
+
+    assert report.result is FAIL
+    assert any(check.result is FAIL for check in report.checks)
 
 
 def test_an_empty_plan_proves_nothing() -> None:

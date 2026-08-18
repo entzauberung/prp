@@ -26,6 +26,11 @@ from prp_runtime.api.native import (
     RunEventEnvelope,
 )
 from prp_runtime.api.native import create_router as create_native_router
+from prp_runtime.api.native_agent import (
+    ApprovalDecisionRequest,
+    ApprovalView,
+)
+from prp_runtime.api.native_agent import create_router as create_native_agent_router
 from prp_runtime.api.openai_chat import create_router as create_openai_chat_router
 from prp_runtime.api.openai_responses import (
     create_router as create_openai_responses_router,
@@ -39,11 +44,14 @@ __all__ = [
     "STATUS_BY_FAMILY",
     "BindingNormalizationResult",
     "BindingOperation",
+    "ApprovalDecisionRequest",
+    "ApprovalView",
     "ErrorResponse",
     "RunEnvelope",
     "RunEventEnvelope",
     "create_anthropic_router",
     "create_native_router",
+    "create_native_agent_router",
     "create_openai_chat_router",
     "create_openai_responses_router",
     "create_router",

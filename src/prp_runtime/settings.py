@@ -12,12 +12,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SecretStr, model_validator
 
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.domain.errors import ErrorCode, ProviderError
+from prp_runtime.domain.values import PrincipalId
 from prp_runtime.json_support import strict_json_loads
 from prp_runtime.providers.base import ModelProfile
+from prp_runtime.workspace.models import WorkspaceRootMapping
 
 __all__ = ["ENV_PREFIX", "LogLevel", "Settings"]
 
@@ -33,6 +35,10 @@ _ENV_FIELDS: dict[str, str] = {
     "PRP_LEADER_PROFILE": "leader_profile",
     "PRP_WORKER_PROFILE": "worker_profile",
     "PRP_CASCADE_PROFILES": "cascade_profiles",
+    "PRP_ALLOW_HOST_YOLO": "allow_host_yolo",
+    "PRP_SERVICE_TOKEN": "service_token",
+    "PRP_SERVICE_PRINCIPAL": "service_principal",
+    "PRP_WORKSPACE_ROOTS": "workspace_roots",
 }
 
 
@@ -58,10 +64,26 @@ def _cascade_profiles_from_json(value: object) -> object:
     return value
 
 
+def _workspace_roots_from_json(value: object) -> object:
+    """Accept a strict JSON object for server-only workspace roots."""
+    if isinstance(value, str):
+        parsed = strict_json_loads(value)
+        if not isinstance(parsed, dict) or not all(
+            isinstance(alias, str) for alias in parsed
+        ):
+            raise ValueError("PRP_WORKSPACE_ROOTS must be a JSON object")
+        return parsed
+    return value
+
+
 ProfileValue = Annotated[ModelProfile, BeforeValidator(_profile_from_json)]
 CascadeProfilesValue = Annotated[
     tuple[ModelProfile, ...],
     BeforeValidator(_cascade_profiles_from_json),
+]
+WorkspaceRootsValue = Annotated[
+    WorkspaceRootMapping,
+    BeforeValidator(_workspace_roots_from_json),
 ]
 
 
@@ -78,12 +100,22 @@ class Settings(BaseModel):
     max_request_bytes: int = Field(default=1_048_576, gt=0)
     max_input_chars: int = Field(default=100_000, gt=0)
     log_level: LogLevel = "INFO"
+    allow_host_yolo: bool = False
+    service_token: SecretStr | None = None
+    service_principal: PrincipalId = "prn_default"
+    workspace_roots: WorkspaceRootsValue = Field(
+        default_factory=WorkspaceRootMapping,
+        exclude=True,
+        repr=False,
+    )
     leader_profile: ProfileValue | None = None
     worker_profile: ProfileValue | None = None
     cascade_profiles: CascadeProfilesValue = Field(default_factory=tuple)
 
     @model_validator(mode="after")
     def _profiles_are_consistent(self) -> "Settings":
+        if self.service_token is not None and not self.service_token.get_secret_value().strip():
+            raise ValueError("service_token must not be blank")
         if self.leader_profile is not None and self.leader_profile.role is not ModelRole.PLANNER:
             raise ValueError("the leader profile must declare the PLANNER role")
         if self.worker_profile is not None and self.worker_profile.role is not ModelRole.WORKER:

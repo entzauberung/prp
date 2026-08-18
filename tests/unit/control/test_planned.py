@@ -19,14 +19,17 @@ from prp_runtime.domain.enums import (
 )
 from prp_runtime.domain.events import EventType, assert_sequence_chain
 from prp_runtime.domain.models import (
+    Artifact,
+    Attempt,
     Budget,
     ErrorCategory,
     ErrorInfo,
     NativeRunRequest,
     Usage,
     WorkUnit,
+    new_artifact_id,
 )
-from prp_runtime.domain.values import ResourceClaim, utc_now
+from prp_runtime.domain.values import ModelRef, ResourceClaim, new_attempt_id, utc_now
 from prp_runtime.planning.compiler import CompiledPlan, compile_plan
 from prp_runtime.planning.frontier import compute_frontier
 from prp_runtime.planning.models import PlanProposal, PlanRejection
@@ -50,9 +53,20 @@ async def store(tmp_path: Path) -> AsyncIterator[SqliteStore]:
 
 
 def proposal(*nodes: dict[str, object]) -> PlanProposal:
+    values = nodes
+    dependencies = {dependency for value in values for dependency in value.get("depends_on", ())}
+    final_node = next(
+        (
+            value["key"]
+            for value in reversed(values)
+            if value["key"] not in dependencies
+        ),
+        values[-1]["key"],
+    )
     return PlanProposal(
         summary="compile and commit",
-        nodes=nodes,
+        final_node=final_node,
+        nodes=values,
     )
 
 
@@ -91,8 +105,17 @@ class StaticPlannerAdapter:
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
+        plan = dict(self._plan)
+        if "final_node" not in plan:
+            nodes = tuple(plan["nodes"])
+            dependencies = {
+                dependency for value in nodes for dependency in value.get("depends_on", ())
+            }
+            plan["final_node"] = next(
+                value["key"] for value in reversed(nodes) if value["key"] not in dependencies
+            )
         return ProviderResponse(
-            text=json.dumps(self._plan),
+            text=json.dumps(plan),
             usage=Usage(input_tokens=5, output_tokens=5),
             finish_reason=FinishReason.STOP,
         )
@@ -184,8 +207,15 @@ async def test_controller_atomically_commits_graph_version_and_events(
 
     assert isinstance(committed, tuple)
     assert (await store.get_run(run_id)).graph_version == 2
+    assert (await store.get_run(run_id)).final_work_unit_id == compiled.final_work_unit_id
     units = await store.list_work_units(run_id, graph_version=2)
     assert len(units) == 2
+    compiled_by_key = {draft.node_key: draft for draft in compiled.nodes}
+    for unit in units:
+        draft = compiled_by_key[unit.lineage_key or unit.name.lower()]
+        assert unit.lineage_key == draft.lineage_key
+        assert unit.dependency_fingerprint == draft.dependency_fingerprint
+        assert unit.content_fingerprint == draft.content_fingerprint
     by_name = {unit.name: unit for unit in units}
     assert by_name["Review"].depends_on == (by_name["Draft"].work_unit_id,)
     assert by_name["Review"].resource_claims == (
@@ -614,6 +644,7 @@ async def test_explicit_planned_executes_verified_graph_and_assembles_result(
     planner_adapter = StaticPlannerAdapter(
         {
             "summary": "produce two inputs and combine them",
+            "final_node": "join",
             "nodes": [
                 node("left", instruction="produce left"),
                 node("right", instruction="produce right"),
@@ -693,6 +724,94 @@ async def test_explicit_planned_executes_verified_graph_and_assembles_result(
 
 
 @pytest.mark.asyncio
+async def test_assembler_uses_declared_final_unit_when_other_answer_is_newer(
+    store: SqliteStore,
+) -> None:
+    controller, run_id = await create_controller_run(store)
+    compiled = compile_plan(
+        PlanProposal(
+            summary="compile and commit",
+            final_node="final",
+            nodes=(node("final"), node("other")),
+        ),
+        run_id=run_id,
+        graph_version=2,
+    )
+    assert isinstance(compiled, CompiledPlan)
+    await controller.commit_plan(run_id, compiled, target_graph_version=2)
+    units = await store.list_work_units(run_id, graph_version=2)
+    by_name = {unit.name: unit for unit in units}
+
+    for unit, content in (
+        (by_name["Final"], "declared final"),
+        (by_name["Other"], "newer but not final"),
+    ):
+        attempt_id = new_attempt_id()
+        await store.create_attempt(
+            Attempt(
+                attempt_id=attempt_id,
+                run_id=run_id,
+                work_unit_id=unit.work_unit_id,
+                role=ModelRole.WORKER,
+                model=ModelRef(provider="fake", model="worker"),
+            )
+        )
+        await store.add_artifact(
+            Artifact(
+                artifact_id=new_artifact_id(),
+                run_id=run_id,
+                work_unit_id=unit.work_unit_id,
+                attempt_id=attempt_id,
+                name="answer",
+                content=content,
+            )
+        )
+
+    result = await assemble_run_result(store, run_id)
+    assert result.output_text == "declared final"
+
+
+@pytest.mark.asyncio
+async def test_assembler_rejects_an_answer_artifact_from_another_run(
+    store: SqliteStore,
+) -> None:
+    controller, run_id = await create_controller_run(store)
+    compiled = compile_plan(
+        proposal(node("final")),
+        run_id=run_id,
+        graph_version=2,
+    )
+    assert isinstance(compiled, CompiledPlan)
+    await controller.commit_plan(run_id, compiled, target_graph_version=2)
+    final_unit = (await store.list_work_units(run_id, graph_version=2))[0]
+    other = await controller.create_run(NativeRunRequest(input="other run"))
+    attempt_id = new_attempt_id()
+    await store.create_attempt(
+        Attempt(
+            attempt_id=attempt_id,
+            run_id=other.run_id,
+            work_unit_id=final_unit.work_unit_id,
+            role=ModelRole.WORKER,
+            model=ModelRef(provider="fake", model="worker"),
+        )
+    )
+    await store.add_artifact(
+        Artifact(
+            artifact_id=new_artifact_id(),
+            run_id=other.run_id,
+            work_unit_id=final_unit.work_unit_id,
+            attempt_id=attempt_id,
+            name="answer",
+            content="foreign result",
+        )
+    )
+
+    result = await assemble_run_result(store, run_id)
+
+    assert result.output_text is None
+
+
+@pytest.mark.asyncio
 async def test_planned_attempt_budget_stops_before_next_worker_call(
     store: SqliteStore,
 ) -> None:
@@ -735,7 +854,7 @@ async def test_planned_attempt_budget_stops_before_next_worker_call(
     units = await store.list_work_units(created.run_id, graph_version=2)
     by_name = {unit.name: unit for unit in units}
     assert by_name["First"].status is WorkUnitStatus.SUCCEEDED
-    assert by_name["Second"].status is WorkUnitStatus.FAILED
+    assert by_name["Second"].status is WorkUnitStatus.BLOCKED
     assert by_name["Third"].status is WorkUnitStatus.BLOCKED
     event_types = [
         event.event_type for event in await store.list_events(created.run_id)

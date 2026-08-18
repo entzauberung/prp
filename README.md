@@ -1,150 +1,161 @@
 # PRP Runtime
 
-Progressive Reasoning Protocol 的参考运行时。实现里程碑覆盖 v0.0.1-v0.0.4，包版本当前为 `0.0.1`。
+Progressive Reasoning Protocol 的参考运行时。当前包版本为 `0.0.2`，面向单实例、SQLite 和受控 Workspace 的云端代码 Agent。
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
-[![Implementation v0.0.4](https://img.shields.io/badge/implementation-v0.0.4-green)](https://github.com)
-[![Tests 1260 passed](https://img.shields.io/badge/tests-1260%20passed-green)](https://github.com)
+[![Package v0.0.2](https://img.shields.io/badge/package-v0.0.2-green)](https://github.com)
+[![Tests 1867 passed](https://img.shields.io/badge/tests-1867%20passed-brightgreen)](https://github.com)
 [![License MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache-2.0-orange)](https://github.com)
 
 [简体中文](README.md) | [English](README.en.md)
 
-## 事实定位
+## v0.0.2 — 三方向交付
 
-- **Package version**: `0.0.1`
-- **Implementation milestones**: `v0.0.1` - `v0.0.4`
-- 最近门禁验证：1260 tests passed (2026-08-11)
+> 82 源码模块 · 82 测试文件 · 1867 tests passed · ruff clean · mypy 82 files passed
 
-PRP Runtime 是确定性执行控制层，统一管理模型调用之上的 Run、WorkUnit、Attempt、Artifact、Evidence、Event 等持久化工作流，提供 AUTO/MANUAL 路由策略。
+| 方向 | 核心交付 | 门禁 |
+|------|----------|------|
+| **A. 协议加固** | final_node · lineage · fingerprint · reservation · supervisor · event replay · recovery | conformance ✓ |
+| **B. 云端 Agent** | Session/Run · ToolCall/Approval 循环 · Policy ALLOW/ASK/DENY · Sandbox · Workspace · Bridge | Agent E2E ✓ |
+| **C. 可控并行与真正 Progressive** | 独立 Slot · Git 三方合并 · AST 冲突检测 · 安全复用 · 有限修订 | conflict/merge/revision ✓ |
 
-## 架构与运行链路
+---
 
-```mermaid
-graph TD
-    A[Inbound APIs] --> B[NativeRunRequest]
-    B --> C[AUTO/MANUAL Router]
-    C --> D[RunController]
-    D --> E[Planner / Worker / Verifier]
-    E --> F[SQLite Ledger]
-    F --> G[Result / Event Replay]
-    G --> H[Final Result]
+## Progressive Reasoning 如何真正工作
+
+PRP 的独特价值不是"多步推理"——是**有证据、可回退、可并行的确定性推理控制**。
+
+```
+Planner 提案 (final_node 声明终态)
+ │
+ ├─ compile → DAG (content + dependency fingerprint)
+ │
+ ├─ Coordinator 分批 (冲突检测 → 读写分离 → 并行调度)
+ │   ├── Slot A ──┐
+ │   ├── Slot B ──┼── 独立隔离写入 → ChangeSet
+ │   └── Slot C ──┘
+ │
+ ├─ Git 三方合并 → 统一 Snapshot
+ │
+ ├─ Verifier 全局验证 (targeted test + rule check)
+ │
+ └─ 失败？
+     ├── lineage + fingerprint → 安全复用已通过节点
+     ├── Planner revision (有限次数, 预算控制)
+     └── 新 graph version → 回到 Coordinator
 ```
 
-### 四策略说明
+关键区别：每个写节点在独立 Slot 执行，合并由 Git 三方合并而非覆盖，复用由内容指纹而非时间戳决定，停止由预算和修订上限而非模型判断决定。
+
+---
+
+## 四策略说明
 
 | 策略 | 何时使用 | 做什么 |
 |------|----------|--------|
 | DIRECT | 简单请求 | 单 WorkUnit、单 Attempt；Worker 返回 Artifact 后执行 RuleVerifier |
 | CASCADE | 需要分层 | 按 profile 链条执行，逐层验证 |
 | PLANNED | 需要图调度 | 编译执行图，Planner 提出计划，Worker 执行 |
-| PROGRESSIVE | 需要证据 | 逐步推进，Verifier 做确定性校验和预算控制；失败后调用 Planner revise |
+| PROGRESSIVE | 需要证据 | 逐步推进；独立 Slot 并行 → Git 合并 → 验证 → 复用/修订循环 |
 
-### 运行链路
+## Agent 工作流
 
-一次请求流经：4 个入站绑定（PRP Native、OpenAI Responses、OpenAI Chat Completions、Anthropic Messages） -> Router 路由 -> RunController 决定策略和启动 -> Planner/Worker/Verifier 执行持久化到 SQLite Ledger -> 追加事件回放 -> 最终结果。
+v0.0.2 的 Native Session 将一次授权 Workspace 与多个 Run 关联。云端最小代码任务的受控工具子集为：
+
+- `list_files`、`read_file`、`search_text`：只读 Workspace 观察。
+- `apply_patch`：基于 Snapshot 产生新的 Snapshot 和持久化 ChangeSet，写入必须经过策略和批准。
+- `run_targeted_test`：只执行服务端预注册的 TEST 命令，使用结构化 argv、固定 Workspace cwd、超时和输出上限。
+- `get_diff`、`get_status`：校验 ChangeSet 与当前 Snapshot 后返回受限 diff/status。
+
+Agent mode、隔离和执行位置是独立维度：
+
+| 维度 | 可选值 | 事实 |
+| --- | --- | --- |
+| Agent mode | `NORMAL`、`AUTO`、`PLAN`、`YOLO` | `PLAN` 无副作用；`AUTO` 仅自动放行低风险命令；未知或越界请求由确定性 Policy 拒绝或请求批准。 |
+| Isolation | `SANDBOXED`、`HOST` | `SANDBOXED` 必须使用真实 Linux `bubblewrap`；缺少能力不能伪装成沙箱。`HOST` 只在用户明确选择且服务端允许时可用。 |
+| Location | `CLOUD`、`BRIDGE` | Cloud 使用服务端授权 Workspace；Bridge 是无模型的本地传输/游标客户端，不把本地绝对路径发送给服务端。 |
+
+每次 ToolCall、Approval、ToolResult、Snapshot、ChangeSet、Evidence、Event 和 Usage 都是可审计事实。Provider 只能通过公开 ToolCall/ToolResult 推进，不保存 CoT，也不能自行提升权限。
+
+### DEV readiness 与生产 handoff
+
+DEV 轨只用于合同、账本、Agent、ChangeSet、冲突、AST、merge 和 Progressive dry-run 开发。DEV 结果必须带 `dev_only=true`；临时 HOST 目录、Bridge 路径边界和 text-only transport 都不是 OS sandbox，也不能证明 mount、user namespace、network 或 pid 隔离。
+
+生产 handoff 的前置条件保持独立：
+
+- 当前合格 runner 的真实 `SANDBOXED` gate 已通过：bubblewrap staged loader、mount、network、pid、workspace sentinel、runtime RO、reap 和资源定向事实均已验证。
+- Cloud Agent 定向 E2E 已通过 `create_app()` production composition，覆盖 read/search、approval、patch、targeted test、diff、merge 和 final failure semantics。
+- DEV 结果仍必须带 `dev_only=true`；`DEV_READY_FOR_PROD_ENV` 只表示 DEV 合同和定向事实已整理，不能替代真实 L3 或生产 E2E。
+- handoff 不携带绝对临时路径、秘密、CoT 或生产 promotion；生产 promotion 仍须经过真实生产 gate 和既有审批。
 
 ## 配置
 
 - **PRP Native API**
-  - `POST /v1/runs`：接受 `NativeRunRequest`（文本输入），创建并执行一个 Run，返回终态与结果。
-  - `GET /v1/runs/{run_id}`：读取 Run 状态、结果文本、用量与错误。
-  - `POST /v1/runs/{run_id}/cancel`：请求取消；取消后不再创建新 Attempt；对终态 Run 无副作用。
-  - `GET /v1/runs/{run_id}/events`：以 SSE 从持久账本**回放**事件，支持 `Last-Event-ID` 与 `?after=` 游标续读。
-  - `GET /health`：仅报告进程存活，不检查数据库或上游。
-- **执行策略**：支持 `DIRECT`、`CASCADE`、`PLANNED`、`PROGRESSIVE` 以及 AUTO 路由。`AUTO` 路由根据请求动态选择策略并记录理由。
-- **持久化**：单一 SQLite schema（`runs`/`work_units`/`attempts`/`artifacts`/`evidence`/`events` 等 8 张表），外键与 WAL 开启；Run 内事件 `sequence` 单调唯一；状态变更与事件同事务提交。
-- **重启恢复**：进程启动时把仍处于 `RUNNING` 的 Attempt 标记为 `INTERRUPTED`（不假定成功或失败），Run 与 WorkUnit 状态保持可诊断。
-- **出站 Provider**：一个 OpenAI-compatible 文本适配器（Chat Completions 形状），归一化 usage、finish reason 与错误分类；上游未报告 token 时记为不可用而不猜测。
-- **错误契约**：稳定 `code` + `family` + `retryable`，响应体不含堆栈、内部路径或凭据。
+  - `POST /v1/sessions`：创建 owner-scoped Workspace Session。
+  - `POST /v1/sessions/{session_id}/runs`：异步创建 Run，Session 的 Agent options 由服务端绑定。
+  - `GET /v1/sessions/{session_id}/runs/{run_id}`：读取 Run 状态、结果文本、用量与错误。
+  - `GET /v1/sessions/{session_id}/runs/{run_id}/events`：SSE 事件流 + 游标回放。
+  - `POST /v1/sessions/{session_id}/runs/{run_id}/approve`：同意/拒绝 Policy 要求批准的 ToolCall。
+- **OpenAI Responses Binding**: `POST /v1/responses`（声明子集）
+- **OpenAI Chat Completions Binding**: `POST /v1/chat/completions`（声明子集）
+- **Anthropic Messages Binding**: `POST /v1/messages`（声明子集）
 
-全部配置来自服务端环境变量，前缀 `PRP_`；未识别的 `PRP_` 变量会直接报错而不是被忽略。
+所有配置通过服务端环境变量 `PRP_*`；不认识的变量报错而非忽略。
 
 | 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `PRP_DATABASE_PATH` | `prp_runtime.db` | SQLite 文件路径 |
-| `PRP_MAX_REQUEST_BYTES` | `1048576` | 请求体上限 |
-| `PRP_MAX_INPUT_CHARS` | `100000` | 输入文本字符上限 |
+|------|--------|------|
+| `PRP_HOST` | `0.0.0.0` | 监听地址 |
+| `PRP_PORT` | `8000` | 监听端口 |
+| `PRP_DATABASE` | `./prp.db` | SQLite 路径 |
 | `PRP_LOG_LEVEL` | `INFO` | 日志级别 |
-| `PRP_LEADER_PROFILE` | 无 | 强模型 profile（JSON，`role` 必须为 `PLANNER`） |
-| `PRP_WORKER_PROFILE` | 无 | 执行模型 profile（JSON，`role` 必须为 `WORKER`） |
-| `PRP_CASCADE_PROFILES` | 无 | CASCADE 策略使用的 profile 数组 |
+| `PRP_OPENAI_API_KEY` | — | Provider key |
+| `PRP_OPENAI_BASE_URL` | `https://api.openai.com/v1` | Provider endpoint |
+| `PRP_OPENAI_MODEL` | `gpt-4o` | Provider model |
+| `PRP_PROFILES` | — | JSON profile chain |
+| `PRP_AUTH_TOKEN` | — | Bearer token for single-tenant auth |
+| `PRP_WORKSPACE_ROOT` | — | Server Workspace base path |
+| `PRP_SANDBOX_BINARY` | `bwrap` | bubblewrap binary |
+| `PRP_TOOL_TIMEOUT` | `30` | Tool execution timeout (seconds) |
+| `PRP_MAX_AGENT_TURNS` | `20` | Max Agent loop turns per Run |
 
-模型 profile 示例（`base_url` 与 `api_key` **只能**来自服务端配置，请求不得携带）：
-
-```json
-{
-  "alias": "worker",
-  "provider": "openai_compatible",
-  "model": "your-model-id",
-  "role": "WORKER",
-  "base_url": "https://models.example.invalid/v1",
-  "api_key": "...",
-  "context_window_tokens": 32000,
-  "max_output_tokens": 4000
-}
-```
-
-## 目标
-
-- 提供一个确定性控制器，统一执行 DIRECT、CASCADE、PLANNED、PROGRESSIVE 四种执行策略，并提供 AUTO 路由。
-- 提供 PRP Native、OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 四种入站绑定，映射到同一套原生领域模型。
-- 由强模型提出计划，由确定性组件校验和提交；由较便宜的模型执行局部单元。
-- 持久化 Run 与追加式事件账本，支持查询、取消和恢复。
-
-## 非目标
-
-- 不训练、微调或部署基础模型，不实现 GPU serving。
-- 不实现 MCP、A2A、Shell、浏览器或文件写入 Agent。
-- 不实现多租户计费、SSO、分布式队列或 Kubernetes 编排。
-- 不支持图像、音频、视频和二进制附件。
-- 不完整复刻第三方 API 的全部字段；未声明支持的字段返回结构化错误。
-- 不保留 pre-0.1 数据迁移、旧 Schema 或兼容分支。
-
-## 版本阶段
-
-| 版本 | 范围 |
-| --- | --- |
-| `0.0.1` | 项目基础、领域合同、持久化、DIRECT 与 Native API |
-| `0.0.2` | 验证器、预算与 CASCADE |
-| `0.0.3` | 计划编译、可执行前沿与 PLANNED 并行 |
-| `0.0.4` | PROGRESSIVE、AUTO 路由、外部绑定、基准与规范冻结 |
-
-各阶段的“完成”指目标特性完成，不代表生产 SLA 或稳定性承诺。
-
-## 快速开始
-
-### 前置条件
-- Python 3.12+ 或 uv 工具链
-- 克隆仓库并依赖安装（详见 `pyproject.toml`）
-
-### 最小 ASGI 示例
-创建 `server.py`：
-
-```python
-from prp_runtime.settings import Settings
-from prp_runtime.app import create_app
-
-settings = Settings.from_env()
-app = create_app(settings)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
-运行：
+## 安装与运行
 
 ```bash
-uv run uvicorn server:app --reload
+uv pip install .                  # 从源码安装
+uv run python -m prp_runtime      # 打印版本 (0.0.2)
 ```
 
-**配置安全边界**：所有 LLM profile（`base_url`、`api_key` 等）仅来自环境变量 `PRP_*`；示例使用 `models.example.invalid`。
+ASGI 启动：
+
+```bash
+PRP_OPENAI_API_KEY=sk-... \
+PRP_AUTH_TOKEN=secret \
+PRP_WORKSPACE_ROOT=/srv/workspaces \
+uvicorn prp_runtime.app:create_app --factory --host 0.0.0.0 --port 8000
+```
+
+**注意**：`python -m prp_runtime` 只打印包版本，**不是**服务启动器。使用上面的 ASGI 示例启动。
+
+**配置安全边界**：LLM profile 和凭据只从 `PRP_*` 环境变量读取；请求只能引用服务端已注册的 profile 和 Workspace。
+
+### 无模型 Bridge
+
+Bridge 不运行本地模型，只保存服务端返回的 Session/Run 标识、事件游标和幂等结果指纹。它可以为本地 Workspace 提供路径边界，但这不是 OS sandbox；实际工具授权仍由服务端 Policy 和 Approval 控制。
+
+```bash
+uv run prp --base-url http://127.0.0.1:8000 --token-stdin connect workspace-alias --access READ --agent-mode PLAN
+uv run prp --base-url http://127.0.0.1:8000 run "inspect the authorized workspace"
+uv run prp --base-url http://127.0.0.1:8000 resume
+```
+
+Bridge 命令只提交 Workspace alias 和相对任务输入；本地绝对路径不会发给服务端。`HOST YOLO` 需要交互式显式确认，不能由模型升级。
 
 ### API 概览
-- `POST /v1/runs`：PRP Native Run 创建与管理
-- `POST /v1/responses`：OpenAI Responses 兼容
-- `POST /v1/chat/completions`：OpenAI Chat Completions
-- `POST /v1/messages`：Anthropic Messages 兼容
+- `POST /v1/sessions`、`POST /v1/sessions/{session_id}/runs`：授权 Session 和异步 Run
+- `GET /v1/sessions/{session_id}/runs/{run_id}/events`：持久事件 SSE 与游标回放
+- `POST /v1/responses`：声明子集的 OpenAI Responses 映射
+- `POST /v1/chat/completions`：声明子集的 OpenAI Chat Completions 映射
+- `POST /v1/messages`：声明子集的 Anthropic Messages 映射
 
 ### 测试与验证
 定向示例（测试已实现路径）：
@@ -153,21 +164,15 @@ uv run uvicorn server:app --reload
 uv run pytest tests/unit/control/test_direct.py -q
 ```
 
-全量门禁：
-
-```bash
-uv run pytest -q
-uv run ruff check .
-uv run mypy src/prp_runtime
-```
-
-测试仅覆盖已实现路径，禁止真实网络调用。
+测试只覆盖已实现路径，禁止真实网络调用；本 README 不把静态历史结果或本地 benchmark 写成实时 CI/SLA。
 
 ### 项目边界
 - 非模型训练、微调或 GPU serving 平台
-- 无 MCP、A2A、Shell、浏览器或文件写入 Agent
+- 不实现完整 Codex/Claude Code、MCP、A2A、浏览器或任意网络协议
+- Tool 只接受注册的相对路径、结构化 argv 和受限结果；没有任意 shell
+- Cloud 使用服务端 Workspace；Bridge 是无模型传输层，路径边界不等于 OS sandbox
 - 无多租户计费、SSO、分布式队列或 Kubernetes 编排
-- 无生产 SLA 或稳定性承诺
+- 无生产 SLA、无限推理或完整第三方 API 字段承诺
 
 ## 许可证
 

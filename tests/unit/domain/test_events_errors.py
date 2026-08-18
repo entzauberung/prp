@@ -9,6 +9,7 @@ from prp_runtime.domain.enums import (
     AttemptStatus,
     ExecutionStrategy,
     RunStatus,
+    ToolCallStatus,
     WorkUnitStatus,
 )
 from prp_runtime.domain.errors import (
@@ -32,9 +33,12 @@ from prp_runtime.domain.events import (
     RunEvent,
     assert_sequence_chain,
     next_sequence,
+    payload_from_agent_history,
     payload_from_model,
 )
 from prp_runtime.domain.models import (
+    AgentHistoryRecord,
+    AgentTurn,
     ControllerAction,
     ControllerDecision,
     NativeRunRequest,
@@ -59,14 +63,40 @@ MINIMAL_PAYLOADS: dict[str, object] = {
     "to_strategy": "CASCADE",
     "decision": {"action": "CANCEL"},
     "graph_version": 1,
+    "round_id": "round_1",
+    "round_index": 0,
+    "status": "VERIFIED",
+    "merged_snapshot_id": "snap_1",
+    "merge_id": "merge_1",
+    "workspace_id": "ws_1",
+    "base_snapshot_id": "snap_1",
+    "change_set_ids": ["cs_1"],
+    "input_digest": "a" * 64,
+    "merged_content_hash": "b" * 64,
+    "promoted_content_hash": "c" * 64,
     "work_unit_ids": [WORK_UNIT_ID],
     "reason": "because",
     "work_unit_id": WORK_UNIT_ID,
     "attempt_id": ATTEMPT_ID,
+    "reservation_id": "res_1",
+    "dispatch_key": "dispatch-1",
+    "source_work_unit_id": WORK_UNIT_ID,
+    "source_attempt_id": ATTEMPT_ID,
+    "source_artifact_ids": ["art_1"],
+    "artifact_ids": ["art_2"],
+    "lineage_key": "stable-node",
     "artifact_id": "art_1",
     "evidence_id": "ev_1",
     "result": "INCONCLUSIVE",
     "usage": {"input_tokens": 1},
+    "call_id": "tc_123",
+    "tool_name": "read_file",
+    "effect": "READ",
+    "sequence": 1,
+    "kind": "turn",
+    "idempotency_key": "turn-1",
+    "claim_id": "claim_123",
+    "expires_at": "2026-08-10T12:05:00Z",
 }
 
 
@@ -74,6 +104,37 @@ def make_event(event_type: EventType, sequence: int = 1, **overrides: object) ->
     payload: dict[str, object] = {
         key: MINIMAL_PAYLOADS[key] for key in EVENT_REQUIRED_KEYS[event_type]
     }
+    tool_statuses = {
+        EventType.TOOL_CALL_REQUESTED: ToolCallStatus.REQUESTED,
+        EventType.TOOL_CALL_AWAITING_APPROVAL: ToolCallStatus.AWAITING_APPROVAL,
+        EventType.TOOL_CALL_STARTED: ToolCallStatus.RUNNING,
+        EventType.TOOL_CALL_SUCCEEDED: ToolCallStatus.SUCCEEDED,
+        EventType.TOOL_CALL_FAILED: ToolCallStatus.FAILED,
+        EventType.TOOL_CALL_CANCELLED: ToolCallStatus.CANCELLED,
+        EventType.TOOL_CALL_REJECTED: ToolCallStatus.REJECTED,
+        EventType.TOOL_CALL_INTERRUPTED: ToolCallStatus.INTERRUPTED,
+        EventType.TOOL_CALL_UNKNOWN: ToolCallStatus.UNKNOWN,
+    }
+    if event_type in tool_statuses:
+        payload["status"] = tool_statuses[event_type]
+    bridge_claim_statuses = {
+        EventType.BRIDGE_CLAIM_CREATED: "ACTIVE",
+        EventType.BRIDGE_CLAIM_EXPIRED: "EXPIRED",
+        EventType.BRIDGE_CLAIM_SETTLED: "SETTLED",
+        EventType.BRIDGE_CLAIM_RELEASED: "RELEASED",
+    }
+    if event_type in bridge_claim_statuses:
+        payload["status"] = bridge_claim_statuses[event_type]
+    merge_statuses = {
+        EventType.MERGE_PLANNED: "PLANNED",
+        EventType.MERGE_STARTED: "RUNNING",
+        EventType.MERGE_MERGED: "MERGED",
+        EventType.MERGE_PROMOTED: "PROMOTED",
+        EventType.MERGE_CONFLICT: "CONFLICT",
+        EventType.MERGE_UNKNOWN: "UNKNOWN",
+    }
+    if event_type in merge_statuses:
+        payload["status"] = merge_statuses[event_type]
     payload.update(overrides)
     return RunEvent(
         run_id=RUN_ID,
@@ -108,6 +169,13 @@ def test_error_detail_is_built_from_the_code() -> None:
     assert detail.retryable is True
     assert detail.field is None
     assert ErrorDetail.for_code(ErrorCode.INVALID_REQUEST, "bad input").retryable is False
+    agent_options = ErrorDetail.for_code(
+        ErrorCode.INVALID_AGENT_OPTIONS,
+        "agent options are not an allowed combination",
+        field="agent_options",
+    )
+    assert agent_options.family is ErrorFamily.VALIDATION
+    assert agent_options.retryable is False
 
 
 def test_error_detail_rejects_inconsistent_or_blank_content() -> None:
@@ -228,6 +296,23 @@ def test_the_evidence_event_carries_the_verdict_not_its_boolean() -> None:
     assert "passed" not in required
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.RESERVATION_CREATED,
+        EventType.RESERVATION_HELD,
+        EventType.RESERVATION_SETTLED,
+        EventType.RESERVATION_RELEASED,
+        EventType.RESERVATION_EXPIRED,
+    ],
+)
+def test_reservation_events_carry_the_reservation_identity(event_type: EventType) -> None:
+    event = make_event(event_type)
+    assert event.payload["reservation_id"] == "res_1"
+    if event_type is EventType.RESERVATION_CREATED:
+        assert event.payload["dispatch_key"] == "dispatch-1"
+
+
 @pytest.mark.parametrize("verdict", ["PASS", "FAIL", "INCONCLUSIVE"])
 def test_the_evidence_event_accepts_every_verdict(verdict: str) -> None:
     event = make_event(EventType.EVIDENCE_RECORDED, result=verdict)
@@ -336,6 +421,95 @@ def test_event_payload_rejects_a_non_json_value() -> None:
             payload={"model": object()},  # type: ignore[dict-item]
             timestamp=T0,
         )
+
+
+def test_event_payload_is_strict_bounded_and_private_free() -> None:
+    with pytest.raises(ValidationError):
+        RunEvent(
+            run_id=RUN_ID,
+            sequence=1,
+            event_type=EventType.RUN_STARTED,
+            payload={"value": float("inf")},
+            timestamp=T0,
+        )
+    with pytest.raises(ValidationError, match="chain_of_thought"):
+        RunEvent(
+            run_id=RUN_ID,
+            sequence=1,
+            event_type=EventType.RUN_STARTED,
+            payload={"metadata": {"chain_of_thought": "private"}},
+            timestamp=T0,
+        )
+    with pytest.raises(ValidationError, match="size limit"):
+        RunEvent(
+            run_id=RUN_ID,
+            sequence=1,
+            event_type=EventType.RUN_STARTED,
+            payload={"value": "x" * (64 * 1024)},
+            timestamp=T0,
+        )
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.TOOL_CALL_REQUESTED,
+        EventType.TOOL_CALL_AWAITING_APPROVAL,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_SUCCEEDED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_CANCELLED,
+        EventType.TOOL_CALL_REJECTED,
+        EventType.TOOL_CALL_INTERRUPTED,
+        EventType.TOOL_CALL_UNKNOWN,
+    ],
+)
+def test_tool_events_have_a_matching_status_and_no_sensitive_payload(
+    event_type: EventType,
+) -> None:
+    event = make_event(event_type)
+    assert event.payload["call_id"] == "tc_123"
+    with pytest.raises(ValidationError, match="arguments"):
+        make_event(event_type, arguments={"path": "secret.py"})
+    with pytest.raises(ValidationError, match="stdout"):
+        make_event(event_type, stdout="full command output")
+    wrong_status = (
+        ToolCallStatus.SUCCEEDED
+        if event_type is EventType.TOOL_CALL_REQUESTED
+        else ToolCallStatus.REQUESTED
+    )
+    with pytest.raises(ValidationError, match="status"):
+        make_event(event_type, status=wrong_status)
+
+
+def test_tool_events_reject_large_result_payloads() -> None:
+    with pytest.raises(ValidationError, match="result"):
+        make_event(EventType.TOOL_CALL_SUCCEEDED, result={"content": "x" * 20_000})
+
+
+def test_agent_history_event_contains_metadata_only() -> None:
+    record = AgentHistoryRecord(
+        run_id=RUN_ID,
+        work_unit_id=WORK_UNIT_ID,
+        attempt_id=ATTEMPT_ID,
+        sequence=1,
+        idempotency_key="turn-1",
+        item=AgentTurn(text="public"),
+        created_at=T0,
+    )
+    assert payload_from_agent_history(record) == {
+        "sequence": 1,
+        "kind": "turn",
+        "idempotency_key": "turn-1",
+    }
+    event = make_event(EventType.AGENT_HISTORY_RECORDED)
+    assert event.payload == {
+        "sequence": 1,
+        "kind": "turn",
+        "idempotency_key": "turn-1",
+    }
+    with pytest.raises(ValidationError, match="metadata"):
+        make_event(EventType.AGENT_HISTORY_RECORDED, item={"text": "hidden"})
 
 
 def test_payload_from_domain_model_is_json_safe() -> None:

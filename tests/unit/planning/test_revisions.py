@@ -25,6 +25,7 @@ from prp_runtime.providers.base import (
 def proposal() -> PlanProposal:
     return PlanProposal(
         summary="replace the failed graph",
+        final_node="replacement",
         nodes=(
             PlanNode(
                 key="replacement",

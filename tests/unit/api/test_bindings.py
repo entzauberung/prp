@@ -4,14 +4,16 @@ import pytest
 from pydantic import ValidationError
 
 from prp_runtime.api.bindings import (
+    BindingNormalizationResult,
     BindingOperation,
     normalize_cancel,
     normalize_query,
     normalize_request,
 )
-from prp_runtime.domain.enums import RoutingPolicy
+from prp_runtime.api.tool_bindings import build_native_tool_turn
+from prp_runtime.domain.enums import RoutingPolicy, ToolCallStatus
 from prp_runtime.domain.errors import ErrorCode, PrpError
-from prp_runtime.domain.models import ArtifactKind
+from prp_runtime.domain.models import AgentToolCall, AgentToolResult, ArtifactKind
 
 
 def test_normalize_request_builds_one_native_shape() -> None:
@@ -124,3 +126,51 @@ def test_result_is_closed_and_immutable() -> None:
     result = normalize_request({"input": "hello"})
     with pytest.raises(ValidationError):
         result.operation = BindingOperation.QUERY  # type: ignore[misc]
+
+
+def test_normalization_result_cannot_mix_operation_payloads() -> None:
+    with pytest.raises(ValidationError):
+        BindingNormalizationResult(operation=BindingOperation.CREATE)
+    with pytest.raises(ValidationError):
+        BindingNormalizationResult(
+            operation=BindingOperation.QUERY,
+            request=normalize_request({"input": "x"}).request,
+        )
+
+
+def test_shared_tool_turn_preserves_call_result_order() -> None:
+    call = AgentToolCall(call_id="call-1", tool_name="read_file")
+    result = AgentToolResult(
+        call_id="call-1",
+        status=ToolCallStatus.SUCCEEDED,
+        output="contents",
+    )
+
+    turn = build_native_tool_turn((call, result))
+
+    assert turn.items == (call, result)
+    assert turn.tool_calls == (call,)
+    assert turn.tool_results == (result,)
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        (AgentToolResult(call_id="orphan", status=ToolCallStatus.SUCCEEDED),),
+        (
+            AgentToolCall(call_id="call-1", tool_name="read_file"),
+            AgentToolCall(call_id="call-1", tool_name="read_file"),
+        ),
+        (
+            AgentToolCall(call_id="call-1", tool_name="read_file"),
+            AgentToolResult(call_id="call-1", status=ToolCallStatus.SUCCEEDED),
+            AgentToolResult(call_id="call-1", status=ToolCallStatus.SUCCEEDED),
+        ),
+    ],
+)
+def test_shared_tool_turn_rejects_orphan_duplicate_and_replayed_results(
+    items: tuple[object, ...],
+) -> None:
+    with pytest.raises(PrpError) as excinfo:
+        build_native_tool_turn(items)  # type: ignore[arg-type]
+    assert excinfo.value.code is ErrorCode.INVALID_REQUEST

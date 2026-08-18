@@ -382,6 +382,7 @@ async def test_cascade_escalates_in_order_and_stops_on_verified_pass(
 
     assert finished.status is RunStatus.SUCCEEDED
     assert finished.strategy is ExecutionStrategy.CASCADE
+    assert finished.final_work_unit_id is None
     assert [request.alias for request in weak.requests + strong.requests] == [
         "w1",
         "w2",

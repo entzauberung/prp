@@ -6,7 +6,7 @@ Protocol. At this version only package identity is defined.
 
 __all__ = ["__version__", "PACKAGE_NAME", "LICENSE_EXPRESSION", "package_info"]
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 PACKAGE_NAME = "prp-runtime"
 

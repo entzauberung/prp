@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prp-runtime"
-version = "0.0.1"
+version = "0.0.2"
 description = "Progressive Reasoning Protocol reference runtime"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE"]
 authors = [{ name = "PRP Runtime Authors" }]
+
 dependencies = [
     "fastapi>=0.115,<1.0",
     "pydantic>=2.9,<3.0",
@@ -19,6 +20,10 @@ dependencies = [
     "uvicorn>=0.30,<1.0",
     "jsonschema>=4.23,<5.0",
 ]
+
+[project.scripts]
+prp = "prp_runtime.client.cli:main"
+prp-bridge = "prp_runtime.client.cli:main"
 
 [project.optional-dependencies]
 dev = [

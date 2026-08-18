@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable
 from pathlib import Path
 
@@ -52,6 +53,15 @@ def _settings(database: Path) -> Settings:
     )
 
 
+def _wait_for_terminal(client: TestClient, run_id: str) -> dict[str, object]:
+    for _ in range(200):
+        body = client.get(f"/v1/runs/{run_id}").json()
+        if body["status"] in {status.value for status in RunStatus if status.is_terminal}:
+            return body
+        time.sleep(0.005)
+    raise AssertionError(f"run {run_id} did not reach a terminal state")
+
+
 def _node(key: str, **overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
         "key": key,
@@ -74,7 +84,11 @@ class PlanAdapter:
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         return ProviderResponse(
-            text=json.dumps({"summary": "v0.0.3 fixed plan", "nodes": self._nodes}),
+            text=json.dumps({
+                "summary": "v0.0.3 fixed plan",
+                "final_node": self._nodes[-1]["key"],
+                "nodes": self._nodes,
+            }),
             usage=Usage(input_tokens=2, output_tokens=2),
             finish_reason=FinishReason.STOP,
         )
@@ -165,9 +179,9 @@ def test_native_planned_parallel_graph_persists_verified_result(tmp_path: Path) 
                 "budget": {"max_attempts": 4, "max_concurrency": 2},
             },
         )
+        body = _wait_for_terminal(client, response.json()["run_id"])
 
     assert response.status_code == 201
-    body = response.json()
     assert body["status"] == RunStatus.SUCCEEDED.value
     assert body["strategy"] == ExecutionStrategy.PLANNED.value
     assert body["graph_version"] == 2
@@ -225,9 +239,9 @@ def test_native_invalid_plan_fails_with_zero_user_graph_facts(tmp_path: Path) ->
                 "strategy": "PLANNED",
             },
         )
+        body = _wait_for_terminal(client, response.json()["run_id"])
 
     assert response.status_code == 201
-    body = response.json()
     assert body["status"] == RunStatus.FAILED.value
     assert body["graph_version"] == 1
     assert worker.requests == []
@@ -272,8 +286,8 @@ def test_native_planned_budget_stops_before_second_attempt(tmp_path: Path) -> No
                 "budget": {"max_attempts": 2},
             },
         )
+        body = _wait_for_terminal(client, response.json()["run_id"])
 
-    body = response.json()
     assert response.status_code == 201
     assert body["status"] == RunStatus.FAILED.value
     assert body["error"]["category"] == "BUDGET_EXCEEDED"

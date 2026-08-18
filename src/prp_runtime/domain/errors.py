@@ -53,6 +53,7 @@ class ErrorCode(StrEnum):
     INPUT_TOO_LARGE = "input_too_large"
     INVALID_BUDGET = "invalid_budget"
     INVALID_OUTPUT_REQUIREMENT = "invalid_output_requirement"
+    INVALID_AGENT_OPTIONS = "invalid_agent_options"
 
     # STATE
     RUN_NOT_FOUND = "run_not_found"
@@ -92,6 +93,7 @@ ERROR_FAMILIES: Mapping[ErrorCode, ErrorFamily] = MappingProxyType(
         ErrorCode.INPUT_TOO_LARGE: ErrorFamily.VALIDATION,
         ErrorCode.INVALID_BUDGET: ErrorFamily.VALIDATION,
         ErrorCode.INVALID_OUTPUT_REQUIREMENT: ErrorFamily.VALIDATION,
+        ErrorCode.INVALID_AGENT_OPTIONS: ErrorFamily.VALIDATION,
         ErrorCode.RUN_NOT_FOUND: ErrorFamily.STATE,
         ErrorCode.WORK_UNIT_NOT_FOUND: ErrorFamily.STATE,
         ErrorCode.ILLEGAL_STATE_TRANSITION: ErrorFamily.STATE,

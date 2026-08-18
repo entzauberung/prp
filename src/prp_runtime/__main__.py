@@ -1,16 +1,11 @@
-"""Module entry point.
+"""Module entry point for the model-free PRP Bridge CLI."""
 
-Prints package identity. It never starts a server or a background task.
-"""
-
-import json
-
-from prp_runtime import package_info
+from prp_runtime.client.cli import main as cli_main
 
 
 def main() -> int:
-    print(json.dumps(package_info(), sort_keys=True))
-    return 0
+    """Delegate module execution to the Bridge CLI."""
+    return cli_main()
 
 
 if __name__ == "__main__":

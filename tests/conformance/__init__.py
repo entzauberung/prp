@@ -1,1 +1,1 @@
-"""Conformance test package."""
+"""Versioned production-path conformance scenarios."""

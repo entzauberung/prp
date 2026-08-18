@@ -2,7 +2,28 @@
 
 本文件记录 PRP Runtime 的显著变更。
 
-版本阶段 `0.0.1` 到 `0.0.4` 属于 pre-0.1 开发期，不保留向后兼容，不提供数据迁移。
+`0.0.2` 是当前包身份。数据库 schema 直接替换，pre-0.1 数据不提供向后兼容或迁移。
+
+## [0.0.2] - Unreleased
+
+### Added
+
+- 四种正交 Agent mode：`NORMAL`、`AUTO`、`PLAN`、`YOLO`；确定性 Policy 对工具产生可审计的 `ALLOW`、`ASK` 或 `DENY`。
+- Cloud/Bridge 两种执行位置、`SANDBOXED`/`HOST` 隔离边界、owner-scoped Workspace、Snapshot、ToolCall/ToolResult、Approval、Lease 和 ChangeSet 合同。
+- `list_files`、`read_file`、`search_text`、`apply_patch`、`run_targeted_test`、`get_diff`、`get_status` 受限工具子集；写入基于 Snapshot 生成 ChangeSet，测试命令使用预注册结构化 argv。
+- Native Session/Run API、单租户服务令牌、SSE 事件回放与 Bridge 的无模型断线游标恢复。
+- Responses、Chat Completions 和 Anthropic Messages 的声明子集映射到共享 Agent 核心；不声称完整第三方协议兼容。
+- final node、revision lineage、内容指纹、原子 reservation、Provider readiness/恢复、隔离并行和 Progressive 证据修订。
+
+### Security and limits
+
+- `PLAN` 无副作用；`AUTO` 只自动放行低风险命令；模型不能自批权限、访问任意主机路径、保存秘密或启用通用网络。
+- `SANDBOXED` 必须有真实 Linux `bubblewrap`；Bridge 的本地 Workspace path boundary 不等于 OS sandbox。
+- 本版是单实例 SQLite 参考实现，不提供生产 SLA、无限推理、完整 Codex/Claude Code 兼容或多租户计费。
+
+### Verification
+
+- v0.0.2 package identity、最小云端代码任务（list/search/read/patch/targeted test/diff）和 API/Bridge 定向门禁通过。
 
 ## [0.0.1] - 未发布
 
