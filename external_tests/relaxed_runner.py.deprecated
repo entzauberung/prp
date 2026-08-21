@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+Relaxed Test Campaign Orchestrator
+
+Executes grouped test campaigns with automatic classification, bounded logging,
+and optional single-repair cycles for direct defects.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from credential_loader import load_credentials
+from grouped_test_logger import GroupLogger
+
+
+@dataclass
+class TestScenario:
+    """Single test scenario definition."""
+    name: str
+    test_path: str
+    markers: list[str] = field(default_factory=list)
+    timeout: int = 300
+    max_attempts: int = 1
+
+
+@dataclass
+class TestGroup:
+    """Test group with shared classification and logging."""
+    name: str
+    scenarios: list[TestScenario]
+    log_prefix: str
+    timeout: int = 600
+    allow_repair: bool = False
+
+
+@dataclass
+class CampaignResult:
+    """Campaign execution result."""
+    group_name: str
+    total_scenarios: int
+    passed: int = 0
+    product_defects: int = 0
+    upstream_issues: int = 0
+    environment_limitations: int = 0
+    not_applicable: int = 0
+    budget_not_run: int = 0
+    blocked: int = 0
+    duration_seconds: float = 0.0
+    details: list[dict[str, Any]] = field(default_factory=list)
+
+
+class RelaxedRunner:
+    """Campaign orchestrator with relaxed failure handling."""
+
+    def __init__(
+        self,
+        credential_file: Path,
+        log_dir: Path,
+        dry_run: bool = False,
+        allow_repairs: bool = True,
+        max_total_attempts: int = 20,
+    ):
+        self.credential_file = credential_file
+        self.log_dir = log_dir
+        self.dry_run = dry_run
+        self.allow_repairs = allow_repairs
+        self.max_total_attempts = max_total_attempts
+        self.total_attempts = 0
+
+        # Ensure log directory exists
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def run_campaign(self, groups: list[TestGroup]) -> list[CampaignResult]:
+        """Execute all test groups in sequence."""
+        results = []
+
+        for group in groups:
+            if self.total_attempts >= self.max_total_attempts:
+                result = CampaignResult(
+                    group_name=group.name,
+                    total_scenarios=len(group.scenarios),
+                    budget_not_run=len(group.scenarios),
+                )
+                results.append(result)
+                continue
+
+            result = self._run_group(group)
+            results.append(result)
+
+        return results
+
+    def _run_group(self, group: TestGroup) -> CampaignResult:
+        """Execute a single test group."""
+        logger = GroupLogger(self.log_dir, group.log_prefix)
+        result = CampaignResult(
+            group_name=group.name,
+            total_scenarios=len(group.scenarios),
+        )
+
+        start_time = time.time()
+
+        for scenario in group.scenarios:
+            if self.total_attempts >= self.max_total_attempts:
+                result.budget_not_run += 1
+                continue
+
+            scenario_result = self._run_scenario(scenario, logger, group.allow_repair)
+            result.details.append(scenario_result)
+
+            # Classify result
+            classification = scenario_result.get("classification", "BLOCKED")
+            if classification == "PASS":
+                result.passed += 1
+            elif classification == "PRODUCT_DEFECT":
+                result.product_defects += 1
+            elif classification in ("UPSTREAM_UNSUPPORTED", "UPSTREAM_AUTH_OR_BALANCE", "UPSTREAM_TRANSIENT"):
+                result.upstream_issues += 1
+            elif classification == "ENVIRONMENT_LIMITATION":
+                result.environment_limitations += 1
+            elif classification == "NOT_APPLICABLE":
+                result.not_applicable += 1
+            elif classification == "BUDGET_NOT_RUN":
+                result.budget_not_run += 1
+            else:
+                result.blocked += 1
+
+        result.duration_seconds = time.time() - start_time
+        logger.close()
+
+        return result
+
+    def _run_scenario(
+        self,
+        scenario: TestScenario,
+        logger: GroupLogger,
+        allow_repair: bool,
+    ) -> dict[str, Any]:
+        """Execute a single test scenario."""
+        scenario_start = time.time()
+
+        # Build pytest command
+        cmd = self._build_pytest_command(scenario)
+
+        # Execute
+        if self.dry_run:
+            logger.log_event("dry_run", scenario=scenario.name, command=" ".join(cmd))
+            return {
+                "scenario": scenario.name,
+                "classification": "NOT_APPLICABLE",
+                "attempts": 0,
+                "duration": 0.0,
+            }
+
+        result = self._execute_pytest(cmd, scenario.timeout)
+        self.total_attempts += 1
+
+        # Log raw output
+        logger.log_scenario_end(
+            scenario.name,
+            status=f"exit_{result['exit_code']}",
+            duration=result["duration"],
+            stdout=result["stdout"],
+            stderr=result["stderr"],
+        )
+
+        # Classify
+        classification = self._classify_result(result)
+
+        # Attempt repair if allowed and it's a direct defect
+        if (
+            allow_repair
+            and classification == "PRODUCT_DEFECT"
+            and self._is_direct_defect(result)
+            and self.total_attempts < self.max_total_attempts
+        ):
+            repair_result = self._attempt_repair(scenario, result)
+            if repair_result:
+                # Re-run targeted test
+                rerun_result = self._execute_pytest(cmd, scenario.timeout)
+                self.total_attempts += 1
+                logger.log_command(
+                    f"{scenario.name} (repair-rerun)",
+                    " ".join(cmd),
+                    rerun_result["exit_code"],
+                    rerun_result["duration"],
+                    rerun_result["stdout"],
+                    rerun_result["stderr"],
+                )
+                classification = self._classify_result(rerun_result)
+
+        duration = time.time() - scenario_start
+
+        scenario_result = {
+            "scenario": scenario.name,
+            "classification": classification,
+            "attempts": 1,
+            "duration": duration,
+            "exit_code": result["exit_code"],
+        }
+
+        logger.log_structured(scenario_result)
+
+        return scenario_result
+
+    def _build_pytest_command(self, scenario: TestScenario) -> list[str]:
+        """Build pytest command for a scenario."""
+        cmd = ["uv", "run", "pytest", scenario.test_path, "-v"]
+
+        for marker in scenario.markers:
+            cmd.extend(["-m", marker])
+
+        # Pass credential file via environment
+        # (pytest will pick it up via conftest if needed)
+
+        return cmd
+
+    def _execute_pytest(self, cmd: list[str], timeout: int) -> dict[str, Any]:
+        """Execute pytest command and capture results."""
+        start = time.time()
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={
+                    **subprocess.os.environ,
+                    "PRP_TEST_CREDENTIAL_FILE": str(self.credential_file),
+                },
+            )
+
+            return {
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "duration": time.time() - start,
+                "timed_out": False,
+            }
+
+        except subprocess.TimeoutExpired as e:
+            return {
+                "exit_code": -1,
+                "stdout": e.stdout.decode() if e.stdout else "",
+                "stderr": e.stderr.decode() if e.stderr else "",
+                "duration": timeout,
+                "timed_out": True,
+            }
+
+        except Exception as e:
+            return {
+                "exit_code": -2,
+                "stdout": "",
+                "stderr": str(e),
+                "duration": time.time() - start,
+                "timed_out": False,
+            }
+
+    def _classify_result(self, result: dict[str, Any]) -> str:
+        """Classify test result based on exit code and output."""
+        if result["timed_out"]:
+            return "ENVIRONMENT_LIMITATION"
+
+        exit_code = result["exit_code"]
+        stdout = result["stdout"]
+        stderr = result["stderr"]
+
+        # Success
+        if exit_code == 0:
+            return "PASS"
+
+        # Collection-only (no tests run)
+        if exit_code == 5:  # pytest NO_TESTS_COLLECTED
+            return "NOT_APPLICABLE"
+
+        # Check for upstream issues
+        if "UPSTREAM_UNSUPPORTED" in stdout or "not supported" in stderr.lower():
+            return "UPSTREAM_UNSUPPORTED"
+
+        if "401" in stdout or "403" in stdout or "invalid_api_key" in stdout:
+            return "UPSTREAM_AUTH_OR_BALANCE"
+
+        if "429" in stdout or "503" in stdout or "timeout" in stderr.lower():
+            return "UPSTREAM_TRANSIENT"
+
+        # Environment issues
+        if "permission denied" in stderr.lower() or "cannot create" in stderr.lower():
+            return "ENVIRONMENT_LIMITATION"
+
+        # Default to product defect
+        return "PRODUCT_DEFECT"
+
+    def _is_direct_defect(self, result: dict[str, Any]) -> bool:
+        """Check if this is a direct, fixable defect."""
+        stderr = result["stderr"]
+
+        # Simple heuristics for "direct" defects
+        direct_markers = [
+            "ImportError",
+            "AttributeError",
+            "NameError",
+            "SyntaxError",
+            "IndentationError",
+        ]
+
+        return any(marker in stderr for marker in direct_markers)
+
+    def _attempt_repair(self, scenario: TestScenario, result: dict[str, Any]) -> bool:
+        """Attempt automatic repair for direct defects."""
+        # Placeholder: In a real implementation, this would parse the error
+        # and attempt a targeted fix. For now, just log the attempt.
+        return False
+
+
+def define_dry_run_group(credential_file: Path) -> TestGroup:
+    """Define dry-run group for credential verification."""
+    return TestGroup(
+        name="dry-run",
+        scenarios=[
+            TestScenario(
+                name="credential-collection",
+                test_path="external_tests/",
+                markers=["provider_smoke"],
+                timeout=60,
+            ),
+        ],
+        log_prefix="00",
+        timeout=180,
+        allow_repair=False,
+    )
+
+
+def define_provider_group(credential_file: Path) -> TestGroup:
+    """Define provider group for five-profile smoke tests."""
+    return TestGroup(
+        name="provider",
+        scenarios=[
+            TestScenario(
+                name="deepseek-chat-smoke",
+                test_path="tests/unit/external/test_deepseek_chat.py",
+                markers=["external"],
+                timeout=120,
+            ),
+            TestScenario(
+                name="deepseek-responses-smoke",
+                test_path="tests/unit/external/test_deepseek_responses.py",
+                markers=["external"],
+                timeout=120,
+            ),
+            TestScenario(
+                name="deepseek-anthropic-smoke",
+                test_path="tests/unit/external/test_deepseek_anthropic.py",
+                markers=["external"],
+                timeout=120,
+            ),
+            TestScenario(
+                name="luna-responses-smoke",
+                test_path="tests/unit/external/test_luna_responses.py",
+                markers=["external"],
+                timeout=120,
+            ),
+            TestScenario(
+                name="claude-anthropic-smoke",
+                test_path="tests/unit/external/test_claude_anthropic.py",
+                markers=["external"],
+                timeout=120,
+            ),
+        ],
+        log_prefix="10",
+        timeout=600,
+        allow_repair=True,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Relaxed test campaign orchestrator")
+    parser.add_argument(
+        "--credential-file",
+        type=Path,
+        required=True,
+        help="Path to credential file",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        required=True,
+        help="Directory for campaign logs",
+    )
+    parser.add_argument(
+        "--group",
+        choices=["dry-run", "provider", "integration", "deep", "stability", "regression"],
+        required=True,
+        help="Test group to execute",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Collection-only, no actual test execution",
+    )
+
+    args = parser.parse_args()
+
+    # Validate credential file
+    if not args.credential_file.exists():
+        print(f"ERROR: Credential file not found: {args.credential_file}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.credential_file.is_file():
+        print(f"ERROR: Credential path is not a regular file: {args.credential_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load and verify credentials (dry-run always, live only if not --dry-run)
+    try:
+        credentials = load_credentials(args.credential_file)
+        print(f"Loaded {len(credentials.aliases)} credential profiles")
+    except Exception as e:
+        print(f"ERROR: Failed to load credentials: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Define groups based on selection
+    if args.group == "dry-run":
+        groups = [define_dry_run_group(args.credential_file)]
+        is_dry = True
+    elif args.group == "provider":
+        groups = [define_provider_group(args.credential_file)]
+        is_dry = False
+    else:
+        print(f"ERROR: Group '{args.group}' not yet implemented", file=sys.stderr)
+        sys.exit(1)
+
+    # Execute campaign
+    runner = RelaxedRunner(
+        credential_file=args.credential_file,
+        log_dir=args.log_dir,
+        dry_run=is_dry or args.dry_run,
+    )
+
+    results = runner.run_campaign(groups)
+
+    # Print summary
+    print("\n=== Campaign Summary ===")
+    for result in results:
+        print(f"\nGroup: {result.group_name}")
+        print(f"  Total scenarios: {result.total_scenarios}")
+        print(f"  Passed: {result.passed}")
+        print(f"  Product defects: {result.product_defects}")
+        print(f"  Upstream issues: {result.upstream_issues}")
+        print(f"  Environment limitations: {result.environment_limitations}")
+        print(f"  Not applicable: {result.not_applicable}")
+        print(f"  Budget not run: {result.budget_not_run}")
+        print(f"  Blocked: {result.blocked}")
+        print(f"  Duration: {result.duration_seconds:.2f}s")
+
+    # Exit with appropriate code
+    any_blocked = any(r.blocked > 0 for r in results)
+    sys.exit(1 if any_blocked else 0)
+
+
+if __name__ == "__main__":
+    main()

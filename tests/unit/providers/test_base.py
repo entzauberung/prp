@@ -19,6 +19,7 @@ from prp_runtime.providers.base import (
     FinishReason,
     ModelProfile,
     ProviderAdapter,
+    ProviderProtocol,
     ProviderRequest,
     ProviderResponse,
 )
@@ -73,6 +74,33 @@ def test_profile_exposes_the_domain_model_reference() -> None:
     assert profile.supports_structured_output is False
     assert profile.input_price_per_million_tokens == Decimal("0")
     assert profile.output_price_per_million_tokens == Decimal("0")
+    assert profile.protocol is ProviderProtocol.OPENAI_CHAT
+
+
+def test_profile_supports_closed_protocols_and_anthropic_version() -> None:
+    responses = worker_profile(protocol=ProviderProtocol.OPENAI_RESPONSES)
+    assert responses.protocol is ProviderProtocol.OPENAI_RESPONSES
+    anthropic = worker_profile(
+        protocol=ProviderProtocol.ANTHROPIC_MESSAGES,
+        anthropic_version="2023-06-01",
+    )
+    assert anthropic.anthropic_version == "2023-06-01"
+    restored = ModelProfile.model_validate_json(anthropic.model_dump_json())
+    assert restored == anthropic
+
+
+def test_profile_rejects_unknown_protocol_and_cross_protocol_version() -> None:
+    with pytest.raises(ValidationError):
+        worker_profile(protocol="UNKNOWN")
+    with pytest.raises(ValidationError, match="only valid"):
+        worker_profile(anthropic_version="2023-06-01")
+    with pytest.raises(ValidationError, match="requires"):
+        worker_profile(protocol=ProviderProtocol.ANTHROPIC_MESSAGES)
+    with pytest.raises(ValidationError):
+        worker_profile(
+            protocol=ProviderProtocol.ANTHROPIC_MESSAGES,
+            anthropic_version="not-a-version",
+        )
 
 
 def test_profile_cost_uses_exact_decimal_arithmetic_and_preserves_unknown_usage() -> None:

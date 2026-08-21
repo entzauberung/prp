@@ -10,7 +10,9 @@ import prp_runtime.app as app_module
 from prp_runtime import __version__
 from prp_runtime.app import build_adapters, create_app
 from prp_runtime.domain.enums import ModelRole
-from prp_runtime.providers.base import ModelProfile
+from prp_runtime.providers.base import ModelProfile, ProviderProtocol
+from prp_runtime.providers.anthropic import AnthropicMessagesProvider
+from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
 from prp_runtime.settings import Settings
 from prp_runtime.workspace.sandbox import SandboxCapabilities
 
@@ -124,12 +126,44 @@ def test_build_adapters_uses_every_configured_profile(monkeypatch: pytest.Monkey
         built_for.append(profile.alias)
         return object()
 
-    monkeypatch.setattr(app_module, "OpenAICompatibleProvider", fake_provider)
+    monkeypatch.setattr(app_module, "build_provider_adapter", fake_provider)
 
     adapters = build_adapters(settings)
 
     assert list(adapters) == ["leader", "worker", "worker-medium", "worker-large"]
     assert built_for == list(adapters)
+
+
+def test_build_adapters_uses_profile_protocol() -> None:
+    profile = ModelProfile(
+        alias="responses",
+        provider="responses-provider",
+        model="responses-model",
+        role=ModelRole.WORKER,
+        base_url="https://models.internal/v1",
+        protocol=ProviderProtocol.OPENAI_RESPONSES,
+        context_window_tokens=16_000,
+        max_output_tokens=2_000,
+    )
+    adapters = build_adapters(Settings(worker_profile=profile))
+    assert isinstance(adapters["responses"], OpenAIResponsesProvider)
+
+
+def test_build_adapters_constructs_anthropic_profile_without_host_guessing() -> None:
+    profile = ModelProfile(
+        alias="anthropic",
+        provider="anthropic-provider",
+        model="claude-model",
+        role=ModelRole.WORKER,
+        base_url="https://claude.example/custom",
+        protocol=ProviderProtocol.ANTHROPIC_MESSAGES,
+        anthropic_version="2023-06-01",
+        context_window_tokens=16_000,
+        max_output_tokens=2_000,
+    )
+    adapters = build_adapters(Settings(worker_profile=profile))
+    assert isinstance(adapters["anthropic"], AnthropicMessagesProvider)
+    assert adapters["anthropic"].endpoint == "https://claude.example/custom/v1/messages"
 
 
 def test_default_lifespan_builds_cascade_adapters(
@@ -150,7 +184,7 @@ def test_default_lifespan_builds_cascade_adapters(
         created[profile.alias] = adapter
         return adapter
 
-    monkeypatch.setattr(app_module, "OpenAICompatibleProvider", fake_provider)
+    monkeypatch.setattr(app_module, "build_provider_adapter", fake_provider)
     app = create_app(settings)
 
     with TestClient(app):
@@ -256,7 +290,7 @@ def test_owned_adapter_close_failure_still_closes_owned_store(
         created.append(adapter)
         return adapter
 
-    monkeypatch.setattr(app_module, "OpenAICompatibleProvider", fake_provider)
+    monkeypatch.setattr(app_module, "build_provider_adapter", fake_provider)
     app = create_app(settings)
     with pytest.raises(RuntimeError, match="adapter close failed"):
         with TestClient(app):

@@ -44,6 +44,14 @@ packages = ["src/prp_runtime"]
 testpaths = ["tests"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "external: marks tests that require real network access to external APIs",
+    "live_provider: marks tests that make real calls to live provider endpoints",
+    "live_integration: marks tests that validate protocol integration with real endpoints",
+    "live_strategy: marks tests that validate routing and fallback strategies",
+    "live_agent: marks tests that validate end-to-end agent workflows",
+    "live_regression: marks tests that validate historical bug fixes remain resolved"
+]
 
 [tool.ruff]
 line-length = 100

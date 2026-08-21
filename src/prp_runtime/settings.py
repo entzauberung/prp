@@ -21,7 +21,7 @@ from prp_runtime.json_support import strict_json_loads
 from prp_runtime.providers.base import ModelProfile
 from prp_runtime.workspace.models import WorkspaceRootMapping
 
-__all__ = ["ENV_PREFIX", "LogLevel", "Settings"]
+__all__ = ["ENV_PREFIX", "LogLevel", "Settings", "load_credential_profiles"]
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -178,3 +178,37 @@ class Settings(BaseModel):
         # declared field type. ``model_validate`` says that, where ``cls(**values)``
         # would claim every field is already a ``str``.
         return cls.model_validate(values)
+
+
+def load_credential_profiles(credential_file: Path) -> dict[str, ModelProfile]:
+    """Load model profiles from a credential file.
+
+    The credential file should be a JSON file with a top-level object where
+    each key is a profile name and each value is a ModelProfile object.
+
+    Args:
+        credential_file: Path to the credential JSON file
+
+    Returns:
+        Dictionary mapping profile names to ModelProfile instances
+
+    Raises:
+        FileNotFoundError: If credential file does not exist
+        ValueError: If credential file is not valid JSON or schema mismatch
+    """
+    if not credential_file.exists():
+        raise FileNotFoundError(f"Credential file not found: {credential_file}")
+
+    content = credential_file.read_text(encoding="utf-8")
+    raw_data = strict_json_loads(content)
+
+    if not isinstance(raw_data, dict):
+        raise ValueError("Credential file must contain a JSON object")
+
+    profiles: dict[str, ModelProfile] = {}
+    for name, profile_data in raw_data.items():
+        if not isinstance(profile_data, dict):
+            raise ValueError(f"Profile '{name}' must be a JSON object")
+        profiles[name] = ModelProfile.model_validate(profile_data)
+
+    return profiles

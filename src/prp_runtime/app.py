@@ -29,7 +29,7 @@ from prp_runtime.domain.enums import RunStatus
 from prp_runtime.domain.errors import ErrorCode, ErrorDetail, ProviderError, PrpError
 from prp_runtime.domain.models import ErrorCategory, ErrorInfo, Run
 from prp_runtime.providers.base import ProviderAdapter
-from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
+from prp_runtime.providers.factory import build_provider_adapter
 from prp_runtime.runtime.event_bus import EventBus
 from prp_runtime.runtime.supervisor import RunSupervisor
 from prp_runtime.runtime.tooling import ScopeToolRuntimeProvider
@@ -38,7 +38,12 @@ from prp_runtime.storage.recovery import recover_after_restart
 from prp_runtime.storage.sqlite import SqliteStore
 from prp_runtime.workspace.sandbox import SandboxCapabilities, probe_bwrap
 
-__all__ = ["HealthResponse", "ReadinessResponse", "build_adapters", "create_app"]
+__all__ = [
+    "HealthResponse",
+    "ReadinessResponse",
+    "build_adapters",
+    "create_app",
+]
 
 
 class _SqlitePendingRunScanner:
@@ -72,7 +77,7 @@ class ReadinessResponse(BaseModel):
 def build_adapters(settings: Settings) -> dict[str, ProviderAdapter]:
     """Build one outbound adapter per configured model profile."""
     return {
-        profile.alias: OpenAICompatibleProvider(profile) for profile in settings.profiles
+        profile.alias: build_provider_adapter(profile) for profile in settings.profiles
     }
 
 

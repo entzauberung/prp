@@ -16,8 +16,11 @@ class RealNetworkAccessError(RuntimeError):
 
 
 @pytest.fixture(autouse=True)
-def block_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail any real outbound socket connection."""
+def block_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any real outbound socket connection, unless test is marked 'external'."""
+    # Skip network blocking for tests marked with @pytest.mark.external
+    if "external" in request.keywords:
+        return
 
     def deny(*args: object, **kwargs: object) -> object:
         raise RealNetworkAccessError(

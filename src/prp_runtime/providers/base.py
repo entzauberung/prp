@@ -41,6 +41,7 @@ __all__ = [
     "AgentTurn",
     "AttemptCost",
     "ModelProfile",
+    "ProviderProtocol",
     "ProviderAdapter",
     "ProviderRequest",
     "ProviderResponse",
@@ -71,6 +72,15 @@ class FinishReason(StrEnum):
     OTHER = "OTHER"
 
 
+@unique
+class ProviderProtocol(StrEnum):
+    """Closed set of supported outbound provider protocols."""
+
+    OPENAI_CHAT = "OPENAI_CHAT"
+    OPENAI_RESPONSES = "OPENAI_RESPONSES"
+    ANTHROPIC_MESSAGES = "ANTHROPIC_MESSAGES"
+
+
 class ModelProfile(DomainModel):
     """A server-side model configuration referenced by alias.
 
@@ -86,6 +96,16 @@ class ModelProfile(DomainModel):
     role: ModelRole
     base_url: Endpoint
     api_key: SecretStr | None = None
+    protocol: ProviderProtocol = ProviderProtocol.OPENAI_CHAT
+    anthropic_version: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=10,
+            max_length=32,
+            pattern=r"^\d{4}-\d{2}-\d{2}$",
+        ),
+    ] | None = None
     supports_structured_output: bool = False
     context_window_tokens: int = Field(gt=0)
     max_output_tokens: int = Field(gt=0)
@@ -98,6 +118,11 @@ class ModelProfile(DomainModel):
     def _output_fits_the_context_window(self) -> "ModelProfile":
         if self.max_output_tokens > self.context_window_tokens:
             raise ValueError("max_output_tokens cannot exceed context_window_tokens")
+        if self.protocol is ProviderProtocol.ANTHROPIC_MESSAGES:
+            if self.anthropic_version is None:
+                raise ValueError("ANTHROPIC_MESSAGES requires anthropic_version")
+        elif self.anthropic_version is not None:
+            raise ValueError("anthropic_version is only valid for ANTHROPIC_MESSAGES")
         return self
 
     @property

@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import prp_runtime.app as app_module
 from prp_runtime.app import create_app
 from prp_runtime.domain.enums import (
     AttemptStatus,
@@ -98,7 +97,6 @@ def _wait_for_terminal(client: TestClient, run_id: str) -> dict[str, object]:
 
 def test_native_cascade_verification_failure_then_success_has_consistent_facts(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "v002-cascade.db"
     weak_profile = _worker("weak", structured=True)
@@ -111,12 +109,7 @@ def test_native_cascade_verification_failure_then_success_has_consistent_facts(
         cascade_profiles=(strong_profile,),
     )
     adapters = {"weak": weak, "strong": strong}
-    monkeypatch.setattr(
-        app_module,
-        "OpenAICompatibleProvider",
-        lambda profile: adapters[profile.alias],
-    )
-    app = create_app(settings)
+    app = create_app(settings, adapters=adapters)
 
     with TestClient(app) as client:
         response = client.post(

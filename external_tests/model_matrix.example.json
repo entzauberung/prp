@@ -1,0 +1,101 @@
+{
+  "version": "0.0.2",
+  "profiles": [
+    {
+      "alias": "DEEPSEEK_FLASH_CHAT",
+      "vendor": "deepseek",
+      "protocol": "OPENAI_CHAT",
+      "base_url_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_BASE_URL",
+      "model_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_MODEL",
+      "api_key_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_API_KEY"
+    },
+    {
+      "alias": "DEEPSEEK_FLASH_RESPONSES",
+      "vendor": "deepseek",
+      "protocol": "OPENAI_RESPONSES",
+      "base_url_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_RESPONSES_BASE_URL",
+      "model_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_RESPONSES_MODEL",
+      "api_key_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_RESPONSES_API_KEY"
+    },
+    {
+      "alias": "DEEPSEEK_FLASH_ANTHROPIC",
+      "vendor": "deepseek",
+      "protocol": "ANTHROPIC_MESSAGES",
+      "base_url_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_ANTHROPIC_BASE_URL",
+      "model_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_ANTHROPIC_MODEL",
+      "api_key_env": "PRP_EXTERNAL_DEEPSEEK_FLASH_ANTHROPIC_API_KEY"
+    },
+    {
+      "alias": "LUNA_GPT_56",
+      "vendor": "vanyospace",
+      "protocol": "OPENAI_RESPONSES",
+      "base_url_env": "PRP_EXTERNAL_LUNA_GPT_56_BASE_URL",
+      "model_env": "PRP_EXTERNAL_LUNA_GPT_56_MODEL",
+      "api_key_env": "PRP_EXTERNAL_LUNA_GPT_56_API_KEY"
+    },
+    {
+      "alias": "CLAUDE_SONNET_5",
+      "vendor": "vanyospace",
+      "protocol": "ANTHROPIC_MESSAGES",
+      "base_url_env": "PRP_EXTERNAL_CLAUDE_SONNET_5_BASE_URL",
+      "model_env": "PRP_EXTERNAL_CLAUDE_SONNET_5_MODEL",
+      "api_key_env": "PRP_EXTERNAL_CLAUDE_SONNET_5_API_KEY"
+    },
+    {
+      "alias": "ZHIPU_GLM_46V",
+      "vendor": "zhipu",
+      "protocol": "OPENAI_RESPONSES",
+      "base_url_env": "PRP_EXTERNAL_ZHIPU_GLM_46V_BASE_URL",
+      "model_env": "PRP_EXTERNAL_ZHIPU_GLM_46V_MODEL",
+      "api_key_env": "PRP_EXTERNAL_ZHIPU_GLM_46V_API_KEY"
+    },
+    {
+      "alias": "ZHIPU_GLM_45_AIR",
+      "vendor": "zhipu",
+      "protocol": "OPENAI_RESPONSES",
+      "base_url_env": "PRP_EXTERNAL_ZHIPU_GLM_45_AIR_BASE_URL",
+      "model_env": "PRP_EXTERNAL_ZHIPU_GLM_45_AIR_MODEL",
+      "api_key_env": "PRP_EXTERNAL_ZHIPU_GLM_45_AIR_API_KEY"
+    },
+    {
+      "alias": "ZHIPU_GLM_47_FLASH",
+      "vendor": "zhipu",
+      "protocol": "OPENAI_RESPONSES",
+      "base_url_env": "PRP_EXTERNAL_ZHIPU_GLM_47_FLASH_BASE_URL",
+      "model_env": "PRP_EXTERNAL_ZHIPU_GLM_47_FLASH_MODEL",
+      "api_key_env": "PRP_EXTERNAL_ZHIPU_GLM_47_FLASH_API_KEY"
+    }
+  ],
+  "allowed_hosts": [
+    "api.deepseek.com",
+    "fast.vanyospace.com",
+    "open.bigmodel.cn"
+  ],
+  "out_of_scope": [
+    {
+      "model_id": "glm-4v-plus",
+      "scope": "OUT_OF_SCOPE",
+      "reason": "Multimodal vision model not yet supported"
+    },
+    {
+      "model_id": "glm-4-alltools",
+      "scope": "OUT_OF_SCOPE",
+      "reason": "Tool-augmented model requires different protocol"
+    },
+    {
+      "model_id": "GLM-4V-Flash",
+      "scope": "OUT_OF_SCOPE",
+      "reason": "Multimodal vision model not yet supported"
+    },
+    {
+      "model_id": "CogView-3-Flash",
+      "scope": "OUT_OF_SCOPE",
+      "reason": "Image generation model not yet supported"
+    },
+    {
+      "model_id": "CogVideoX-Flash",
+      "scope": "OUT_OF_SCOPE",
+      "reason": "Video generation model not yet supported"
+    }
+  ]
+}

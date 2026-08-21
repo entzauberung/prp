@@ -1,0 +1,10 @@
+{
+  "global_max_attempts": 20,
+  "per_alias_max_attempts": 5,
+  "per_alias_max_successes": 4,
+  "output_tokens": {
+    "default": 128,
+    "planner_progressive": 256
+  },
+  "concurrency": 1
+}
