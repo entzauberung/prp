@@ -225,6 +225,72 @@ def test_tool_response_is_normalised_and_duplicate_or_invalid_input_rejected() -
         )
 
 
+@pytest.mark.parametrize(
+    "companion",
+    [
+        {"type": "thinking", "thinking": "private", "signature": "signed"},
+        {"type": "redacted_thinking", "data": "opaque"},
+    ],
+)
+def test_tool_use_accepts_validated_thinking_companion(
+    companion: dict[str, object],
+) -> None:
+    adapter = AnthropicMessagesProvider(profile())
+    response = adapter._parse(
+        httpx.Response(
+            200,
+            json={
+                "id": "msg-tool-thinking",
+                "content": [
+                    companion,
+                    {
+                        "type": "tool_use",
+                        "id": "call-search",
+                        "name": "search_text",
+                        "input": {"pattern": "Provider"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+        ),
+        elapsed_ms=3,
+    )
+
+    assert response.text is None
+    assert response.tool_calls[0].tool_name == "search_text"
+
+
+@pytest.mark.parametrize(
+    "companion",
+    [
+        {"type": "thinking", "thinking": "private", "signature": 1},
+        {"type": "redacted_thinking", "data": "opaque", "extra": "private"},
+        {"type": "unknown", "data": "private"},
+    ],
+)
+def test_tool_use_rejects_unvalidated_thinking_companion_without_echo(
+    companion: dict[str, object],
+) -> None:
+    adapter = AnthropicMessagesProvider(profile())
+    body = {
+        "content": [
+            companion,
+            {
+                "type": "tool_use",
+                "id": "call-search",
+                "name": "search_text",
+                "input": {},
+            },
+        ],
+        "stop_reason": "tool_use",
+    }
+
+    with pytest.raises(ProviderError) as excinfo:
+        adapter._parse(httpx.Response(200, json=body), elapsed_ms=1)
+
+    assert "private" not in str(excinfo.value)
+
+
 def test_tool_use_and_text_cannot_be_mixed() -> None:
     adapter = AnthropicMessagesProvider(profile())
     with pytest.raises(ProviderError, match="mixed"):

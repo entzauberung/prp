@@ -8,8 +8,8 @@ version = "0.0.2"
 description = "Progressive Reasoning Protocol reference runtime"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "MIT OR Apache-2.0"
-license-files = ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE"]
+license = "Apache-2.0"
+license-files = ["LICENSE-APACHE", "NOTICE", "TRADEMARKS.md"]
 authors = [{ name = "PRP Runtime Authors" }]
 
 dependencies = [
@@ -39,6 +39,25 @@ Homepage = "https://github.com/prp-runtime/prp"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prp_runtime"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/AGENTS.md",
+    "/opencode.json",
+    "/ai",
+    "/ai/**",
+    "/dist",
+    "/dist/**",
+    "/external_tests/.results",
+    "/external_tests/.results/**",
+    "**/__pycache__/**",
+    "**/*.py[cod]",
+    "**/*.db",
+    "**/*.db-wal",
+    "**/*.db-shm",
+    "**/*.log",
+    "**/*.jsonl",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

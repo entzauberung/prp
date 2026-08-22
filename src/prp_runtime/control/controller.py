@@ -1317,6 +1317,7 @@ class RunController:
         changes: dict[str, object] = {
             "status": transition_run(run.status, status),
             "completed_at": now,
+            "usage": stored.usage,
             "metrics": metrics,
         }
         if run.started_at is None:
@@ -1657,32 +1658,48 @@ class RunController:
             return await self._finish_run(current, RunStatus.CANCELLED)
 
         target_graph_version = run.graph_version + 1
-        proposal: PlanProposal | PlanRejection
-        if planner_result.rejection is not None:
-            proposal = planner_result.rejection
-        else:
-            assert isinstance(planner_result.proposal, PlanProposal)
-            proposal = planner_result.proposal
-        compiled = (
-            proposal
-            if isinstance(proposal, PlanRejection)
-            else compile_plan(
-                proposal,
+        compiled = self._compile_planner_result(
+            planner_result,
+            run_id=run.run_id,
+            graph_version=target_graph_version,
+        )
+        if self._can_repair_plan(planner_result, compiled):
+            assert isinstance(compiled, PlanRejection)
+            repair_budget_error = await self._preflight_budget(
+                await self._store.get_run(run.run_id)
+            )
+            if repair_budget_error is not None:
+                return await self._finish_run(
+                    await self._store.get_run(run.run_id),
+                    RunStatus.FAILED,
+                    error=repair_budget_error,
+                )
+            feedback = "; ".join(compiled.reasons)
+            planner_result, postflight = await self._execute_planner_propose(
+                run,
+                planner,
+                repair_feedback=feedback,
+            )
+            if postflight is not None:
+                return await self._finish_run(
+                    await self._store.get_run(run.run_id),
+                    RunStatus.FAILED,
+                    error=postflight,
+                )
+            compiled = self._compile_planner_result(
+                planner_result,
                 run_id=run.run_id,
                 graph_version=target_graph_version,
             )
-        )
         committed = await self.commit_plan(
             run.run_id,
             compiled,
             target_graph_version=target_graph_version,
         )
         if isinstance(committed, PlanRejection):
-            error = ErrorInfo(
-                category=ErrorCategory.UNKNOWN,
-                message=(
-                    f"{committed.summary}: " + "; ".join(committed.reasons)
-                ),
+            error = planner_result.error or ErrorInfo(
+                category=ErrorCategory.INVALID_REQUEST,
+                message="plan_rejected: " + "; ".join(committed.reasons),
             )
             return await self._finish_run(
                 await self._store.get_run(run.run_id),
@@ -1722,6 +1739,36 @@ class RunController:
             await self._store.get_run(run.run_id),
             RunStatus.FAILED,
             error=error,
+        )
+
+    @staticmethod
+    def _compile_planner_result(
+        planner_result: PlannerCallResult,
+        *,
+        run_id: str,
+        graph_version: int,
+    ) -> CompiledPlan | PlanRejection:
+        if planner_result.rejection is not None:
+            return planner_result.rejection
+        assert isinstance(planner_result.proposal, PlanProposal)
+        return compile_plan(
+            planner_result.proposal,
+            run_id=run_id,
+            graph_version=graph_version,
+        )
+
+    @staticmethod
+    def _can_repair_plan(
+        planner_result: PlannerCallResult,
+        compiled: CompiledPlan | PlanRejection,
+    ) -> bool:
+        if not isinstance(compiled, PlanRejection):
+            return False
+        if isinstance(planner_result.proposal, PlanProposal):
+            return True
+        return bool(
+            planner_result.error is not None
+            and planner_result.error.message.startswith("plan_schema_invalid:")
         )
 
     async def _execute_planned_work_unit(
@@ -2915,13 +2962,18 @@ class RunController:
         self,
         run: Run,
         planner: Planner,
+        *,
+        repair_feedback: str | None = None,
     ) -> tuple[PlannerCallResult, ErrorInfo | None]:
         """Record one initial Planner call before any user graph is compiled."""
         return await self._execute_planner_call(
             run,
             planner,
             attempt_index=await self._next_planner_attempt_index(run.run_id),
-            call=lambda: planner.propose_call(run.request),
+            call=lambda: planner.propose_call(
+                run.request,
+                repair_feedback=repair_feedback,
+            ),
         )
 
     async def _execute_planner_revise(

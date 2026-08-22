@@ -1,13 +1,18 @@
 """Minimal cloud code-agent read path through the real ToolExecutor."""
 
+import asyncio
 import json
 import sys
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
+from prp_runtime.app import create_app
 from prp_runtime.control.controller import RunController
 from prp_runtime.domain.enums import (
     AgentMode,
@@ -252,6 +257,87 @@ class PatchTestAdapter:
         assert previous.result["entries"][0]["status"] == "MODIFIED"  # type: ignore[index]
         return ProviderResponse(
             text="patched src/main.py, verified it, and reviewed the diff",
+            usage=usage,
+            finish_reason=FinishReason.STOP,
+        )
+
+
+class ProductionPatchTestAdapter:
+    """Drive the production app through approval, patch, pytest and diff."""
+
+    def __init__(self, *, base_snapshot_id: str) -> None:
+        self._base_snapshot_id = base_snapshot_id
+        self.requests: list[ProviderRequest] = []
+
+    @property
+    def name(self) -> str:
+        return "production-patch-test-fixture"
+
+    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        self.requests.append(request)
+        usage = Usage(input_tokens=1, output_tokens=1, elapsed_ms=1)
+        if len(self.requests) == 1:
+            assert "get_diff" in {tool.name for tool in request.tools}
+            return ProviderResponse(
+                tool_calls=(
+                    AgentToolCall(
+                        call_id=new_tool_call_id(),
+                        tool_name="apply_patch",
+                        arguments={
+                            "patch": {
+                                "base_snapshot_id": self._base_snapshot_id,
+                                "unified_diff": (
+                                    "--- a/src/main.py\n"
+                                    "+++ b/src/main.py\n"
+                                    "@@ -1,2 +1,2 @@\n"
+                                    " def answer():\n"
+                                    '-    return "needle"\n'
+                                    '+    return "patched"\n'
+                                ),
+                            }
+                        },
+                    ),
+                ),
+                usage=usage,
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+
+        previous = request.history[-1]
+        assert isinstance(previous, AgentToolResult)
+        assert previous.status is ToolCallStatus.SUCCEEDED
+        assert previous.result is not None
+        if len(self.requests) == 2:
+            return ProviderResponse(
+                tool_calls=(
+                    AgentToolCall(
+                        call_id=new_tool_call_id(),
+                        tool_name="run_targeted_test",
+                        arguments={
+                            "spec_name": "pytest",
+                            "parameters": {"targets": ["test_fixture.py"]},
+                        },
+                    ),
+                ),
+                usage=usage,
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+        if len(self.requests) == 3:
+            assert previous.result["exit_code"] == 0  # type: ignore[index]
+            return ProviderResponse(
+                tool_calls=(
+                    AgentToolCall(
+                        call_id=new_tool_call_id(),
+                        tool_name="get_diff",
+                        arguments={},
+                    ),
+                ),
+                usage=usage,
+                finish_reason=FinishReason.TOOL_CALLS,
+            )
+        assert len(self.requests) == 4
+        assert previous.result["entries"][0]["path"] == "src/main.py"  # type: ignore[index]
+        return ProviderResponse(
+            text="production patch, test and diff completed",
             usage=usage,
             finish_reason=FinishReason.STOP,
         )
@@ -554,6 +640,160 @@ async def test_read_search_agent_path_uses_workspace_tools_and_audited_session_r
         [event.payload for event in events],
         ensure_ascii=True,
     )
+
+
+def test_production_patch_test_agent_path_binds_diff_after_approval(
+    tmp_path: Path,
+) -> None:
+    """Keep the production catalog stable while binding diff after the patch."""
+    from tests.integration.test_agent_api import seed_workspace
+
+    database_path = tmp_path / "production-agent.db"
+    workspace_root = tmp_path / "production-workspace"
+    (workspace_root / "src").mkdir(parents=True)
+    target = workspace_root / "src" / "main.py"
+    target.write_text('def answer():\n    return "needle"\n', encoding="utf-8")
+    (workspace_root / "test_fixture.py").write_text(
+        'from src.main import answer\n\n\ndef test_answer():\n    assert answer() == "patched"\n',
+        encoding="utf-8",
+    )
+    owner_id = "prn_production_patch"
+    seed_workspace(database_path, owner_id, workspace_root)
+
+    async def initial_snapshot_id() -> str:
+        async with SqliteStore(database_path) as store:
+            snapshots = await store.list_snapshots("ws_project", owner_id=owner_id)
+            assert len(snapshots) == 1
+            return snapshots[0].snapshot_id
+
+    base_snapshot_id = asyncio.run(initial_snapshot_id())
+    adapter = ProductionPatchTestAdapter(base_snapshot_id=base_snapshot_id)
+    profile = _profile()
+    app = create_app(
+        Settings(
+            database_path=database_path,
+            worker_profile=profile,
+            service_token=SecretStr("production-agent-token"),
+            service_principal=owner_id,
+            workspace_roots={"project-main": str(workspace_root)},
+        ),
+        adapters={profile.alias: adapter},
+    )
+    headers = {"Authorization": "Bearer production-agent-token"}
+
+    with TestClient(app) as client:
+        session_response = client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={
+                "workspace_id": "ws_project",
+                "access": ["READ", "WRITE"],
+                "agent_options": {
+                    "agent_mode": "AUTO",
+                    "isolation_mode": "HOST",
+                    "execution_location": "CLOUD",
+                },
+            },
+        )
+        assert session_response.status_code == 201
+        session_id = session_response.json()["session_id"]
+        run_response = client.post(
+            f"/v1/sessions/{session_id}/runs",
+            headers=headers,
+            json={
+                "input": "patch the fixture, run its targeted test, then inspect the diff",
+                "routing_policy": "MANUAL",
+                "strategy": "DIRECT",
+                "budget": {"max_attempts": 8, "max_total_tokens": 32},
+            },
+        )
+        assert run_response.status_code == 202
+        run_id = run_response.json()["run_id"]
+
+        approval = None
+        for _ in range(500):
+            approvals_response = client.get(
+                f"/v1/sessions/{session_id}/approvals",
+                headers=headers,
+            )
+            assert approvals_response.status_code == 200
+            approvals = approvals_response.json()
+            if approvals:
+                assert len(approvals) == 1
+                approval = approvals[0]
+                break
+            time.sleep(0.01)
+        assert approval is not None
+        assert approval["tool_name"] == "apply_patch"
+        assert approval["effect"] == ToolEffect.WRITE.value
+        assert approval["scope"]["paths"] == ["src/main.py"]
+        assert target.read_text(encoding="utf-8").endswith('return "needle"\n')
+
+        decision = client.post(
+            f"/v1/sessions/{session_id}/approvals/{approval['request_id']}/decision",
+            headers=headers,
+            json={"outcome": "ALLOW"},
+        )
+        assert decision.status_code == 200
+        assert decision.json()["outcome"] == "ALLOW"
+
+        terminal = None
+        for _ in range(1_000):
+            run_view = client.get(
+                f"/v1/sessions/{session_id}/runs/{run_id}",
+                headers=headers,
+            ).json()
+            if run_view["status"] in {
+                status.value for status in RunStatus if status.is_terminal
+            }:
+                terminal = run_view
+                break
+            time.sleep(0.01)
+        assert terminal is not None
+        assert terminal["status"] == RunStatus.SUCCEEDED.value, terminal.get("error")
+        assert terminal["output_text"] == "production patch, test and diff completed"
+
+    async def persisted_facts() -> tuple[object, ...]:
+        async with SqliteStore(database_path) as store:
+            calls = await store.list_tool_calls(run_id)
+            results = []
+            for call in calls:
+                results.append(await store.get_tool_result(call.call_id))
+            approvals = await store.list_approvals(owner_id=owner_id, run_id=run_id)
+            decisions = []
+            for item in approvals:
+                decisions.append(
+                    await store.get_approval_decision(
+                        item.request_id,
+                        owner_id=owner_id,
+                    )
+                )
+            change_sets = await store.list_change_sets(run_id=run_id)
+            snapshots = await store.list_snapshots("ws_project", owner_id=owner_id)
+            return (
+                calls,
+                tuple(results),
+                approvals,
+                tuple(decisions),
+                change_sets,
+                snapshots,
+            )
+
+    calls, results, approvals, decisions, change_sets, snapshots = asyncio.run(
+        persisted_facts()
+    )
+    assert [call.tool_name for call in calls] == [
+        "apply_patch",
+        "run_targeted_test",
+        "get_diff",
+    ]
+    assert all(call.status is ToolCallStatus.SUCCEEDED for call in calls)
+    assert all(result.status is ToolCallStatus.SUCCEEDED for result in results)
+    assert len(approvals) == len(decisions) == len(change_sets) == 1
+    assert decisions[0].outcome.value == "ALLOW"
+    assert len(snapshots) == 2
+    assert target.read_text(encoding="utf-8").endswith('return "patched"\n')
+    assert len(adapter.requests) == 4
 
 
 @pytest.mark.asyncio

@@ -27,10 +27,21 @@ from prp_runtime.tools.command import (
     CommandRunner,
     build_targeted_test_definition,
 )
-from prp_runtime.tools.diff import DiffToolRunner, build_diff_definitions
+from prp_runtime.tools.diff import (
+    DiffManifestMismatchError,
+    DiffResult,
+    DiffToolRunner,
+    build_diff_definitions,
+)
 from prp_runtime.tools.executor import ToolExecutor
 from prp_runtime.tools.filesystem import build_filesystem_registry
-from prp_runtime.tools.patch import PatchRunner, build_patch_definition
+from prp_runtime.tools.models import ToolCall
+from prp_runtime.tools.patch import (
+    PatchApplyResult,
+    PatchRequest,
+    PatchRunner,
+    build_patch_definition,
+)
 from prp_runtime.tools.registry import ToolDefinition, ToolRegistry
 from prp_runtime.tools.search import SearchRunner, build_search_definition
 from prp_runtime.workspace.backend import WorkspaceBackend
@@ -69,6 +80,61 @@ class ToolRuntimeState(StrEnum):
 
 class ToolRuntimeError(ValueError):
     """A workspace tool runtime cannot be safely composed or used."""
+
+
+class _DeferredDiffRunner(DiffToolRunner):
+    """Expose a stable tool catalog, then bind the approved patch result."""
+
+    def __init__(
+        self,
+        base_manifest: SnapshotManifest,
+        manifest_provider: Callable[[], SnapshotManifest],
+    ) -> None:
+        self._base_manifest = base_manifest
+        self._manifest_provider = manifest_provider
+        self._bound_change_set: ChangeSet | None = None
+        self._runner: DiffToolRunner | None = None
+
+    def bind(self, change_set: ChangeSet) -> None:
+        if self._bound_change_set is not None:
+            if self._bound_change_set != change_set:
+                raise ToolRuntimeError("diff runtime is already bound to another ChangeSet")
+            return
+        self._bound_change_set = change_set
+        self._runner = DiffToolRunner(
+            change_set,
+            base_manifest=self._base_manifest,
+            manifest_provider=self._manifest_provider,
+        )
+
+    def get_diff(self) -> DiffResult:
+        if self._runner is None:
+            raise DiffManifestMismatchError("diff is unavailable before a successful patch")
+        return self._runner.get_diff()
+
+    def get_status(self) -> DiffResult:
+        if self._runner is None:
+            raise DiffManifestMismatchError("status is unavailable before a successful patch")
+        return self._runner.get_status()
+
+
+class _DiffBindingPatchRunner(PatchRunner):
+    """Bind the persisted ChangeSet only after PatchRunner commits atomically."""
+
+    def __init__(
+        self,
+        runner: PatchRunner,
+        store: SqliteStore,
+        diff_runner: _DeferredDiffRunner,
+    ) -> None:
+        self._runner = runner
+        self._store = store
+        self._diff_runner = diff_runner
+
+    async def apply(self, call: ToolCall, request: PatchRequest) -> PatchApplyResult:
+        result = await self._runner.apply(call, request)
+        self._diff_runner.bind(await self._store.get_change_set(result.change_set_id))
+        return result
 
 
 class WorkspaceToolRuntime:
@@ -289,7 +355,13 @@ class WorkspaceToolRuntimeFactory:
                     )
                 )
 
+            deferred_diff_runner: _DeferredDiffRunner | None = None
             if ResourceAccess.READ in scope.grant.access:
+                current_manifest = manifest_provider or (
+                    resolved_workspace.snapshot_manifest
+                    if slot_context is None
+                    else backend.snapshot_manifest
+                )
                 if change_set is not None:
                     if (
                         change_set.workspace_id != scope.workspace_id
@@ -306,6 +378,12 @@ class WorkspaceToolRuntimeFactory:
                             )
                         )
                     )
+                elif ResourceAccess.WRITE in scope.grant.access:
+                    deferred_diff_runner = _DeferredDiffRunner(
+                        base_manifest,
+                        current_manifest,
+                    )
+                    definitions.extend(build_diff_definitions(deferred_diff_runner))
 
             if ResourceAccess.WRITE in scope.grant.access:
                 patch_runner = PatchRunner(
@@ -315,6 +393,12 @@ class WorkspaceToolRuntimeFactory:
                     base_snapshot=snapshot,
                     base_manifest=base_manifest,
                 )
+                if deferred_diff_runner is not None:
+                    patch_runner = _DiffBindingPatchRunner(
+                        patch_runner,
+                        store,
+                        deferred_diff_runner,
+                    )
                 definitions.append(build_patch_definition(patch_runner))
                 try:
                     command_runner = CommandRunner(
@@ -411,6 +495,12 @@ class ScopedAgentToolExecutor:
         self._scope = scope
         self._runtime_provider = runtime_provider
         self._runtime: WorkspaceToolRuntime | None = None
+
+    async def provider_catalog(self) -> tuple[ProviderToolDescriptor, ...]:
+        """Load the same workspace-bound public catalog used for execution."""
+        if self._runtime is None:
+            self._runtime = await self._runtime_provider(self._scope)
+        return self._runtime.catalog
 
     async def execute(
         self,

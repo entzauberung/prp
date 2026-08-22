@@ -71,6 +71,24 @@
     "fast.vanyospace.com",
     "open.bigmodel.cn"
   ],
+  "optional_profiles": [
+    {
+      "alias": "TERRA_GPT",
+      "vendor": "terra",
+      "protocol": "OPENAI_RESPONSES",
+      "base_url_env": "PRP_EXTERNAL_TERRA_GPT_BASE_URL",
+      "model_env": "PRP_EXTERNAL_TERRA_GPT_MODEL",
+      "api_key_env": "PRP_EXTERNAL_TERRA_GPT_API_KEY",
+      "allowed_host_env": "PRP_EXTERNAL_TERRA_GPT_ALLOWED_HOST",
+      "status": "TERRA_NOT_CONFIGURED",
+      "activation_requires": [
+        "exact model metadata",
+        "exact HTTPS base URL",
+        "exact credential mapping",
+        "explicit allowed host admission"
+      ]
+    }
+  ],
   "out_of_scope": [
     {
       "model_id": "glm-4v-plus",

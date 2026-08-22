@@ -19,13 +19,6 @@ from urllib.parse import urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
-from prp_runtime.app import create_app
-from prp_runtime.domain.enums import AttemptStatus, ModelRole, RunStatus
-from prp_runtime.providers.base import ModelProfile, ProviderProtocol
-from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
-from prp_runtime.settings import Settings
-from prp_runtime.storage.sqlite import SqliteStore
-
 from external_tests.result_ledger import LedgerEntry, LedgerStore
 from external_tests.support import (
     BudgetCounter,
@@ -35,6 +28,12 @@ from external_tests.support import (
     create_external_http_client,
     validate_external_url,
 )
+from prp_runtime.app import create_app
+from prp_runtime.domain.enums import AttemptStatus, ModelRole, RunStatus
+from prp_runtime.providers.base import ModelProfile, ProviderProtocol
+from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
+from prp_runtime.settings import Settings
+from prp_runtime.storage.sqlite import SqliteStore
 
 ZHIPU_ALIASES = (
     "ZHIPU_GLM_46V",

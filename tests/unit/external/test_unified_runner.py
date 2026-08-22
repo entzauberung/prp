@@ -7,11 +7,9 @@ output redaction, and subprocess invocation mechanics.
 from __future__ import annotations
 
 import importlib.util
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
 
 import pytest
 
@@ -37,20 +35,14 @@ _RUNNER_SPEC.loader.exec_module(_RUNNER)
 @pytest.fixture
 def dummy_credentials():
     """Create dummy credentials for testing."""
-    return _LOADER.parse_credentials_text(
-        """\
-## DeepSeek API
-This is the DeepSeek credential.
-sk-deepseek-dummy-key-12345678901234567890
-
-## Vanyospace OpenAI / Luna GPT-5.6
-This is the Luna/OpenAI credential for Vanyospace.
-sk-openai-dummy-key-12345678901234567890
-
-## Vanyospace Anthropic / Claude Sonnet 5
-This is the Claude/Anthropic credential for Vanyospace.
-sk-anthropic-dummy-key-12345678901234567890
-"""
+    return _LOADER.load_credentials_from_env(
+        {
+            "PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_API_KEY": "deepseek-dummy-key",
+            "PRP_EXTERNAL_DEEPSEEK_FLASH_RESPONSES_API_KEY": "deepseek-dummy-key",
+            "PRP_EXTERNAL_DEEPSEEK_FLASH_ANTHROPIC_API_KEY": "deepseek-dummy-key",
+            "PRP_EXTERNAL_LUNA_GPT_56_API_KEY": "openai-dummy-key",
+            "PRP_EXTERNAL_CLAUDE_SONNET_5_API_KEY": "anthropic-dummy-key",
+        }
     )
 
 
@@ -85,6 +77,21 @@ def test_stage_registry_contains_authoritative_stages() -> None:
         assert "--" not in stage_spec.pytest_args
 
 
+def test_interface_candidate_matrix_is_protocol_scoped() -> None:
+    assert _RUNNER.INTERFACE_CANDIDATES["OPENAI_CHAT"] == (
+        "DEEPSEEK_FLASH_CHAT",
+    )
+    assert _RUNNER.INTERFACE_CANDIDATES["OPENAI_RESPONSES"] == (
+        "DEEPSEEK_FLASH_RESPONSES",
+        "LUNA_GPT_56",
+        "TERRA_GPT",
+    )
+    assert _RUNNER.INTERFACE_CANDIDATES["ANTHROPIC_MESSAGES"] == (
+        "DEEPSEEK_FLASH_ANTHROPIC",
+        "CLAUDE_SONNET_5",
+    )
+
+
 def test_child_env_clears_ambient_profiles_and_proxies(dummy_credentials) -> None:
     """Child env should remove ambient PRP_EXTERNAL_ vars and proxies."""
     env = _RUNNER.build_child_env(
@@ -112,17 +119,17 @@ def test_child_env_adds_all_profiles(dummy_credentials) -> None:
 
     # Check DeepSeek profiles (all use deepseek credential)
     assert "PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_API_KEY" in env
-    assert env["PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_API_KEY"].startswith("sk-deepseek-")
+    assert env["PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_API_KEY"] == "deepseek-dummy-key"
     assert "PRP_EXTERNAL_DEEPSEEK_FLASH_RESPONSES_API_KEY" in env
     assert "PRP_EXTERNAL_DEEPSEEK_FLASH_ANTHROPIC_API_KEY" in env
 
     # Check Luna profile (uses openai credential)
     assert "PRP_EXTERNAL_LUNA_GPT_56_API_KEY" in env
-    assert env["PRP_EXTERNAL_LUNA_GPT_56_API_KEY"].startswith("sk-openai-")
+    assert env["PRP_EXTERNAL_LUNA_GPT_56_API_KEY"] == "openai-dummy-key"
 
     # Check Claude profile (uses anthropic credential)
     assert "PRP_EXTERNAL_CLAUDE_SONNET_5_API_KEY" in env
-    assert env["PRP_EXTERNAL_CLAUDE_SONNET_5_API_KEY"].startswith("sk-anthropic-")
+    assert env["PRP_EXTERNAL_CLAUDE_SONNET_5_API_KEY"] == "anthropic-dummy-key"
 
 
 def test_stage_uses_one_structured_child_and_redacts_output(monkeypatch, dummy_credentials) -> None:
@@ -134,8 +141,8 @@ def test_stage_uses_one_structured_child_and_redacts_output(monkeypatch, dummy_c
         captured["kwargs"] = kwargs
         return SimpleNamespace(
             returncode=0,
-            stdout="child says sk-deepseek-dummy-key-12345678901234567890",
-            stderr="child err sk-openai-dummy-key-12345678901234567890",
+            stdout="child says deepseek-dummy-key",
+            stderr="child err openai-dummy-key",
         )
 
     monkeypatch.setattr(_RUNNER.subprocess, "run", fake_run)
@@ -151,9 +158,12 @@ def test_stage_uses_one_structured_child_and_redacts_output(monkeypatch, dummy_c
     ]
     assert captured["kwargs"]["shell"] is False
     assert captured["kwargs"]["cwd"] == _RUNNER.REPO_ROOT
-    assert captured["kwargs"]["env"]["PRP_EXTERNAL_LUNA_GPT_56_API_KEY"].startswith("sk-openai-")
-    assert "sk-deepseek-dummy-key" not in result.stdout
-    assert "sk-openai-dummy-key" not in result.stderr
+    assert (
+        captured["kwargs"]["env"]["PRP_EXTERNAL_LUNA_GPT_56_API_KEY"]
+        == "openai-dummy-key"
+    )
+    assert "deepseek-dummy-key" not in result.stdout
+    assert "openai-dummy-key" not in result.stderr
 
 
 def test_child_exit_code_and_timeout_are_propagated(monkeypatch, dummy_credentials) -> None:
@@ -210,15 +220,15 @@ def test_stage_specific_timeouts_override_default(monkeypatch, dummy_credentials
 def test_redaction_removes_all_credential_types(dummy_credentials) -> None:
     """Output redaction should remove all three credential classes."""
     text = (
-        "DeepSeek: sk-deepseek-dummy-key-12345678901234567890\n"
-        "OpenAI: sk-openai-dummy-key-12345678901234567890\n"
-        "Anthropic: sk-anthropic-dummy-key-12345678901234567890"
+        "DeepSeek: deepseek-dummy-key\n"
+        "OpenAI: openai-dummy-key\n"
+        "Anthropic: anthropic-dummy-key"
     )
     redacted = _RUNNER._redact_output(text, dummy_credentials)
 
-    assert "sk-deepseek-dummy-key" not in redacted
-    assert "sk-openai-dummy-key" not in redacted
-    assert "sk-anthropic-dummy-key" not in redacted
+    assert "deepseek-dummy-key" not in redacted
+    assert "openai-dummy-key" not in redacted
+    assert "anthropic-dummy-key" not in redacted
     assert "<redacted>" in redacted
 
 

@@ -4,7 +4,12 @@
 
 `0.0.2` 是当前包身份。数据库 schema 直接替换，pre-0.1 数据不提供向后兼容或迁移。
 
-## [0.0.2] - Unreleased
+## [0.0.2] - 2026-08-22
+
+### Legal
+
+- License is Apache-2.0. The earlier dual-license wording was replaced; see
+  `NOTICE` and `TRADEMARKS.md` for attribution and branding boundaries.
 
 ### Added
 
@@ -23,14 +28,15 @@
 
 ### Verification
 
-- v0.0.2 package identity、最小云端代码任务（list/search/read/patch/targeted test/diff）和 API/Bridge 定向门禁通过。
+- v0.0.2 package identity、最小云端代码任务（list/search/read/patch/targeted test/diff）和 API/Bridge 定向门禁的源码与定向证据已记录。
+- 相关证据来自仓库 conformance/integration tests 与 `ai/RELEASE-EVIDENCE-MATRIX.md`、`ai/PROTOCOL-VALIDATION.json`、`ai/PROVIDER-CAPABILITIES.json`；这些记录不是持续 CI、benchmark、SLA 或所有 provider 通过证明。
 
 ## [0.0.1] - 未发布
 
 ### Added
 
 - 项目元数据 `pyproject.toml`，Python 要求 `>=3.12`。
-- 双许可证 `MIT OR Apache-2.0` 与 `NOTICE`。
+- Apache-2.0 许可证与 `NOTICE`。
 - Python 包骨架 `src/prp_runtime`，暴露包身份信息。
 - 严格设置层 `Settings`：仅接受白名单 `PRP_` 环境变量，未识别变量直接报错；模型 profile 经 JSON 环境变量注入，`api_key` 以 `SecretStr` 持有，不出现在 `repr` 或序列化中。
 - 原生领域合同：`NativeRunRequest`、`Run`、`WorkUnit`、`Attempt`、`Artifact`、`Evidence`、`Budget`、`Usage`、`ControllerDecision`，全部 frozen 且拒绝未知字段，无 chain-of-thought 字段。

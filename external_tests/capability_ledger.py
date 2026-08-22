@@ -35,6 +35,7 @@ class CapabilityEntry:
     error_code: str | None
     output_sha256: str | None
     recorded_at: str
+    diagnostic: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.status not in _STATUSES:

@@ -1,179 +1,120 @@
 # PRP Runtime
 
-Progressive Reasoning Protocol 的参考运行时。当前包版本为 `0.0.2`，面向单实例、SQLite 和受控 Workspace 的云端代码 Agent。
+> 让模型推理不再只是一次回答，而成为可验证、可恢复、可审批的执行过程。
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
-[![Package v0.0.2](https://img.shields.io/badge/package-v0.0.2-green)](https://github.com)
-[![Tests 1867 passed](https://img.shields.io/badge/tests-1867%20passed-brightgreen)](https://github.com)
-[![License MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache-2.0-orange)](https://github.com)
+PRP Runtime 是 Progressive Reasoning Protocol 的参考运行时。它把模型、工具、权限、工作区和验证组织成一条可追踪的执行链，面向受控 Workspace 中的云端代码 Agent。
 
-[简体中文](README.md) | [English](README.en.md)
+当前版本：`0.0.2` · Python `3.12+` · 单实例 SQLite · Apache-2.0
 
-## v0.0.2 — 三方向交付
+[English](README.en.md)
 
-> 82 源码模块 · 82 测试文件 · 1867 tests passed · ruff clean · mypy 82 files passed
+## 为什么需要 PRP
 
-| 方向 | 核心交付 | 门禁 |
-|------|----------|------|
-| **A. 协议加固** | final_node · lineage · fingerprint · reservation · supervisor · event replay · recovery | conformance ✓ |
-| **B. 云端 Agent** | Session/Run · ToolCall/Approval 循环 · Policy ALLOW/ASK/DENY · Sandbox · Workspace · Bridge | Agent E2E ✓ |
-| **C. 可控并行与真正 Progressive** | 独立 Slot · Git 三方合并 · AST 冲突检测 · 安全复用 · 有限修订 | conflict/merge/revision ✓ |
+普通模型 API 解决的是：
 
----
-
-## Progressive Reasoning 如何真正工作
-
-PRP 的独特价值不是"多步推理"——是**有证据、可回退、可并行的确定性推理控制**。
-
-```
-Planner 提案 (final_node 声明终态)
- │
- ├─ compile → DAG (content + dependency fingerprint)
- │
- ├─ Coordinator 分批 (冲突检测 → 读写分离 → 并行调度)
- │   ├── Slot A ──┐
- │   ├── Slot B ──┼── 独立隔离写入 → ChangeSet
- │   └── Slot C ──┘
- │
- ├─ Git 三方合并 → 统一 Snapshot
- │
- ├─ Verifier 全局验证 (targeted test + rule check)
- │
- └─ 失败？
-     ├── lineage + fingerprint → 安全复用已通过节点
-     ├── Planner revision (有限次数, 预算控制)
-     └── 新 graph version → 回到 Coordinator
+```text
+发送消息 -> 获得回答
 ```
 
-关键区别：每个写节点在独立 Slot 执行，合并由 Git 三方合并而非覆盖，复用由内容指纹而非时间戳决定，停止由预算和修订上限而非模型判断决定。
+真实工程任务还需要回答：这一步为什么可以执行？什么证据证明它完成了？失败后应该重试、切换、回滚还是停止？写文件前谁批准？重启后能否恢复？
 
----
+PRP 管的不是模型“想了多少”，而是推理如何被计划、执行、验证、修订和停止。
 
-## 四策略说明
+## 三个方向
 
-| 策略 | 何时使用 | 做什么 |
-|------|----------|--------|
-| DIRECT | 简单请求 | 单 WorkUnit、单 Attempt；Worker 返回 Artifact 后执行 RuleVerifier |
-| CASCADE | 需要分层 | 按 profile 链条执行，逐层验证 |
-| PLANNED | 需要图调度 | 编译执行图，Planner 提出计划，Worker 执行 |
-| PROGRESSIVE | 需要证据 | 逐步推进；独立 Slot 并行 → Git 合并 → 验证 → 复用/修订循环 |
+### 协议与事实
 
-## Agent 工作流
+Responses、Chat Completions 和 Anthropic Messages 的声明子集进入同一个 Native Runtime。Run、Attempt、Artifact、Evidence、Event 和 Usage 都能成为可审计事实，并支持 SSE 回放、取消、恢复、预算和错误分类。
 
-v0.0.2 的 Native Session 将一次授权 Workspace 与多个 Run 关联。云端最小代码任务的受控工具子集为：
+### Agent 与工具
 
-- `list_files`、`read_file`、`search_text`：只读 Workspace 观察。
-- `apply_patch`：基于 Snapshot 产生新的 Snapshot 和持久化 ChangeSet，写入必须经过策略和批准。
-- `run_targeted_test`：只执行服务端预注册的 TEST 命令，使用结构化 argv、固定 Workspace cwd、超时和输出上限。
-- `get_diff`、`get_status`：校验 ChangeSet 与当前 Snapshot 后返回受限 diff/status。
+Agent 只能使用注册工具：`list_files`、`read_file`、`search_text`、`apply_patch`、`run_targeted_test`、`get_diff`、`get_status`。
 
-Agent mode、隔离和执行位置是独立维度：
+写操作经过 Policy 和 Approval，patch 产生 Snapshot 与 ChangeSet，测试只能运行预注册的结构化命令。模型不能自行提升权限，也不能获得任意 shell。
 
-| 维度 | 可选值 | 事实 |
-| --- | --- | --- |
-| Agent mode | `NORMAL`、`AUTO`、`PLAN`、`YOLO` | `PLAN` 无副作用；`AUTO` 仅自动放行低风险命令；未知或越界请求由确定性 Policy 拒绝或请求批准。 |
-| Isolation | `SANDBOXED`、`HOST` | `SANDBOXED` 必须使用真实 Linux `bubblewrap`；缺少能力不能伪装成沙箱。`HOST` 只在用户明确选择且服务端允许时可用。 |
-| Location | `CLOUD`、`BRIDGE` | Cloud 使用服务端授权 Workspace；Bridge 是无模型的本地传输/游标客户端，不把本地绝对路径发送给服务端。 |
+### 真正的 Progressive Reasoning
 
-每次 ToolCall、Approval、ToolResult、Snapshot、ChangeSet、Evidence、Event 和 Usage 都是可审计事实。Provider 只能通过公开 ToolCall/ToolResult 推进，不保存 CoT，也不能自行提升权限。
+```text
+Planner 提案 -> 编译 DAG -> 独立 Slot 执行 -> Evidence 验证
+       -> Git 三方合并 -> 有限修订 -> 新 graph version
+```
 
-### DEV readiness 与生产 handoff
+Progressive 不是“再问模型一次”：新证据出现才允许修订；通过节点按 lineage 和内容 fingerprint 复用；写入在独立 Slot 中进行；合并使用三方合并；revision、attempt、token 和预算都有上限；最终状态由规则和验证决定。
 
-DEV 轨只用于合同、账本、Agent、ChangeSet、冲突、AST、merge 和 Progressive dry-run 开发。DEV 结果必须带 `dev_only=true`；临时 HOST 目录、Bridge 路径边界和 text-only transport 都不是 OS sandbox，也不能证明 mount、user namespace、network 或 pid 隔离。
+## 四种策略
 
-生产 handoff 的前置条件保持独立：
+| 策略 | 适合场景 | 核心行为 |
+|---|---|---|
+| `DIRECT` | 简单任务 | 一个 WorkUnit、一次 Attempt、一次验证 |
+| `CASCADE` | 需要备用模型 | 仅在可重试失败时进入下一 profile |
+| `PLANNED` | 需要任务图 | Planner 提案 DAG，Worker 按依赖执行 |
+| `PROGRESSIVE` | 需要证据和修订 | 执行、合并、验证、复用和有限 revision |
 
-- 当前合格 runner 的真实 `SANDBOXED` gate 已通过：bubblewrap staged loader、mount、network、pid、workspace sentinel、runtime RO、reap 和资源定向事实均已验证。
-- Cloud Agent 定向 E2E 已通过 `create_app()` production composition，覆盖 read/search、approval、patch、targeted test、diff、merge 和 final failure semantics。
-- DEV 结果仍必须带 `dev_only=true`；`DEV_READY_FOR_PROD_ENV` 只表示 DEV 合同和定向事实已整理，不能替代真实 L3 或生产 E2E。
-- handoff 不携带绝对临时路径、秘密、CoT 或生产 promotion；生产 promotion 仍须经过真实生产 gate 和既有审批。
-
-## 配置
-
-- **PRP Native API**
-  - `POST /v1/sessions`：创建 owner-scoped Workspace Session。
-  - `POST /v1/sessions/{session_id}/runs`：异步创建 Run，Session 的 Agent options 由服务端绑定。
-  - `GET /v1/sessions/{session_id}/runs/{run_id}`：读取 Run 状态、结果文本、用量与错误。
-  - `GET /v1/sessions/{session_id}/runs/{run_id}/events`：SSE 事件流 + 游标回放。
-  - `POST /v1/sessions/{session_id}/runs/{run_id}/approve`：同意/拒绝 Policy 要求批准的 ToolCall。
-- **OpenAI Responses Binding**: `POST /v1/responses`（声明子集）
-- **OpenAI Chat Completions Binding**: `POST /v1/chat/completions`（声明子集）
-- **Anthropic Messages Binding**: `POST /v1/messages`（声明子集）
-
-所有配置通过服务端环境变量 `PRP_*`；不认识的变量报错而非忽略。
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PRP_HOST` | `0.0.0.0` | 监听地址 |
-| `PRP_PORT` | `8000` | 监听端口 |
-| `PRP_DATABASE` | `./prp.db` | SQLite 路径 |
-| `PRP_LOG_LEVEL` | `INFO` | 日志级别 |
-| `PRP_OPENAI_API_KEY` | — | Provider key |
-| `PRP_OPENAI_BASE_URL` | `https://api.openai.com/v1` | Provider endpoint |
-| `PRP_OPENAI_MODEL` | `gpt-4o` | Provider model |
-| `PRP_PROFILES` | — | JSON profile chain |
-| `PRP_AUTH_TOKEN` | — | Bearer token for single-tenant auth |
-| `PRP_WORKSPACE_ROOT` | — | Server Workspace base path |
-| `PRP_SANDBOX_BINARY` | `bwrap` | bubblewrap binary |
-| `PRP_TOOL_TIMEOUT` | `30` | Tool execution timeout (seconds) |
-| `PRP_MAX_AGENT_TURNS` | `20` | Max Agent loop turns per Run |
-
-## 安装与运行
+## 最小使用
 
 ```bash
-uv pip install .                  # 从源码安装
-uv run python -m prp_runtime      # 打印版本 (0.0.2)
+uv pip install .
 ```
 
-ASGI 启动：
-
 ```bash
-PRP_OPENAI_API_KEY=sk-... \
-PRP_AUTH_TOKEN=secret \
-PRP_WORKSPACE_ROOT=/srv/workspaces \
+PRP_PROFILES='[{"alias":"worker","provider":"openai","model":"gpt-4o"}]' \
+PRP_OPENAI_API_KEY='<YOUR_PROVIDER_KEY>' \
+PRP_AUTH_TOKEN='<YOUR_SERVICE_TOKEN>' \
+PRP_WORKSPACE_ROOT='/srv/workspaces' \
 uvicorn prp_runtime.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
-**注意**：`python -m prp_runtime` 只打印包版本，**不是**服务启动器。使用上面的 ASGI 示例启动。
+`python -m prp_runtime` 只打印包版本，不启动服务。
 
-**配置安全边界**：LLM profile 和凭据只从 `PRP_*` 环境变量读取；请求只能引用服务端已注册的 profile 和 Workspace。
+## API
 
-### 无模型 Bridge
+- `POST /v1/sessions`：创建授权 Session 与 Workspace 绑定
+- `POST /v1/sessions/{session_id}/runs`：创建异步 Run
+- `GET /v1/sessions/{session_id}/runs/{run_id}`：读取状态、结果和用量
+- `GET /v1/sessions/{session_id}/runs/{run_id}/events`：SSE 事件与游标回放
+- `POST /v1/sessions/{session_id}/runs/{run_id}/approve`：审批 ToolCall
+- `POST /v1/responses`：OpenAI Responses 声明子集
+- `POST /v1/chat/completions`：OpenAI Chat Completions 声明子集
+- `POST /v1/messages`：Anthropic Messages 声明子集
 
-Bridge 不运行本地模型，只保存服务端返回的 Session/Run 标识、事件游标和幂等结果指纹。它可以为本地 Workspace 提供路径边界，但这不是 OS sandbox；实际工具授权仍由服务端 Policy 和 Approval 控制。
+## 适用场景
 
-```bash
-uv run prp --base-url http://127.0.0.1:8000 --token-stdin connect workspace-alias --access READ --agent-mode PLAN
-uv run prp --base-url http://127.0.0.1:8000 run "inspect the authorized workspace"
-uv run prp --base-url http://127.0.0.1:8000 resume
-```
+代码仓库只读审查、问题定位、审批式单文件修复、预注册测试任务、多模型 fallback、预算控制、可回放 Agent 流程，以及需要并行、冲突检测和有限修订的工程任务。
 
-Bridge 命令只提交 Workspace alias 和相对任务输入；本地绝对路径不会发给服务端。`HOST YOLO` 需要交互式显式确认，不能由模型升级。
+PRP 不是任意 shell，不是模型训练平台，不提供生产 SLA，也不承诺完整第三方 API 兼容。`SANDBOXED` 是需要真实 Linux `bubblewrap` 的 Sandbox isolation 模式；Bridge 的路径边界不等于 OS sandbox。
 
-### API 概览
-- `POST /v1/sessions`、`POST /v1/sessions/{session_id}/runs`：授权 Session 和异步 Run
-- `GET /v1/sessions/{session_id}/runs/{run_id}/events`：持久事件 SSE 与游标回放
-- `POST /v1/responses`：声明子集的 OpenAI Responses 映射
-- `POST /v1/chat/completions`：声明子集的 OpenAI Chat Completions 映射
-- `POST /v1/messages`：声明子集的 Anthropic Messages 映射
+## 与普通协议的不同
 
-### 测试与验证
-定向示例（测试已实现路径）：
+- 模型 API 规定消息格式；PRP 规定一次任务如何推进。
+- 工具协议描述“能调用什么”；PRP 还记录审批、证据、快照、变更集和停止条件。
+- 普通多轮反思依赖模型继续判断；PRP 让 Evidence、状态机和预算决定是否修订。
+- 普通并行容易互相覆盖；PRP 用 Slot、ChangeSet、fingerprint 和三方合并控制并行。
 
-```bash
-uv run pytest tests/unit/control/test_direct.py -q
-```
+## 研究脉络
 
-测试只覆盖已实现路径，禁止真实网络调用；本 README 不把静态历史结果或本地 benchmark 写成实时 CI/SLA。
+以下是相关研究方向参考，不是 PRP 的原创来源，也不代表本项目复现了论文或完成了 benchmark：
 
-### 项目边界
-- 非模型训练、微调或 GPU serving 平台
-- 不实现完整 Codex/Claude Code、MCP、A2A、浏览器或任意网络协议
-- Tool 只接受注册的相对路径、结构化 argv 和受限结果；没有任意 shell
-- Cloud 使用服务端 Workspace；Bridge 是无模型传输层，路径边界不等于 OS sandbox
-- 无多租户计费、SSO、分布式队列或 Kubernetes 编排
-- 无生产 SLA、无限推理或完整第三方 API 字段承诺
+- *ReAct: Synergizing Reasoning and Acting in Language Models*，Shunyu Yao et al., 2023：<https://arxiv.org/abs/2210.03629>
+- *Tree of Thoughts: Deliberate Problem Solving with Large Language Models*，Shunyu Yao et al., 2023：<https://arxiv.org/abs/2305.10601>
+- *Reflexion: Language Agents with Verbal Reinforcement Learning*，Noah Shinn et al., 2023：<https://arxiv.org/abs/2303.11366>
+- *Self-Refine: Iterative Refinement with Self-Feedback*，Aman Madaan et al., 2023：<https://arxiv.org/abs/2303.17651>
+- *Graph of Thoughts: Solving Elaborate Problems with Large Language Models*，Maciej Besta et al., 2024：<https://arxiv.org/abs/2308.09687>
+- *Toolformer: Language Models Can Teach Themselves to Use Tools*，Timo Schick et al., 2023：<https://arxiv.org/abs/2302.04761>
+- *SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering*，John Yang et al., 2024：<https://arxiv.org/abs/2405.15793>
 
-## 许可证
+PRP 的侧重点是工程协议：把行动、修订、图和工具变成持久、可验证、可恢复的事实。
 
-采用 `MIT OR Apache-2.0` 双许可，任选其一。详见 [LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE) 和 [NOTICE](NOTICE)。
+## 开源与现实 / Open Source & Reality
+
+PRP 由一名独立开发者维护。接下来我将从甘肃农村前往外地租房生活，并通过普通工作承担生活和 API 测试成本。工作会切碎开发时间，v0.0.3 可能不会很快到来，但开发不会停止。我无法始终把全部时间投入开源，却会长期维护这个项目。使用、反馈、贡献或赞助，都会直接转化为开发时间和测试资源。
+
+## 许可证与边界
+
+本项目采用 Apache-2.0，详见 [LICENSE-APACHE](LICENSE-APACHE)、[NOTICE](NOTICE) 和 [TRADEMARKS.md](TRADEMARKS.md)。Apache-2.0 允许商业使用和分发修改版，但项目名称和官方身份不得被用于制造冒充或背书暗示。当前版本是单实例 SQLite 参考实现，不提供多租户计费、SSO、分布式队列、Kubernetes、完整 Codex/Claude Code/MCP/A2A 兼容或生产 SLA。
+
+---
+
+<p align="center">
+  <strong>二十七步天注定，逆流河上任我行。</strong><br>
+  <sub>Искров · 甘肃</sub>
+</p>

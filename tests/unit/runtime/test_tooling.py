@@ -160,6 +160,8 @@ def test_factory_binds_the_complete_cloud_registry_for_read_write_grant(
         "list_files",
         "read_file",
         "search_text",
+        "get_diff",
+        "get_status",
         "apply_patch",
         "run_targeted_test",
     )

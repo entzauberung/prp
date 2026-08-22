@@ -4,8 +4,8 @@ import pytest
 
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.domain.errors import ErrorCode, ProviderError
-from prp_runtime.providers.base import ModelProfile, ProviderProtocol
 from prp_runtime.providers.anthropic import AnthropicMessagesProvider
+from prp_runtime.providers.base import ModelProfile, ProviderProtocol
 from prp_runtime.providers.factory import build_provider_adapter
 from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
 

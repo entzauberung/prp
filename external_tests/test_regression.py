@@ -7,9 +7,9 @@ import pytest
 @pytest.mark.asyncio
 async def test_regression_basic_completion(live_profile_deepseek):
     """Regression: basic completion flow must work."""
+    from prp_runtime.domain.enums import ModelRole
     from prp_runtime.providers.base import ModelProfile, ProviderProtocol, ProviderRequest
     from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
-    from prp_runtime.domain.enums import ModelRole
 
     profile = ModelProfile(
         alias="regression_deepseek",
@@ -47,9 +47,9 @@ async def test_regression_basic_completion(live_profile_deepseek):
 @pytest.mark.asyncio
 async def test_regression_error_handling(live_profile_deepseek):
     """Regression: error handling must be robust."""
+    from prp_runtime.domain.enums import ModelRole
     from prp_runtime.providers.base import ModelProfile, ProviderProtocol, ProviderRequest
     from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
-    from prp_runtime.domain.enums import ModelRole
 
     profile = ModelProfile(
         alias="regression_error",
@@ -82,9 +82,9 @@ async def test_regression_error_handling(live_profile_deepseek):
 @pytest.mark.asyncio
 async def test_regression_protocol_compatibility(live_profile_anthropic):
     """Regression: Anthropic Messages protocol must remain compatible."""
-    from prp_runtime.providers.base import ModelProfile, ProviderProtocol, ProviderRequest
-    from prp_runtime.providers.anthropic import AnthropicProvider
     from prp_runtime.domain.enums import ModelRole
+    from prp_runtime.providers.anthropic import AnthropicProvider
+    from prp_runtime.providers.base import ModelProfile, ProviderProtocol, ProviderRequest
 
     profile = ModelProfile(
         alias="regression_anthropic",

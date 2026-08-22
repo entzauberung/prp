@@ -1,6 +1,7 @@
 """Authenticated Native Agent API integration coverage."""
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -398,6 +399,52 @@ def test_production_app_read_path_uses_scoped_runtime(
         assert calls[0]["tool_name"] == "read_file"
         assert calls[0]["status"] == ToolCallStatus.SUCCEEDED.value
         assert len(adapter.requests) == 2
+
+
+def test_current_planner_spawn_agent_workspace_lifecycle_is_session_scoped(
+    tmp_path: Path,
+) -> None:
+    """Reproduce current workspace timing without creating an eager child workspace."""
+    workspace_root = tmp_path / "current-lifecycle-workspace"
+    workspace_root.mkdir()
+    (workspace_root / "README.md").write_text("production read\n", encoding="utf-8")
+    adapter = ProductionReadAdapter()
+    app = build_app(tmp_path, workspace_root=workspace_root, adapter=adapter)
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/v1/sessions",
+            json={"workspace_id": "ws_project", "access": ["READ"]},
+        ).status_code == 401
+        session = client.post(
+            "/v1/sessions",
+            headers=auth_headers(),
+            json={"workspace_id": "ws_project", "access": ["READ"]},
+        ).json()
+        session_id = session["session_id"]
+        run_id = client.post(
+            f"/v1/sessions/{session_id}/runs",
+            headers=auth_headers(),
+            json={"input": "read README.md"},
+        ).json()["run_id"]
+        time.sleep(0.02)
+        finished = wait_for_terminal(client, session_id, run_id)
+        assert finished["status"] == RunStatus.SUCCEEDED.value
+
+    async def inspect() -> tuple[int, int, tuple[ToolCallStatus, ...]]:
+        async with SqliteStore(tmp_path / "agent.db") as store:
+            workspaces = await store.list_workspaces(owner_id="prn_operator")
+            snapshots = await store.list_snapshots(
+                "ws_project", owner_id="prn_operator"
+            )
+            calls = await store.list_tool_calls(run_id)
+            return len(workspaces), len(snapshots), tuple(call.status for call in calls)
+
+    workspace_count, snapshot_count, call_statuses = asyncio.run(inspect())
+    assert workspace_count == 1
+    assert snapshot_count == 1
+    assert call_statuses == (ToolCallStatus.SUCCEEDED,)
+    assert len(adapter.requests) == 2
 
 
 def test_production_app_write_path_pauses_for_approval(

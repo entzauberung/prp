@@ -15,7 +15,7 @@ from prp_runtime.settings import Settings
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_VERSION = "0.0.2"
-EXPECTED_LICENSE = "MIT OR Apache-2.0"
+EXPECTED_LICENSE = "Apache-2.0"
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +61,7 @@ def test_installed_distribution_matches_package() -> None:
 
 
 def test_license_files_exist() -> None:
-    for name in ("LICENSE-MIT", "LICENSE-APACHE", "NOTICE"):
+    for name in ("LICENSE-APACHE", "NOTICE", "TRADEMARKS.md"):
         assert (PROJECT_ROOT / name).is_file()
 
 

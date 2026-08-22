@@ -1,10 +1,20 @@
 {
-  "global_max_attempts": 20,
-  "per_alias_max_attempts": 5,
-  "per_alias_max_successes": 4,
-  "output_tokens": {
+  "global_max_attempts": 30,
+  "per_alias_max_attempts": 8,
+  "per_alias_max_successes": 8,
+  "max_output_tokens": {
     "default": 128,
-    "planner_progressive": 256
+    "planner": 256,
+    "progressive": 256,
+    "agent": 256
   },
-  "concurrency": 1
+  "timeout_seconds": {
+    "provider": 600,
+    "integration": 600,
+    "strategy": 900,
+    "agent": 900,
+    "regression": 600
+  },
+  "concurrency": 1,
+  "one_transient_confirmation_per_scenario": true
 }

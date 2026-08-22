@@ -213,6 +213,22 @@ class AgentLoop:
                 0,
                 ErrorInfo(category=ErrorCategory.INVALID_REQUEST, message=history_error),
             )
+        tool_catalog = self._tool_catalog
+        catalog_names = self._catalog_names
+        catalog_loader = (
+            None
+            if self._tool_executor is None
+            else getattr(self._tool_executor, "provider_catalog", None)
+        )
+        if catalog_names is None and callable(catalog_loader):
+            try:
+                tool_catalog = tuple(await catalog_loader())
+                catalog_names = frozenset(tool.name for tool in tool_catalog)
+            except Exception:
+                # A text-only turn does not need a workspace runtime. Keep the
+                # catalog empty and let any attempted tool call fail closed.
+                tool_catalog = ()
+                catalog_names = frozenset()
         seen_results: dict[str, AgentToolResult] = {
             item.call_id: item
             for item in current_history
@@ -403,7 +419,7 @@ class AgentLoop:
                     instructions=instructions,
                     json_schema=json_schema,
                     history=tuple(current_history),
-                    tools=self._tool_catalog,
+                    tools=tool_catalog,
                 )
             except (DomainValidationError, ValueError):
                 return self._exhausted(
@@ -493,10 +509,10 @@ class AgentLoop:
                         message="provider requested a tool but no tool executor is configured",
                     ),
                 )
-            if self._catalog_names is not None:
+            if catalog_names is not None:
                 unknown_tools = sorted(
                     {call.tool_name for call in turn.tool_calls}
-                    - self._catalog_names
+                    - catalog_names
                 )
                 if unknown_tools:
                     return self._exhausted(

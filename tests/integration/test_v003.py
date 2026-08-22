@@ -94,6 +94,25 @@ class PlanAdapter:
         )
 
 
+class RepairingPlanAdapter(PlanAdapter):
+    def __init__(self, plans: list[list[dict[str, object]]]) -> None:
+        super().__init__(plans[0])
+        self._plans = plans
+
+    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        self.requests.append(request)
+        nodes = self._plans.pop(0)
+        return ProviderResponse(
+            text=json.dumps({
+                "summary": "repairable plan",
+                "final_node": nodes[-1]["key"],
+                "nodes": nodes,
+            }),
+            usage=Usage(input_tokens=2, output_tokens=2),
+            finish_reason=FinishReason.STOP,
+        )
+
+
 class WorkerAdapter:
     def __init__(
         self,
@@ -243,6 +262,8 @@ def test_native_invalid_plan_fails_with_zero_user_graph_facts(tmp_path: Path) ->
 
     assert response.status_code == 201
     assert body["status"] == RunStatus.FAILED.value
+    assert body["error"]["category"] == "INVALID_REQUEST"
+    assert body["error"]["message"].startswith("plan_rejected:")
     assert body["graph_version"] == 1
     assert worker.requests == []
 
@@ -254,10 +275,43 @@ def test_native_invalid_plan_fails_with_zero_user_graph_facts(tmp_path: Path) ->
             return len(units), len(attempts), [event.event_type for event in events]
 
     unit_count, attempt_count, event_types = run_async(inspect())
-    assert unit_count == attempt_count == 1
+    assert unit_count == attempt_count == 2
     assert EventType.PLAN_REJECTED in event_types
     assert EventType.PLAN_COMMITTED not in event_types
     assert event_types[-1] is EventType.RUN_FAILED
+
+
+def test_native_invalid_plan_gets_one_bounded_schema_repair(tmp_path: Path) -> None:
+    database = tmp_path / "v003-repair.db"
+    planner = RepairingPlanAdapter(
+        [
+            [_node("a", depends_on=["b"]), _node("b", depends_on=["a"])],
+            [_node("fixed")],
+        ]
+    )
+    worker = WorkerAdapter({"produce fixed": "repaired result"})
+    app = create_app(
+        _settings(database),
+        adapters={"planner": planner, "worker": worker},
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/runs",
+            json={
+                "input": "repair a cycle",
+                "routing_policy": "MANUAL",
+                "strategy": "PLANNED",
+                "budget": {"max_attempts": 3},
+            },
+        )
+        body = _wait_for_terminal(client, response.json()["run_id"])
+
+    assert response.status_code == 201
+    assert body["status"] == RunStatus.SUCCEEDED.value
+    assert len(planner.requests) == 2
+    assert len(worker.requests) == 1
+    assert "dependency cycle" in (planner.requests[1].instructions or "")
 
 
 def test_native_planned_budget_stops_before_second_attempt(tmp_path: Path) -> None:

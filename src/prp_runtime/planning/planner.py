@@ -21,7 +21,7 @@ from prp_runtime.domain.models import (
     WorkUnit,
 )
 from prp_runtime.domain.values import ModelRef, RunId, new_work_unit_id
-from prp_runtime.json_support import StrictJsonError
+from prp_runtime.json_support import StrictJsonError, strict_json_loads
 from prp_runtime.planning.models import (
     MAX_PLAN_NODES,
     PlanProposal,
@@ -53,7 +53,16 @@ _PLANNER_INSTRUCTIONS = (
     "the supplied schema. Include public summaries, dependencies, resources, output "
     "requirements, acceptance criteria, and exactly one final_node identifying the "
     "user-facing output node. Do not include reasoning, chain-of-thought, code, "
-    "commands, provider configuration, credentials, or persistent IDs."
+    "commands, provider configuration, credentials, or persistent IDs. Prefer the "
+    "smallest valid graph, keep all public text concise, and omit optional fields "
+    "when they are not needed."
+)
+_PLANNER_REPAIR_PREFIX = (
+    "The previous public proposal was rejected by strict validation. Return one corrected "
+    "strict JSON PlanProposal. Ensure every dependency names an existing node, the graph "
+    "is acyclic, and final_node names exactly one leaf node. Do not repeat the rejected "
+    "shape or include reasoning. Prefer the smallest valid graph and omit optional "
+    "fields when they are not needed. Public rejection feedback: "
 )
 
 
@@ -78,14 +87,62 @@ class _PlannerRevisionInput(DomainModel):
     feedback: str | None = None
 
 
+_PLAN_NODE_KEY_SCHEMA = {
+    "type": "string",
+    "pattern": r"^[a-z][a-z0-9_-]{0,63}$",
+}
 _PLAN_PROPOSAL_SCHEMA = json.dumps(
-    PlanProposal.model_json_schema(),
+    {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "final_node": _PLAN_NODE_KEY_SCHEMA,
+            "nodes": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_PLAN_NODES,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": _PLAN_NODE_KEY_SCHEMA,
+                        "name": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "instruction": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 16384,
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": _PLAN_NODE_KEY_SCHEMA,
+                        },
+                    },
+                    "required": ["key", "name", "instruction", "depends_on"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["summary", "final_node", "nodes"],
+        "additionalProperties": False,
+    },
     ensure_ascii=True,
     allow_nan=False,
     separators=(",", ":"),
 )
 _PLAN_REVISION_SCHEMA = json.dumps(
-    PlanRevision.model_json_schema(),
+    {
+        "type": "object",
+        "properties": {
+            "base_graph_version": {"type": "integer", "minimum": 1},
+            "reason": {
+                "type": "string",
+                "enum": [reason.value for reason in PlanRevisionReason],
+            },
+            "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "proposal": strict_json_loads(_PLAN_PROPOSAL_SCHEMA),
+        },
+        "required": ["base_graph_version", "reason", "summary", "proposal"],
+        "additionalProperties": False,
+    },
     ensure_ascii=True,
     allow_nan=False,
     separators=(",", ":"),
@@ -150,8 +207,12 @@ def _provider_error(error: ProviderError) -> ErrorInfo:
     )
 
 
-def _planner_error(message: str) -> ErrorInfo:
-    return ErrorInfo(category=ErrorCategory.PROVIDER_ERROR, message=message)
+def _planner_error(
+    message: str,
+    *,
+    category: ErrorCategory = ErrorCategory.PROVIDER_ERROR,
+) -> ErrorInfo:
+    return ErrorInfo(category=category, message=message)
 
 
 def _planner_usage(usage: Usage | None) -> Usage | None:
@@ -182,7 +243,12 @@ class Planner:
         """The server-side profile used for this call."""
         return self._profile
 
-    def build_request(self, request: NativeRunRequest) -> ProviderRequest:
+    def build_request(
+        self,
+        request: NativeRunRequest,
+        *,
+        repair_feedback: str | None = None,
+    ) -> ProviderRequest:
         """Build the outbound request from a bounded public Native summary."""
         if self._profile.role is not ModelRole.PLANNER:
             raise ProviderError(
@@ -197,7 +263,11 @@ class Planner:
         return ProviderRequest.for_profile(
             self._profile,
             input=summary.model_dump_json(),
-            instructions=_PLANNER_INSTRUCTIONS,
+            instructions=(
+                _PLANNER_INSTRUCTIONS
+                if repair_feedback is None
+                else _PLANNER_REPAIR_PREFIX + repair_feedback
+            ),
             json_schema=_PLAN_PROPOSAL_SCHEMA,
         )
 
@@ -215,10 +285,15 @@ class Planner:
         assert isinstance(result.proposal, PlanProposal)
         return result.proposal
 
-    async def propose_call(self, request: NativeRunRequest) -> PlannerCallResult:
+    async def propose_call(
+        self,
+        request: NativeRunRequest,
+        *,
+        repair_feedback: str | None = None,
+    ) -> PlannerCallResult:
         """Return a parsed proposal or rejection with measured provider facts."""
         try:
-            provider_request = self.build_request(request)
+            provider_request = self.build_request(request, repair_feedback=repair_feedback)
             response = await self._adapter.complete(provider_request)
         except ProviderError as error:
             return self._rejected_call(
@@ -260,7 +335,11 @@ class Planner:
                     reasons=("response is not a valid PlanProposal",),
                 ),
                 response=response,
-                error=_planner_error("Planner provider response was invalid"),
+                error=_planner_error(
+                    "plan_schema_invalid: Planner response did not match the strict "
+                    "PlanProposal schema",
+                    category=ErrorCategory.INVALID_REQUEST,
+                ),
             )
         return PlannerCallResult(
             model=self._profile.model_ref,
@@ -383,7 +462,11 @@ class Planner:
                     reasons=("response is not a valid PlanRevision",),
                 ),
                 response=response,
-                error=_planner_error("Planner provider response was invalid"),
+                error=_planner_error(
+                    "plan_schema_invalid: Planner revision did not match the strict "
+                    "PlanRevision schema",
+                    category=ErrorCategory.INVALID_REQUEST,
+                ),
             )
         return PlannerCallResult(
             model=self._profile.model_ref,

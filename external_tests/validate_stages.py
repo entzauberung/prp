@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 # Import the registry
 from unattended_runner import STAGE_REGISTRY

@@ -228,6 +228,12 @@ class AnthropicMessagesProvider:
         calls: list[AgentToolCall] = []
         seen_ids: set[str] = set()
         for block in raw:
+            if isinstance(block, dict) and block.get("type") in {
+                "thinking",
+                "redacted_thinking",
+            }:
+                self._validate_thinking_companion(block)
+                continue
             if not isinstance(block, dict) or set(block) - {"type", "id", "name", "input"}:
                 raise self._invalid_response("tool_use block has an unsupported shape")
             if block.get("type") != "tool_use":
@@ -249,7 +255,21 @@ class AnthropicMessagesProvider:
                 raise self._invalid_response("tool_use ids must be unique")
             seen_ids.add(call.call_id)
             calls.append(call)
+        if not calls:
+            raise self._invalid_response("tool_use content is empty")
         return tuple(calls)
+
+    def _validate_thinking_companion(self, block: dict[str, Any]) -> None:
+        if block.get("type") == "thinking":
+            if set(block) != {"type", "thinking", "signature"}:
+                raise self._invalid_response("thinking companion has an unsupported shape")
+            if not isinstance(block.get("thinking"), str) or not isinstance(
+                block.get("signature"), str
+            ):
+                raise self._invalid_response("thinking companion is malformed")
+            return
+        if set(block) != {"type", "data"} or not isinstance(block.get("data"), str):
+            raise self._invalid_response("redacted thinking companion is malformed")
 
     def _parse_text(self, raw: object) -> str:
         if not isinstance(raw, list) or not raw:

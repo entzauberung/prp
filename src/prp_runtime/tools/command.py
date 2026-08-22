@@ -650,8 +650,16 @@ def _parameter(name: str, *, multiple: bool = False, max_items: int = 16) -> Com
 DEFAULT_COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="pytest",
-        executable="pytest",
-        argv_template=("-q", "{targets}"),
+        executable="python",
+        argv_template=(
+            "-B",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            "{targets}",
+        ),
         parameters=(_parameter("targets", multiple=True),),
         command_class=CommandClass.TEST,
         timeout_seconds=60,

@@ -1,109 +1,34 @@
-"""Strict, secret-safe credentials for the unattended external runner.
+"""Environment-only credentials for the optional external test harness.
 
-This module deliberately has no network, subprocess, environment, or logging
-side effects. Only the runner should call ``load_credentials`` on the
-authorized external file.
+No credential file format is supported. Live runs receive provider keys only
+through ``PRP_EXTERNAL_*_API_KEY`` environment variables; example configuration
+uses placeholders and never contains a real key.
 """
 
 from __future__ import annotations
 
 import os
-import re
-import stat
 from collections.abc import Mapping
 from typing import Final
+from urllib.parse import urlsplit
 
-
-MAX_CREDENTIAL_FILE_BYTES: Final = 64 * 1024
 _PROFILE_PREFIX: Final = "PRP_EXTERNAL_"
+_PLACEHOLDER_PREFIXES: Final = ("<", "YOUR_", "REPLACE_", "CHANGEME")
 
-_BLOCK_ALIASES: Final = {
-    "DEEPSEEK": "deepseek",
-    "DEEPSEEK_API": "deepseek",
-    "DEEPSEEK_PROVIDER": "deepseek",
-    "DEEPSEEK_V4": "deepseek",
-    "DEEPSEEK_V4_FLASH": "deepseek",
-    "DEEPSEEK_FLASH": "deepseek",
-    "OPENAI": "openai",
-    "VANYOSPACE_OPENAI": "openai",
-    "VANYOSPACE_OPENAI_API": "openai",
-    "LUNA": "openai",
-    "LUNA_OPENAI": "openai",
-    "LUNA_GPT_56": "openai",
-    "LUNA_GPT_5_6": "openai",
-    "GPT_56_LUNA": "openai",
-    "GPT_5_6_LUNA": "openai",
-    "GPT_56": "openai",
-    "VANYOSPACE_LUNA": "openai",
-    "VANYOSPACE_GPT": "openai",
-    "ANTHROPIC": "anthropic",
-    "VANYOSPACE_ANTHROPIC": "anthropic",
-    "VANYOSPACE_ANTHROPIC_API": "anthropic",
-    "CLAUDE": "anthropic",
-    "CLAUDE_ANTHROPIC": "anthropic",
-    "CLAUDE_SONNET_5": "anthropic",
-    "CLAUDE_SONNET": "anthropic",
-    "VANYOSPACE_CLAUDE": "anthropic",
-    "VANYOSPACE_SONNET": "anthropic",
-    "VANYOSPACE": "vanyospace",
-    "ZHIPU": "zhipu",
-    "ZHIPU_API": "zhipu",
-    "ZHIPUAI": "zhipu",
-    "GLM": "zhipu",
-    "BIGMODEL": "zhipu",
+TERRA_ALIAS: Final = "TERRA_GPT"
+TERRA_PROTOCOL: Final = "OPENAI_RESPONSES"
+TERRA_ENV_NAMES: Final = {
+    "model": "PRP_EXTERNAL_TERRA_GPT_MODEL",
+    "base_url": "PRP_EXTERNAL_TERRA_GPT_BASE_URL",
+    "api_key": "PRP_EXTERNAL_TERRA_GPT_API_KEY",
+    "allowed_host": "PRP_EXTERNAL_TERRA_GPT_ALLOWED_HOST",
 }
-_DOCUMENTATION_HEADINGS: Final = frozenset(
-    {
-        "API_KEYS",
-        "AUTHORIZED_CREDENTIALS",
-        "CREDENTIALS",
-        "EXTERNAL_CREDENTIALS",
-        "TEST_KEYS",
-    }
+TERRA_NOT_CONFIGURED: Final = "TERRA_NOT_CONFIGURED"
+TERRA_READY: Final = "READY"
+TERRA_FALLBACK_NOT_ALLOWED: Final = "FALLBACK_NOT_ALLOWED"
+TERRA_RETRYABLE_FAILURES: Final = frozenset(
+    {"NETWORK", "TIMEOUT", "UPSTREAM_TRANSIENT", "PROVIDER_UNAVAILABLE"}
 )
-
-_KEY_ALIASES: Final = {
-    "deepseek": {
-        "API_KEY": "deepseek",
-        "KEY": "deepseek",
-        "DEEPSEEK_KEY": "deepseek",
-        "DEEPSEEK_API_KEY": "deepseek",
-    },
-    "openai": {
-        "API_KEY": "openai",
-        "OPENAI_API_KEY": "openai",
-        "OPENAI_KEY": "openai",
-        "LUNA_API_KEY": "openai",
-        "LUNA_KEY": "openai",
-        "GPT_5_6_LUNA_API_KEY": "openai",
-        "VANYOSPACE_OPENAI_API_KEY": "openai",
-    },
-    "anthropic": {
-        "API_KEY": "anthropic",
-        "ANTHROPIC_API_KEY": "anthropic",
-        "ANTHROPIC_KEY": "anthropic",
-        "CLAUDE_API_KEY": "anthropic",
-        "CLAUDE_KEY": "anthropic",
-        "VANYOSPACE_ANTHROPIC_API_KEY": "anthropic",
-    },
-    "vanyospace": {
-        "LUNA_API_KEY": "openai",
-        "LUNA_KEY": "openai",
-        "OPENAI_API_KEY": "openai",
-        "VANYOSPACE_OPENAI_API_KEY": "openai",
-        "CLAUDE_API_KEY": "anthropic",
-        "CLAUDE_KEY": "anthropic",
-        "ANTHROPIC_API_KEY": "anthropic",
-        "VANYOSPACE_ANTHROPIC_API_KEY": "anthropic",
-    },
-    "zhipu": {
-        "API_KEY": "zhipu",
-        "ZHIPU_API_KEY": "zhipu",
-        "ZHIPU_KEY": "zhipu",
-        "ZHIPUAI_API_KEY": "zhipu",
-        "GLM_API_KEY": "zhipu",
-    },
-}
 
 PROFILE_CONTRACTS: Final = {
     "DEEPSEEK_FLASH_CHAT": {
@@ -133,23 +58,13 @@ PROFILE_CONTRACTS: Final = {
     },
 }
 
-_HEADER_RE = re.compile(r"^\s*(?:#{1,6}\s+|\[)(?P<name>[^\]#]+?)(?:\]|\s*#*)\s*$")
-_ASSIGNMENT_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:`)?(?P<key>[^:=`]+?)(?:`)?\s*(?:=|:)\s*(?P<value>.*?)\s*$"
-)
-_BLOCK_MARKER_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*|__)?(?P<label>[A-Za-z0-9_. -]+?)(?:\*\*|__)?\s*:\s*$"
-)
-
 
 class CredentialError(ValueError):
-    """An intentionally non-sensitive credential parsing error."""
+    """A non-sensitive environment credential configuration error."""
 
-    def __init__(self, code: str, block: str | None = None) -> None:
+    def __init__(self, code: str) -> None:
         self.code = code
-        self.block = block
-        label = f" block={block}" if block else ""
-        super().__init__(f"credential error code={code}{label}")
+        super().__init__(f"credential error code={code}")
 
 
 class _SecretStr:
@@ -168,24 +83,8 @@ class _SecretStr:
         return self.__value
 
 
-def _normalise_label(label: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "_", label.strip().upper()).strip("_")
-
-
-def _normalise_value(value: str, block: str) -> str:
-    candidate = value.strip()
-    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "'\"`":
-        candidate = candidate[1:-1].strip()
-    if not candidate:
-        raise CredentialError("INVALID_VALUE", block)
-    # Allow dots for zhipu keys, but still reject other whitespace
-    if any(c.isspace() for c in candidate):
-        raise CredentialError("INVALID_VALUE", block)
-    return candidate
-
-
 class CredentialSet:
-    """Opaque parsed credentials with a controlled per-profile env export."""
+    """Opaque provider keys with controlled per-profile environment export."""
 
     __slots__ = ("__secrets",)
 
@@ -219,137 +118,168 @@ class CredentialSet:
         return self.profile_env(alias)
 
 
-def parse_credentials_text(text: str) -> CredentialSet:
-    """Parse provider credentials from loosely-formatted Markdown text.
+def _is_placeholder(value: str) -> bool:
+    upper = value.strip().upper()
+    return not upper or any(upper.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES)
 
-    Relaxed mode: extracts API keys using context hints (deepseek, zhipu, claude keywords).
-    Supports both sk-* format and zhipu's {hex}.{base64} format.
-    """
 
-    if not isinstance(text, str):
-        raise CredentialError("INVALID_TEXT")
-
-    # Collect all API key candidates with their surrounding context
-    candidates: list[tuple[str, str]] = []  # (key, context_line)
-
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        # Match sk-* keys OR zhipu format (hex.base64)
-        is_sk_key = stripped.startswith("sk-") and len(stripped) > 20
-        is_zhipu_key = (
-            "." in stripped
-            and len(stripped) > 30
-            and not stripped.startswith("http")
-            and not " " in stripped
-            and re.match(r"^[a-f0-9]{32}\.[A-Za-z0-9]+$", stripped)
-        )
-
-        if is_sk_key or is_zhipu_key:
-            # Gather context: look back up to 5 lines for provider hints
-            context_lines = []
-            for j in range(max(0, i - 5), i + 1):
-                context_lines.append(lines[j].lower())
-            context = " ".join(context_lines)
-            candidates.append((stripped, context))
-
-    # Classify candidates by provider hints
+def load_credentials_from_env(environ: Mapping[str, str] | None = None) -> CredentialSet:
+    """Load all active provider keys from environment variables only."""
+    source = os.environ if environ is None else environ
     values: dict[str, _SecretStr] = {}
-
-    # Provider-specific hints ordered by specificity (most specific first)
-    provider_patterns = {
-        "deepseek": ["deepseek", "api.deepseek.com"],
-        "zhipu": ["zhipu", "bigmodel", "glm", "可以使用的模型有glm"],
-        "anthropic": ["claude", "anthropic", "sonnet"],
-        "openai": ["gpt-5.6-luna", "luna", "fast.vanyospace.com", "第三方的测试key"],
-    }
-
-    for key, context in candidates:
-        # First check if the key format suggests zhipu (hex.base64)
-        matched_provider = None
-        if "." in key and re.match(r"^[a-f0-9]{32}\.[A-Za-z0-9]+$", key):
-            matched_provider = "zhipu"
-
-        # Then check if the key itself contains a provider hint
-        if not matched_provider:
-            key_lower = key.lower()
-            for provider in ["deepseek", "anthropic", "openai"]:
-                if provider in key_lower:
-                    matched_provider = provider
-                    break
-
-        # If no match in key, check context with specificity ordering
-        if not matched_provider:
-            for provider, hints in provider_patterns.items():
-                if any(hint in context for hint in hints):
-                    matched_provider = provider
-                    break
-
-        if matched_provider and matched_provider not in values:
-            try:
-                values[matched_provider] = _SecretStr(_normalise_value(key, matched_provider))
-            except CredentialError:
-                pass
-
-    # Only the three credential classes used by the active five-profile matrix
-    # are required. Extra legacy keys in the authorized document are ignored.
-    required_keys = {"deepseek", "openai", "anthropic"}
-    missing = required_keys - set(values)
+    missing: set[str] = set()
+    for alias, contract in PROFILE_CONTRACTS.items():
+        env_name = f"{_PROFILE_PREFIX}{alias}_API_KEY"
+        raw = source.get(env_name, "").strip()
+        provider = contract["credential"]
+        if _is_placeholder(raw):
+            missing.add(env_name)
+            continue
+        previous = values.get(provider)
+        if previous is not None and previous.reveal() != raw:
+            raise CredentialError(f"CONFLICTING_ENV:{provider}")
+        values[provider] = _SecretStr(raw)
     if missing:
-        raise CredentialError(f"MISSING_KEY: {missing}")
-
+        raise CredentialError("MISSING_ENV:" + ",".join(sorted(missing)))
     return CredentialSet(values)
 
 
-def load_credentials(path: str | os.PathLike[str]) -> CredentialSet:
-    """Load a regular, non-symlink UTF-8 credential file without logging it."""
+class OptionalProfileResolution:
+    """Public, non-secret result of resolving optional Terra metadata."""
 
+    __slots__ = ("alias", "status", "reason", "model", "base_url", "allowed_host", "api_key")
+
+    def __init__(
+        self,
+        *,
+        alias: str,
+        status: str,
+        reason: str,
+        model: str | None = None,
+        base_url: str | None = None,
+        allowed_host: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.alias = alias
+        self.status = status
+        self.reason = reason
+        self.model = model
+        self.base_url = base_url
+        self.allowed_host = allowed_host
+        self.api_key = api_key
+
+    def redacted(self) -> dict[str, str | None]:
+        return {
+            "alias": self.alias,
+            "status": self.status,
+            "reason": self.reason,
+            "model": self.model,
+            "base_url_host": _url_host(self.base_url) if self.base_url else None,
+            "allowed_host": self.allowed_host,
+            "api_key": "<redacted>" if self.api_key else None,
+        }
+
+
+def _url_host(value: str) -> str | None:
     try:
-        file_path = os.fspath(path)
-    except TypeError as error:
-        raise CredentialError("INVALID_PATH") from error
+        return urlsplit(value).hostname
+    except ValueError:
+        return None
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+def resolve_terra_profile(
+    environ: Mapping[str, str],
+    *,
+    allowed_hosts: set[str] | frozenset[str] | tuple[str, ...],
+    fallback_from: str | None = None,
+    failure_classification: str | None = None,
+) -> OptionalProfileResolution:
+    """Resolve Terra only from complete explicit environment metadata."""
+    if fallback_from is not None and fallback_from != "LUNA_GPT_56":
+        return OptionalProfileResolution(
+            alias=TERRA_ALIAS,
+            status=TERRA_FALLBACK_NOT_ALLOWED,
+            reason="Terra fallback is only permitted after LUNA_GPT_56",
+        )
+    if fallback_from is not None:
+        failure = failure_classification or environ.get(
+            "PRP_EXTERNAL_LUNA_GPT_56_FAILURE", ""
+        ).strip()
+        if failure not in TERRA_RETRYABLE_FAILURES:
+            return OptionalProfileResolution(
+                alias=TERRA_ALIAS,
+                status=TERRA_FALLBACK_NOT_ALLOWED,
+                reason="Luna failure is not classified as retryable",
+            )
+
+    values = {field: environ.get(name, "").strip() for field, name in TERRA_ENV_NAMES.items()}
+    missing = tuple(field for field, value in values.items() if not value)
+    if missing:
+        return OptionalProfileResolution(
+            alias=TERRA_ALIAS,
+            status=TERRA_NOT_CONFIGURED,
+            reason=f"missing Terra metadata: {','.join(missing)}",
+        )
+    if fallback_from is None:
+        return OptionalProfileResolution(
+            alias=TERRA_ALIAS,
+            status=TERRA_FALLBACK_NOT_ALLOWED,
+            reason="Terra requires an explicit Luna fallback decision",
+        )
+
+    base_url = values["base_url"]
+    allowed_host = values["allowed_host"]
     try:
-        descriptor = os.open(file_path, flags)
-    except OSError as error:
-        raise CredentialError("FILE_UNREADABLE") from error
-
-    try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise CredentialError("NOT_REGULAR_FILE")
-        if file_stat.st_size > MAX_CREDENTIAL_FILE_BYTES:
-            raise CredentialError("FILE_TOO_LARGE")
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            descriptor = -1
-            data = handle.read(MAX_CREDENTIAL_FILE_BYTES + 1)
-    except CredentialError:
-        raise
-    except OSError as error:
-        raise CredentialError("FILE_UNREADABLE") from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-    if len(data) > MAX_CREDENTIAL_FILE_BYTES:
-        raise CredentialError("FILE_TOO_LARGE")
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise CredentialError("INVALID_ENCODING") from error
-    return parse_credentials_text(text)
-
-
-load_authorized_credentials = load_credentials
+        parsed = urlsplit(base_url)
+        valid_url = (
+            parsed.scheme == "https"
+            and parsed.hostname is not None
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid_url = False
+        parsed = None
+    if not valid_url or parsed is None or parsed.hostname != allowed_host:
+        return OptionalProfileResolution(
+            alias=TERRA_ALIAS,
+            status=TERRA_NOT_CONFIGURED,
+            reason="Terra base URL must be HTTPS and match its explicit host",
+        )
+    if allowed_host.lower() not in {host.lower() for host in allowed_hosts}:
+        return OptionalProfileResolution(
+            alias=TERRA_ALIAS,
+            status=TERRA_NOT_CONFIGURED,
+            reason="Terra host is not explicitly admitted to the active allowlist",
+            model=values["model"],
+            base_url=base_url,
+            allowed_host=allowed_host,
+        )
+    return OptionalProfileResolution(
+        alias=TERRA_ALIAS,
+        status=TERRA_READY,
+        reason="complete Terra metadata is explicitly admitted",
+        model=values["model"],
+        base_url=base_url,
+        allowed_host=allowed_host,
+        api_key=values["api_key"],
+    )
 
 
 __all__ = [
     "CredentialError",
     "CredentialSet",
-    "MAX_CREDENTIAL_FILE_BYTES",
+    "OptionalProfileResolution",
     "PROFILE_CONTRACTS",
-    "load_authorized_credentials",
-    "load_credentials",
-    "parse_credentials_text",
+    "TERRA_ALIAS",
+    "TERRA_ENV_NAMES",
+    "TERRA_FALLBACK_NOT_ALLOWED",
+    "TERRA_NOT_CONFIGURED",
+    "TERRA_PROTOCOL",
+    "TERRA_READY",
+    "TERRA_RETRYABLE_FAILURES",
+    "load_credentials_from_env",
+    "resolve_terra_profile",
 ]

@@ -1,12 +1,14 @@
 PRP Runtime
 Copyright 2026 PRP Runtime Authors
 
-This product is licensed under either of
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE-APACHE).
 
-  * MIT license (see LICENSE-MIT)
-  * Apache License, Version 2.0 (see LICENSE-APACHE)
-
-at your option.
+Apache-2.0 does not grant rights to use the PRP Runtime name, project marks,
+or any future logo to imply origin, sponsorship, or endorsement. See
+TRADEMARKS.md for the project branding policy. The branding policy does not
+restrict lawful commercial use or resale of modified source code under
+Apache-2.0.
 
 Third-party notices
 -------------------

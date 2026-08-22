@@ -10,8 +10,8 @@ import prp_runtime.app as app_module
 from prp_runtime import __version__
 from prp_runtime.app import build_adapters, create_app
 from prp_runtime.domain.enums import ModelRole
-from prp_runtime.providers.base import ModelProfile, ProviderProtocol
 from prp_runtime.providers.anthropic import AnthropicMessagesProvider
+from prp_runtime.providers.base import ModelProfile, ProviderProtocol
 from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
 from prp_runtime.settings import Settings
 from prp_runtime.workspace.sandbox import SandboxCapabilities

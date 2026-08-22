@@ -13,13 +13,6 @@ from urllib.parse import urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
-from prp_runtime.app import create_app
-from prp_runtime.domain.enums import AttemptStatus, ModelRole, RunStatus
-from prp_runtime.providers.base import ModelProfile, ProviderProtocol
-from prp_runtime.settings import Settings
-from prp_runtime.storage.sqlite import SqliteStore
-
-from external_tests.credential_loader import PROFILE_CONTRACTS
 from external_tests.result_ledger import LedgerEntry, LedgerStore
 from external_tests.support import (
     ExternalConfig,
@@ -29,45 +22,85 @@ from external_tests.support import (
     validate_external_url,
 )
 from external_tests.test_live_deepseek import _create_adapter, _profile_for_runtime
+from prp_runtime.app import create_app
+from prp_runtime.domain.enums import AttemptStatus, RunStatus
+from prp_runtime.providers.base import ModelProfile
+from prp_runtime.settings import Settings
+from prp_runtime.storage.sqlite import SqliteStore
 
 INGRESS_CASES = {
     "responses": {
-        "alias": "DEEPSEEK_FLASH_RESPONSES",
         "path": "/v1/responses",
         "protocol": "OPENAI_RESPONSES",
     },
     "chat": {
-        "alias": "DEEPSEEK_FLASH_CHAT",
         "path": "/v1/chat/completions",
         "protocol": "OPENAI_CHAT",
     },
     "messages": {
-        "alias": "DEEPSEEK_FLASH_ANTHROPIC",
         "path": "/v1/messages",
         "protocol": "ANTHROPIC_MESSAGES",
     },
 }
-PROTOCOL_RESULT_FILE = Path("/home/bruce/文档/prp测试日志/real-gap-closure/20-protocols.jsonl")
+PROTOCOL_RESULT_FILE = Path(os.environ["PRP_LIVE_RESULT_FILE"])
 TERMINAL_RUN_STATUSES = {status.value for status in RunStatus if status.is_terminal}
 
 
 def _profile_by_alias(config: ExternalConfig, alias: str) -> ExternalProfile:
+    """Retain the canonical exact-alias lookup used by lifecycle fixtures."""
+
     matches = [profile for profile in config.profiles if profile.alias == alias]
     if len(matches) != 1:
         raise ExternalGateError(f"protocol matrix must contain exactly one {alias}")
     return matches[0]
 
 
-def _provider_passed(alias: str) -> bool:
-    return any(
-        entry.alias == alias and entry.status == "PASS"
-        for entry in LedgerStore(Path(os.environ["PRP_LIVE_RESULT_FILE"])).read()
+def _select_ingress_profile(
+    config: ExternalConfig, protocol: str
+) -> tuple[ExternalProfile, bool]:
+    """Return the first configured candidate with actual outbound PASS evidence."""
+
+    profiles = {profile.alias: profile for profile in config.profiles}
+    raw_order = os.environ.get("PRP_EXTERNAL_CANDIDATE_ORDER", "")
+    candidate_order = tuple(part.strip() for part in raw_order.split(",") if part.strip())
+    if not candidate_order:
+        candidate_order = tuple(
+            profile.alias for profile in config.profiles if profile.protocol == protocol
+        )
+    candidates = tuple(
+        profiles[alias]
+        for alias in candidate_order
+        if alias in profiles and profiles[alias].protocol == protocol
     )
+    if not candidates:
+        raise ExternalGateError(f"protocol matrix has no candidate for {protocol}")
+
+    passed_aliases = {
+        entry.alias
+        for entry in LedgerStore(PROTOCOL_RESULT_FILE).read()
+        if entry.protocol == protocol
+        and entry.status == "PASS"
+        and entry.actual_or_simulated == "ACTUAL"
+    }
+    for profile in candidates:
+        if profile.alias in passed_aliases:
+            return profile, True
+    return candidates[0], False
+
+
+def _scenario_id(case_name: str, profile: ExternalProfile, attempt_id: str) -> str:
+    base = f"wo-009-st-001-ingress-{case_name}-{profile.alias.lower()}"
+    existing_ids = {
+        entry.scenario_id for entry in LedgerStore(PROTOCOL_RESULT_FILE).read()
+    }
+    if base not in existing_ids:
+        return base
+    return f"{base}-retry-{attempt_id}"
 
 
 def _prerequisite_entry(case_name: str, profile: ExternalProfile, path: str) -> LedgerEntry:
     return LedgerEntry(
-        scenario_id=f"wo-003-st-001-{case_name}",
+        scenario_id=_scenario_id(case_name, profile, "prerequisite"),
         alias=profile.alias,
         model_id=profile.model_id,
         protocol=f"{profile.protocol}->{path}",
@@ -124,7 +157,7 @@ def _live_entry(
     usage = attempt.usage
     content = artifact.content if artifact is not None else None
     return LedgerEntry(
-        scenario_id=f"wo-003-st-001-{case_name}",
+        scenario_id=_scenario_id(case_name, profile, attempt.attempt_id),
         alias=profile.alias,
         model_id=profile.model_id,
         protocol=f"{profile.protocol}->{path}",
@@ -167,10 +200,10 @@ def test_ingress_protocol_composition(
     temporary_resources: Any,
 ) -> None:
     case = INGRESS_CASES[case_name]
-    alias = str(case["alias"])
-    profile = _profile_by_alias(external_config, alias)
+    protocol = str(case["protocol"])
+    profile, provider_passed = _select_ingress_profile(external_config, protocol)
     path = str(case["path"])
-    if not _provider_passed(alias):
+    if not provider_passed:
         LedgerStore(PROTOCOL_RESULT_FILE).merge([_prerequisite_entry(case_name, profile, path)])
         return
 

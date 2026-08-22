@@ -70,6 +70,20 @@ class _ProfileSpec:
     base_url_env: str
     model_env: str
     api_key_env: str
+    allowed_host_env: str | None = None
+    optional: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OptionalProfileStatus:
+    """Classified optional profile state without any secret or full URL."""
+
+    alias: str
+    status: str
+    reason: str
+
+    def redacted(self) -> dict[str, str]:
+        return {"alias": self.alias, "status": self.status, "reason": self.reason}
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,10 +92,15 @@ class ExternalConfig:
 
     allowed_hosts: tuple[str, ...]
     profiles: tuple[ExternalProfile, ...]
+    optional_statuses: tuple[OptionalProfileStatus, ...] = ()
 
     def __repr__(self) -> str:
         aliases = tuple(profile.alias for profile in self.profiles)
-        return f"ExternalConfig(allowed_hosts={self.allowed_hosts!r}, aliases={aliases!r})"
+        optional = tuple(status.alias for status in self.optional_statuses)
+        return (
+            f"ExternalConfig(allowed_hosts={self.allowed_hosts!r}, aliases={aliases!r}, "
+            f"optional={optional!r})"
+        )
 
 
 def require_external_opt_in(environ: Mapping[str, str] | None = None) -> None:
@@ -135,7 +154,11 @@ def load_external_config(
     require_external_opt_in(source)
     matrix = _read_matrix(matrix_path)
     allowed_hosts = _read_allowed_hosts(matrix)
-    profile_specs = _validate_profile_specs(_read_profiles(matrix))
+    active_specs = _validate_profile_specs(_read_profiles(matrix))
+    optional_specs = _validate_profile_specs(
+        _read_optional_profiles(matrix), optional=True, existing_specs=active_specs
+    )
+    profile_specs = active_specs + optional_specs
     selected_aliases = require_external_profile_selection(
         source, tuple(spec.alias for spec in profile_specs)
     )
@@ -143,13 +166,30 @@ def load_external_config(
 
     profiles: list[ExternalProfile] = []
     selected_hosts: list[str] = []
+    optional_statuses: list[OptionalProfileStatus] = []
     for spec in profile_specs:
         if spec.alias not in selected_alias_set:
             continue
 
-        base_url = _required_env(source, spec.base_url_env, spec.alias)
-        model_id = _required_env(source, spec.model_env, spec.alias)
-        api_key = _required_env(source, spec.api_key_env, spec.alias)
+        if spec.optional:
+            optional_result = _resolve_optional_spec(source, spec, allowed_hosts)
+            if optional_result is None:
+                optional_statuses.append(
+                    OptionalProfileStatus(
+                        alias=spec.alias,
+                        status="TERRA_NOT_CONFIGURED",
+                        reason="complete optional metadata is not available",
+                    )
+                )
+                continue
+            if isinstance(optional_result, OptionalProfileStatus):
+                optional_statuses.append(optional_result)
+                continue
+            base_url, model_id, api_key = optional_result
+        else:
+            base_url = _required_env(source, spec.base_url_env, spec.alias)
+            model_id = _required_env(source, spec.model_env, spec.alias)
+            api_key = _required_env(source, spec.api_key_env, spec.alias)
 
         _validate_base_url(base_url, spec.base_url_env, spec.alias)
         base_url_host = _url_host(base_url)
@@ -173,9 +213,9 @@ def load_external_config(
             )
         )
 
-    if not profiles:
+    if not profiles and not optional_statuses:
         raise ExternalGateError("model matrix contains no in-scope profiles")
-    return ExternalConfig(tuple(selected_hosts), tuple(profiles))
+    return ExternalConfig(tuple(selected_hosts), tuple(profiles), tuple(optional_statuses))
 
 
 def load_external_profiles(
@@ -215,13 +255,29 @@ def _read_profiles(matrix: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return raw_profiles
 
 
+def _read_optional_profiles(matrix: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    raw_profiles = matrix.get("optional_profiles", [])
+    if not isinstance(raw_profiles, list) or not all(
+        isinstance(profile, dict) for profile in raw_profiles
+    ):
+        raise ExternalGateError("model matrix optional_profiles is malformed")
+    return raw_profiles
+
+
 def _validate_profile_specs(
     profile_specs: list[Mapping[str, Any]],
+    *,
+    optional: bool = False,
+    existing_specs: tuple[_ProfileSpec, ...] = (),
 ) -> tuple[_ProfileSpec, ...]:
     """Validate all matrix metadata without reading any profile values."""
 
-    used_env_names: set[str] = {"PRP_EXTERNAL_TESTS", _PROFILE_SELECTION_ENV}
-    seen_aliases: set[str] = set()
+    used_env_names: set[str] = {
+        "PRP_EXTERNAL_TESTS",
+        _PROFILE_SELECTION_ENV,
+        *(name for spec in existing_specs for name in _spec_env_names(spec)),
+    }
+    seen_aliases: set[str] = {spec.alias for spec in existing_specs}
     validated: list[_ProfileSpec] = []
     for spec in profile_specs:
         alias = _required_text(spec, "alias", "matrix")
@@ -230,6 +286,9 @@ def _validate_profile_specs(
         seen_aliases.add(alias)
         vendor = _required_text(spec, "vendor", alias)
         protocol = _required_text(spec, "protocol", alias)
+        allowed_host_env = None
+        if optional:
+            allowed_host_env = _env_name(spec, "allowed_host_env", alias, used_env_names)
         validated.append(
             _ProfileSpec(
                 alias=alias,
@@ -238,9 +297,63 @@ def _validate_profile_specs(
                 base_url_env=_env_name(spec, "base_url_env", alias, used_env_names),
                 model_env=_env_name(spec, "model_env", alias, used_env_names),
                 api_key_env=_env_name(spec, "api_key_env", alias, used_env_names),
+                allowed_host_env=allowed_host_env,
+                optional=optional,
             )
         )
     return tuple(validated)
+
+
+def _spec_env_names(spec: _ProfileSpec) -> tuple[str, ...]:
+    return tuple(
+        name
+        for name in (spec.base_url_env, spec.model_env, spec.api_key_env, spec.allowed_host_env)
+        if name is not None
+    )
+
+
+def _resolve_optional_spec(
+    environ: Mapping[str, str],
+    spec: _ProfileSpec,
+    allowed_hosts: Collection[str],
+) -> tuple[str, str, str] | OptionalProfileStatus | None:
+    assert spec.optional and spec.allowed_host_env is not None
+    values = {
+        "base URL": environ.get(spec.base_url_env, "").strip(),
+        "model": environ.get(spec.model_env, "").strip(),
+        "API key": environ.get(spec.api_key_env, "").strip(),
+        "allowed host": environ.get(spec.allowed_host_env, "").strip(),
+    }
+    if not all(values.values()):
+        return None
+    if not _is_host(values["allowed host"]):
+        return OptionalProfileStatus(
+            alias=spec.alias,
+            status="TERRA_NOT_CONFIGURED",
+            reason="optional allowed host is malformed",
+        )
+    try:
+        _validate_base_url(values["base URL"], spec.base_url_env, spec.alias)
+        base_host = _url_host(values["base URL"])
+    except ExternalGateError:
+        return OptionalProfileStatus(
+            alias=spec.alias,
+            status="TERRA_NOT_CONFIGURED",
+            reason="optional base URL is not a valid HTTPS URL",
+        )
+    if base_host != values["allowed host"]:
+        return OptionalProfileStatus(
+            alias=spec.alias,
+            status="TERRA_NOT_CONFIGURED",
+            reason="optional base URL host does not match its explicit host",
+        )
+    if values["allowed host"].lower() not in {host.lower() for host in allowed_hosts}:
+        return OptionalProfileStatus(
+            alias=spec.alias,
+            status="TERRA_NOT_CONFIGURED",
+            reason="optional host is not explicitly admitted to the active allowlist",
+        )
+    return values["base URL"], values["model"], values["API key"]
 
 
 def _required_text(spec: Mapping[str, Any], field_name: str, context: str) -> str:

@@ -95,6 +95,9 @@ class PatchStore(Protocol):
     async def list_change_sets(self, *, tool_call_id: str) -> tuple[ChangeSet, ...]:
         """Find durable ChangeSets for idempotent tool-call replay."""
 
+    async def get_change_set(self, change_set_id: str) -> ChangeSet:
+        """Read one persisted ChangeSet after an atomic patch commit."""
+
 
 @dataclass(frozen=True)
 class _Hunk:

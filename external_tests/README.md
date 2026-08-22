@@ -1,77 +1,48 @@
-# External validation
+# Optional External Validation
 
-The external validation campaign uses five active profiles and a bounded request
-budget. Profile definitions are hardcoded in `credential_loader.PROFILE_CONTRACTS`.
+This directory contains optional, manually started provider and integration
+checks. It is not required for the core package test suite and never runs as a
+side effect of importing the project.
 
-**Authoritative credential source**: `/home/bruce/文档/测试key.md`
+## Configuration
 
-The runner reads explicitly authorized credentials from the above Markdown file.
-Keys are authorized for test use and visibility in test context. The deprecated
-`credentials.json` file contains stale keys and incorrect endpoints and MUST NOT
-be used.
+The harness reads provider credentials from environment variables only. It does
+not read credential files, repository files, home-directory files, or command
+arguments containing secrets.
 
-The active profiles are:
+Set the required variables outside the repository when running a live stage:
 
-| Alias | Model | Protocol | Base URL |
-| --- | --- | --- | --- |
-| `DEEPSEEK_FLASH_CHAT` | `deepseek-v4-flash` | `OPENAI_CHAT` | `https://api.deepseek.com` |
-| `DEEPSEEK_FLASH_RESPONSES` | `deepseek-v4-flash` | `OPENAI_RESPONSES` | `https://api.deepseek.com` |
-| `DEEPSEEK_FLASH_ANTHROPIC` | `deepseek-v4-flash` | `ANTHROPIC_MESSAGES` | `https://api.deepseek.com/anthropic` |
-| `LUNA_GPT_56` | `gpt-5.6-luna` | `OPENAI_RESPONSES` | `https://fast.vanyospace.com` |
-| `CLAUDE_SONNET_5` | `claude-sonnet-5` | `ANTHROPIC_MESSAGES` | `https://fast.vanyospace.com` |
+```text
+PRP_EXTERNAL_DEEPSEEK_FLASH_CHAT_API_KEY=<YOUR_PROVIDER_KEY>
+PRP_EXTERNAL_DEEPSEEK_FLASH_RESPONSES_API_KEY=<YOUR_PROVIDER_KEY>
+PRP_EXTERNAL_DEEPSEEK_FLASH_ANTHROPIC_API_KEY=<YOUR_PROVIDER_KEY>
+PRP_EXTERNAL_LUNA_GPT_56_API_KEY=<YOUR_PROVIDER_KEY>
+PRP_EXTERNAL_CLAUDE_SONNET_5_API_KEY=<YOUR_PROVIDER_KEY>
+```
 
-Only `api.deepseek.com` and `fast.vanyospace.com` are in the active host
-allowlist. TLS remains enabled and the harness does not use ambient proxy
-settings.
+The values above are placeholders. Never commit real keys. Optional Terra
+fallback metadata is also environment-only:
 
-The bounded budget is 24 provider attempts globally, at most 6 attempts per
-alias, with 128 output tokens for ordinary requests and 256 for
-planner/progressive/agent requests. Requests are serialized.
+- `PRP_EXTERNAL_TERRA_GPT_MODEL`
+- `PRP_EXTERNAL_TERRA_GPT_BASE_URL`
+- `PRP_EXTERNAL_TERRA_GPT_API_KEY`
+- `PRP_EXTERNAL_TERRA_GPT_ALLOWED_HOST`
 
-## Live Success Definition
+The runner accepts `--stage`, `--select`, `--interface`, `--case`, and an
+optional `--result-file`. It does not accept a credential-file argument.
 
-A test result counts as live provider success ONLY when:
+## Results and Safety
 
-1. A genuine socket request reached the provider endpoint
-2. The request used correct host, model, and protocol per the contract
-3. A non-empty, parseable response was returned
-4. The corresponding ledger entry was persisted
+Results default to `external_tests/.results/` and can be redirected with
+`PRP_EXTERNAL_RESULT_DIR` or `--result-file`. Capability evidence can be
+redirected with `PRP_LIVE_CAPABILITY_FILE`. These outputs are local validation
+artifacts and are ignored by Git.
 
-Collection-only tests, fake adapters, and mocked HTTP do NOT qualify as live success.
+Live success requires an actual HTTPS provider response and a persisted,
+redacted ledger entry. Collection-only checks, fake adapters, and mocked HTTP
+are never reported as live success. Requests are serialized, budgets are
+bounded, and provider failures are classified without exposing credentials.
 
-## Result Classification
-
-Test scenarios classify their outcomes into eight categories:
-
-- `PASS`: Test passed, product behavior is correct.
-- `PRODUCT_DEFECT`: PRP runtime defect confirmed.
-- `UPSTREAM_UNSUPPORTED`: Upstream provider does not support the protocol.
-- `UPSTREAM_AUTH_OR_PERMISSION`: Credential invalid or quota exhausted.
-- `UPSTREAM_TRANSIENT`: Upstream timeout or 5xx, may succeed on retry.
-- `ENVIRONMENT_LIMITATION`: Local environment constraint (network block, missing file).
-- `BUDGET_NOT_RUN`: Not executed due to budget limit.
-- `NOT_APPLICABLE`: Scenario not applicable to this configuration.
-
-Classified failures do not block independent test groups. The runner continues
-execution after classification and records all results in bounded log files.
-
-## Log Files
-
-All logs are written to `/home/bruce/文档/prp测试日志/real-gap-closure/` with fixed names:
-
-- `00-harness.log`: Runner startup and stage transitions.
-- `10-providers.jsonl`: Provider smoke tests.
-- `20-protocols.jsonl`: Runtime integration tests.
-- `30-strategies.jsonl`: Strategy and reasoning tests.
-- `40-agent.jsonl`: Agent tool workflow tests.
-- `50-regression.log`: Regression and final tests.
-- `99-final-report.md`: Campaign summary and findings.
-
-Each file is capped at 2 MiB; total directory is capped at 16 MiB. Logs contain
-redacted command output, structured results, and classification rationale.
-Credentials are redacted where possible but visibility is not a blocker.
-
-The external runner reads explicitly authorized credentials from
-`/home/bruce/文档/测试key.md` in its child process. Keys are never placed in
-this documentation, command arguments, reports, ledgers, events, or the Agent
-environment.
+The matrix, budget, and migration notes describe the optional checks only; they
+do not expand the production package boundary or claim universal provider/API
+compatibility.

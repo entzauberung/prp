@@ -259,6 +259,9 @@ class OpenAIResponsesProvider:
         calls: list[AgentToolCall] = []
         seen_ids: set[str] = set()
         for block in raw:
+            if isinstance(block, dict) and block.get("type") == "reasoning":
+                self._validate_reasoning_companion(block)
+                continue
             if not isinstance(block, dict) or set(block) - {
                 "type",
                 "id",
@@ -297,7 +300,61 @@ class OpenAIResponsesProvider:
                 raise self._invalid_response("function_call ids must be unique")
             seen_ids.add(call.call_id)
             calls.append(call)
+        if not calls:
+            raise self._invalid_response("function_call output is empty")
         return tuple(calls)
+
+    def _validate_reasoning_companion(self, block: dict[str, Any]) -> None:
+        if set(block) - {
+            "type",
+            "id",
+            "status",
+            "summary",
+            "content",
+            "encrypted_content",
+        }:
+            raise self._invalid_response("reasoning companion has an unsupported shape")
+        item_id = block.get("id")
+        if item_id is not None and (
+            not isinstance(item_id, str)
+            or not item_id.strip()
+            or len(item_id) > MAX_RESPONSE_ID_CHARS
+        ):
+            raise self._invalid_response("reasoning companion id is malformed")
+        status = block.get("status")
+        if status not in (None, "in_progress", "completed", "incomplete"):
+            raise self._invalid_response("reasoning companion status is unsupported")
+        self._validate_reasoning_text_blocks(
+            block.get("summary"), expected_type="summary_text", field_name="summary"
+        )
+        self._validate_reasoning_text_blocks(
+            block.get("content"), expected_type="reasoning_text", field_name="content"
+        )
+        encrypted = block.get("encrypted_content")
+        if encrypted is not None and not isinstance(encrypted, str):
+            raise self._invalid_response("reasoning companion encryption is malformed")
+
+    def _validate_reasoning_text_blocks(
+        self,
+        raw: object,
+        *,
+        expected_type: str,
+        field_name: str,
+    ) -> None:
+        if raw is None:
+            return
+        if not isinstance(raw, list):
+            raise self._invalid_response(f"reasoning companion {field_name} is malformed")
+        for item in raw:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"type", "text"}
+                or item.get("type") != expected_type
+                or not isinstance(item.get("text"), str)
+            ):
+                raise self._invalid_response(
+                    f"reasoning companion {field_name} is malformed"
+                )
 
     def _parse_output_blocks(self, raw: object) -> str:
         if not isinstance(raw, list) or not raw:
@@ -324,7 +381,10 @@ class OpenAIResponsesProvider:
             "encrypted_content", "summary"  # DeepSeek extensions
         }
         if extra_fields:
-            raise self._invalid_response(f"output message block contains unsupported fields: {extra_fields}")
+            raise self._invalid_response(
+                "output message block contains unsupported fields: "
+                f"{extra_fields}"
+            )
         msg_type = message.get("type")
         if msg_type is not None and msg_type not in ("message", "reasoning"):
             raise self._invalid_response(f"output contains an unsupported block type: {msg_type}")
@@ -335,11 +395,19 @@ class OpenAIResponsesProvider:
             raise self._invalid_response("output message has no content blocks")
         text_parts: list[str] = []
         for block in content:
-            if not isinstance(block, dict) or set(block) - {"type", "text", "annotations", "logprobs"}:
+            if not isinstance(block, dict) or set(block) - {
+                "type",
+                "text",
+                "annotations",
+                "logprobs",
+            }:
                 raise self._invalid_response("output text block contains unsupported fields")
             block_type = block.get("type")
             if block_type not in ("output_text", "reasoning_text"):
-                raise self._invalid_response(f"output contains a mixed or unsupported text block: {block_type}")
+                raise self._invalid_response(
+                    "output contains a mixed or unsupported text block: "
+                    f"{block_type}"
+                )
             value = block.get("text")
             if not isinstance(value, str) or not value.strip():
                 raise self._invalid_response("output text block is empty")

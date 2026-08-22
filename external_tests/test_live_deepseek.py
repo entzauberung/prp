@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -17,15 +18,6 @@ from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
-
-from prp_runtime.app import create_app
-from prp_runtime.domain.enums import AttemptStatus, ModelRole, RunStatus
-from prp_runtime.providers.base import ModelProfile, ProviderProtocol
-from prp_runtime.providers.anthropic import AnthropicMessagesProvider
-from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
-from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
-from prp_runtime.settings import Settings
-from prp_runtime.storage.sqlite import SqliteStore
 
 from external_tests.result_ledger import LedgerEntry, LedgerStore
 from external_tests.support import (
@@ -36,6 +28,14 @@ from external_tests.support import (
     create_external_http_client,
     validate_external_url,
 )
+from prp_runtime.app import create_app
+from prp_runtime.domain.enums import AttemptStatus, ModelRole, RunStatus
+from prp_runtime.providers.anthropic import AnthropicMessagesProvider
+from prp_runtime.providers.base import ModelProfile, ProviderProtocol
+from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
+from prp_runtime.providers.openai_responses import OpenAIResponsesProvider
+from prp_runtime.settings import Settings
+from prp_runtime.storage.sqlite import SqliteStore
 
 DEEPSEEK_ALIASES = (
     "DEEPSEEK_FLASH_CHAT",
@@ -155,7 +155,7 @@ def _record_entry(
     usage = attempt.usage
     content = artifact.content if artifact is not None else None
     return LedgerEntry(
-        scenario_id=f"wo-001-st-003-{profile.alias.lower()}",
+        scenario_id=_scenario_id(profile, attempt.attempt_id),
         alias=profile.alias,
         model_id=profile.model_id,
         protocol=profile.protocol,
@@ -180,6 +180,43 @@ def _record_entry(
             else "unknown"
         ),
     )
+
+
+def _scenario_id(profile: ExternalProfile, attempt_id: str) -> str:
+    """Keep bounded retry evidence without conflicting with the first record."""
+    base = f"wo-001-st-003-{profile.alias.lower()}"
+    existing = LedgerStore(_result_path()).read()
+    if any(entry.scenario_id == base for entry in existing):
+        return f"{base}-retry-{attempt_id}"
+    return base
+
+
+def _failure_classification(final: dict[str, Any] | None, attempt: Any) -> str:
+    """Classify the redacted runtime failure for the campaign ledger."""
+    message = ""
+    if final is not None:
+        final_error = final.get("error")
+        if isinstance(final_error, dict) and isinstance(final_error.get("message"), str):
+            message = final_error["message"]
+    if not message and attempt.error is not None:
+        message = attempt.error.message
+    normalized = message.lower()
+    status_match = re.search(r"returned status (\d{3})", normalized)
+    if status_match:
+        status = int(status_match.group(1))
+        if status in (401, 403):
+            return "UPSTREAM_AUTH_OR_PERMISSION"
+        if status == 429 or status in (408, 504) or status >= 500:
+            return "UPSTREAM_TRANSIENT"
+        if 400 <= status < 500:
+            return "UPSTREAM_UNSUPPORTED"
+    if "timed out" in normalized or "unreachable" in normalized:
+        return "UPSTREAM_TRANSIENT"
+    if "unusable response" in normalized:
+        return "UPSTREAM_UNSUPPORTED"
+    if "profile" in normalized or "contract" in normalized:
+        return "PRODUCT_DEFECT"
+    return attempt.error.category.value if attempt.error is not None else "UNKNOWN"
 
 
 @pytest.mark.live_provider
@@ -234,11 +271,7 @@ def test_deepseek_multi_protocol_smoke_persists_redacted_evidence(
         )
         error_code = None
         if not succeeded:
-            final_error = final.get("error") if final is not None else None
-            if isinstance(final_error, dict) and isinstance(final_error.get("code"), str):
-                error_code = final_error["code"]
-            elif attempt.error is not None:
-                error_code = attempt.error.category.value
+            error_code = _failure_classification(final, attempt)
         entry = _record_entry(
             profile=profile,
             run_id=run_id,

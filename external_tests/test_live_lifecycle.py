@@ -11,17 +11,16 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from external_tests.result_ledger import LedgerEntry, LedgerStore
+from external_tests.support import ExternalConfig, validate_external_url
+from external_tests.test_live_deepseek import _profile_for_runtime
+from external_tests.test_live_protocols import PROTOCOL_RESULT_FILE, _profile_by_alias
 from prp_runtime.app import create_app
 from prp_runtime.domain.enums import ModelRole, RunStatus
 from prp_runtime.domain.models import Usage
 from prp_runtime.providers.base import FinishReason, ModelProfile, ProviderRequest, ProviderResponse
 from prp_runtime.settings import Settings
 from prp_runtime.storage.sqlite import SqliteStore
-
-from external_tests.result_ledger import LedgerEntry, LedgerStore
-from external_tests.support import ExternalConfig, validate_external_url
-from external_tests.test_live_deepseek import _profile_for_runtime
-from external_tests.test_live_protocols import PROTOCOL_RESULT_FILE, _profile_by_alias
 
 LIFECYCLE_RESULT_ID_PREFIX = "wo-003-st-002-real-lifecycle"
 LOCAL_PROFILE = ModelProfile(
@@ -89,7 +88,7 @@ def test_lifecycle_real_sse_replay_and_cancel(
     alias = "DEEPSEEK_FLASH_RESPONSES"
     if not any(
         entry.alias == alias and entry.status == "PASS"
-        for entry in LedgerStore(Path("/home/bruce/文档/prp测试日志/real-gap-closure/10-providers.jsonl")).read()
+        for entry in LedgerStore(PROTOCOL_RESULT_FILE).read()
     ):
         pytest.skip("real lifecycle requires a prior Responses provider PASS")
     profile = _profile_by_alias(external_config, alias)

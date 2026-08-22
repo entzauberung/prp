@@ -113,6 +113,47 @@ async def test_successful_completion_is_normalised(
     assert route.calls.last.request.headers["authorization"] == f"Bearer {SECRET}"
 
 
+def test_reasoning_content_metadata_preserves_final_text() -> None:
+    adapter = OpenAICompatibleProvider(profile())
+    body = completion_body(
+        choices=[
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "the final answer",
+                    "reasoning_content": "provider-private reasoning metadata",
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    )
+
+    response = adapter._parse(httpx.Response(200, json=body), elapsed_ms=1)
+
+    assert response.text == "the final answer"
+
+
+def test_reasoning_content_metadata_must_be_text_or_null() -> None:
+    adapter = OpenAICompatibleProvider(profile())
+    body = completion_body(
+        choices=[
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "the final answer",
+                    "reasoning_content": {"unexpected": "shape"},
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    )
+
+    with pytest.raises(ProviderError, match="reasoning content is not text"):
+        adapter._parse(httpx.Response(200, json=body), elapsed_ms=1)
+
+
 @pytest.mark.asyncio
 async def test_instructions_are_omitted_when_absent(
     provider: OpenAICompatibleProvider, mocked_http: respx.MockRouter
@@ -577,6 +618,7 @@ async def test_zero_token_usage_is_kept_as_a_measurement(
         (401, ErrorCode.PROVIDER_AUTH_FAILED, False),
         (403, ErrorCode.PROVIDER_AUTH_FAILED, False),
         (408, ErrorCode.PROVIDER_TIMEOUT, True),
+        (504, ErrorCode.PROVIDER_TIMEOUT, True),
         (429, ErrorCode.PROVIDER_RATE_LIMITED, True),
         (400, ErrorCode.PROVIDER_INVALID_RESPONSE, False),
         (404, ErrorCode.PROVIDER_INVALID_RESPONSE, False),

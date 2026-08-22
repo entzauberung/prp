@@ -10,7 +10,7 @@ __version__ = "0.0.2"
 
 PACKAGE_NAME = "prp-runtime"
 
-LICENSE_EXPRESSION = "MIT OR Apache-2.0"
+LICENSE_EXPRESSION = "Apache-2.0"
 
 
 def package_info() -> dict[str, str]:

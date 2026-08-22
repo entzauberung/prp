@@ -1,5 +1,6 @@
 """Outbound provider adapters."""
 
+from prp_runtime.providers.anthropic import AnthropicMessagesProvider
 from prp_runtime.providers.base import (
     FinishReason,
     ModelProfile,
@@ -8,7 +9,6 @@ from prp_runtime.providers.base import (
     ProviderRequest,
     ProviderResponse,
 )
-from prp_runtime.providers.anthropic import AnthropicMessagesProvider
 from prp_runtime.providers.factory import build_provider_adapter
 from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
 from prp_runtime.providers.openai_responses import OpenAIResponsesProvider

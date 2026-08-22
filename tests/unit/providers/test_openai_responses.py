@@ -211,6 +211,7 @@ def test_tool_response_function_call_is_normalised() -> None:
                 "output": [
                     {
                         "type": "function_call",
+                        "id": "fc-item-1",
                         "call_id": "call-search",
                         "name": "search_text",
                         "arguments": '{"pattern":"Provider"}',
@@ -224,6 +225,69 @@ def test_tool_response_function_call_is_normalised() -> None:
     assert response.finish_reason is FinishReason.TOOL_CALLS
     assert response.tool_calls[0].call_id == "call-search"
     assert response.tool_calls[0].arguments == {"pattern": "Provider"}
+
+
+def test_tool_response_accepts_validated_reasoning_companion() -> None:
+    adapter = OpenAIResponsesProvider(profile())
+    response = adapter._parse(
+        httpx.Response(
+            200,
+            json={
+                "id": "resp-tool-reasoning",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs-1",
+                        "status": "completed",
+                        "summary": [
+                            {"type": "summary_text", "text": "private summary"}
+                        ],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call-search",
+                        "name": "search_text",
+                        "arguments": '{"pattern":"Provider"}',
+                    },
+                ],
+            },
+        ),
+        elapsed_ms=3,
+    )
+
+    assert response.text is None
+    assert response.tool_calls[0].tool_name == "search_text"
+
+
+@pytest.mark.parametrize(
+    "companion",
+    [
+        {"type": "message", "role": "assistant", "content": []},
+        {"type": "reasoning", "summary": [], "unexpected": "private"},
+        {"type": "reasoning", "summary": "private"},
+    ],
+)
+def test_tool_response_rejects_unvalidated_companions_without_echo(
+    companion: dict[str, object],
+) -> None:
+    adapter = OpenAIResponsesProvider(profile())
+    body = {
+        "output": [
+            companion,
+            {
+                "type": "function_call",
+                "call_id": "call-search",
+                "name": "search_text",
+                "arguments": "{}",
+            },
+        ]
+    }
+
+    with pytest.raises(ProviderError) as excinfo:
+        adapter._parse(httpx.Response(200, json=body), elapsed_ms=1)
+
+    assert "private" not in str(excinfo.value)
 
 
 def test_tool_response_duplicate_ids_and_non_object_arguments_fail_closed() -> None:

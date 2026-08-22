@@ -3,8 +3,8 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-import pytest
 
+import pytest
 
 PREFLIGHT_EXPECTED_ALIASES = (
     "DEEPSEEK_FLASH_CHAT",

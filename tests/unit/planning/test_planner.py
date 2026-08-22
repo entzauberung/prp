@@ -132,6 +132,18 @@ async def test_planner_builds_one_structured_request_and_returns_a_proposal() ->
     assert not hasattr(planner, "_store")
 
 
+def test_planner_repair_request_keeps_schema_and_adds_public_feedback() -> None:
+    planner = Planner(FakeAdapter(_response(_proposal_text())), _profile())  # type: ignore[arg-type]
+    request = planner.build_request(
+        NativeRunRequest(input="prepare a report"),
+        repair_feedback="plan proposal contains a dependency cycle",
+    )
+
+    assert request.json_schema is not None
+    assert "strict JSON PlanProposal" in (request.instructions or "")
+    assert "plan proposal contains a dependency cycle" in (request.instructions or "")
+
+
 @pytest.mark.asyncio
 async def test_propose_call_preserves_accounting_facts_without_raw_response() -> None:
     response = ProviderResponse(
@@ -267,6 +279,18 @@ async def test_invalid_planner_output_becomes_a_stable_rejection(text: str) -> N
         reasons=("response is not a valid PlanProposal",),
     )
     assert text not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_invalid_planner_output_has_a_precise_schema_error() -> None:
+    result = await Planner(FakeAdapter(_response("not json")), _profile()).propose_call(  # type: ignore[arg-type]
+        NativeRunRequest(input="hello")
+    )
+
+    assert result.rejection is not None
+    assert result.error is not None
+    assert result.error.category is ErrorCategory.INVALID_REQUEST
+    assert result.error.message.startswith("plan_schema_invalid:")
 
 
 @pytest.mark.asyncio

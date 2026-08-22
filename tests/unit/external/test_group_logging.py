@@ -189,7 +189,7 @@ def test_group_logger_get_total_bytes(tmp_path):
     total = logger.get_total_bytes()
     assert total > 0
     assert total == (
-        len("test output\n".encode("utf-8")) +
+        len(b"test output\n") +
         len(json.dumps({
             "scenario": "test",
             "classification": "PASS",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -12,22 +13,32 @@ from urllib.parse import urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
+from external_tests.capability_ledger import CapabilityStore
+from external_tests.result_ledger import LedgerEntry, LedgerStore
+from external_tests.support import (
+    ExternalConfig,
+    ExternalGateError,
+    ExternalProfile,
+    validate_external_url,
+)
+from external_tests.test_live_deepseek import _profile_for_runtime
+from external_tests.test_live_protocols import _profile_by_alias
 from prp_runtime.app import create_app
 from prp_runtime.domain.enums import AttemptStatus, ExecutionStrategy, ModelRole, RunStatus
 from prp_runtime.domain.errors import ErrorCode, ProviderError
-from prp_runtime.providers.base import ModelProfile, ProviderAdapter, ProviderRequest, ProviderResponse
+from prp_runtime.domain.events import EventType
+from prp_runtime.domain.models import Usage
+from prp_runtime.providers.base import (
+    FinishReason,
+    ModelProfile,
+    ProviderAdapter,
+    ProviderRequest,
+    ProviderResponse,
+)
 from prp_runtime.providers.factory import build_provider_adapter
 from prp_runtime.settings import Settings
 from prp_runtime.storage.sqlite import SqliteStore
 
-from external_tests.capability_ledger import CapabilityStore
-from external_tests.result_ledger import LedgerEntry, LedgerStore
-from external_tests.support import ExternalConfig, ExternalGateError, ExternalProfile, validate_external_url
-from external_tests.test_live_deepseek import _profile_for_runtime
-from external_tests.test_live_protocols import _profile_by_alias
-
-PROVIDER_RESULT_FILE = Path("/home/bruce/文档/prp测试日志/real-gap-closure/10-providers.jsonl")
-CAPABILITY_RESULT_FILE = Path("/home/bruce/prp/ai/PROVIDER-CAPABILITIES.json")
 ALIAS = "DEEPSEEK_FLASH_RESPONSES"
 TERMINAL_RUN_STATUSES = {status.value for status in RunStatus if status.is_terminal}
 
@@ -46,6 +57,88 @@ class LocalFailureAdapter:
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         raise ProviderError("bounded local strategy fault", code=self.code)
+
+    async def aclose(self) -> None:
+        return None
+
+
+_LOCAL_PROGRESSIVE_SCHEMA = (
+    '{"type":"object","properties":{"ok":{"const":true}},'
+    '"required":["ok"],"additionalProperties":false}'
+)
+
+
+class LocalProgressivePlannerAdapter:
+    """Deterministic planner fixture for the production Progressive composition."""
+
+    def __init__(self) -> None:
+        self.requests: list[ProviderRequest] = []
+
+    @property
+    def name(self) -> str:
+        return "local-progressive-planner"
+
+    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            document: dict[str, object] = {
+                "summary": "local progressive initial graph",
+                "final_node": "initial",
+                "nodes": [
+                    {
+                        "key": "initial",
+                        "name": "Initial",
+                        "instruction": "produce initial",
+                        "output": {"kind": "JSON", "json_schema": _LOCAL_PROGRESSIVE_SCHEMA},
+                    }
+                ],
+            }
+        else:
+            document = {
+                "base_graph_version": 2,
+                "reason": "VERIFICATION_FAILED",
+                "summary": "local progressive corrected graph",
+                "proposal": {
+                    "summary": "local progressive corrected graph",
+                    "final_node": "revised",
+                    "nodes": [
+                        {
+                            "key": "revised",
+                            "name": "Revised",
+                            "instruction": "produce revised",
+                            "output": {"kind": "JSON", "json_schema": _LOCAL_PROGRESSIVE_SCHEMA},
+                        }
+                    ],
+                },
+            }
+        return ProviderResponse(
+            text=json.dumps(document),
+            usage=Usage(input_tokens=1, output_tokens=1),
+            finish_reason=FinishReason.STOP,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+class LocalProgressiveWorkerAdapter:
+    """Return one verifier-failing artifact, then one passing artifact."""
+
+    def __init__(self) -> None:
+        self.requests: list[ProviderRequest] = []
+
+    @property
+    def name(self) -> str:
+        return "local-progressive-worker"
+
+    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        self.requests.append(request)
+        output = "{\"ok\":false}" if len(self.requests) == 1 else "{\"ok\":true}"
+        return ProviderResponse(
+            text=output,
+            usage=Usage(input_tokens=1, output_tokens=1),
+            finish_reason=FinishReason.STOP,
+        )
 
     async def aclose(self) -> None:
         return None
@@ -70,25 +163,49 @@ def _result_path() -> Path:
     return Path(value)
 
 
+def _capability_path() -> Path:
+    value = os.environ.get("PRP_LIVE_CAPABILITY_FILE")
+    if value is None or not value.strip():
+        raise ExternalGateError(
+            "PRP_LIVE_CAPABILITY_FILE is required for strategy evidence"
+        )
+    return Path(value)
+
+
 def _provider_passed() -> bool:
-    return any(
-        entry.alias == ALIAS and entry.status == "PASS"
-        for entry in LedgerStore(PROVIDER_RESULT_FILE).read()
+    provider_passed = any(
+        entry.alias == ALIAS
+        and entry.protocol == "OPENAI_RESPONSES"
+        and entry.status == "PASS"
+        and entry.actual_or_simulated == "ACTUAL"
+        for entry in LedgerStore(_result_path()).read()
     )
+    capability_passed = any(
+        entry.alias == ALIAS
+        and entry.protocol == "OPENAI_RESPONSES"
+        and entry.status == "PASS"
+        and entry.actual_or_simulated == "ACTUAL"
+        for entry in CapabilityStore(_capability_path()).read()
+    )
+    return provider_passed or capability_passed
 
 
 def _structured_output_passed() -> bool:
     return any(
         entry.alias == ALIAS
+        and entry.protocol == "OPENAI_RESPONSES"
         and entry.capability == "structured_output"
         and entry.status == "PASS"
-        for entry in CapabilityStore(CAPABILITY_RESULT_FILE).read()
+        and entry.actual_or_simulated == "ACTUAL"
+        for entry in CapabilityStore(_capability_path()).read()
     )
 
 
 def _planned_passed() -> bool:
     return any(
-        entry.scenario_id == "wo-004-st-002-planned" and entry.status == "PASS"
+        entry.scenario_id.startswith("wo-004-st-002-planned")
+        and entry.status == "PASS"
+        and entry.actual_or_simulated == "ACTUAL"
         for entry in LedgerStore(_result_path()).read()
     )
 
@@ -160,10 +277,14 @@ def _record(
     protocol: str,
 ) -> None:
     usage = attempt.usage
+    result_path = _result_path()
+    scenario_id = scenario
+    if any(entry.scenario_id == scenario for entry in LedgerStore(result_path).read()):
+        scenario_id = f"{scenario}-retry-{attempt.attempt_id}"
     LedgerStore(_result_path()).merge(
         [
             LedgerEntry(
-                scenario_id=scenario,
+                scenario_id=scenario_id,
                 alias=profile.alias,
                 model_id=profile.model_id,
                 protocol=protocol,
@@ -199,10 +320,13 @@ def _record_planned(
 ) -> None:
     usage = run.usage
     first_attempt = attempts[0] if attempts else None
+    scenario_id = "wo-004-st-002-planned"
+    if any(entry.scenario_id == scenario_id for entry in LedgerStore(_result_path()).read()):
+        scenario_id = f"{scenario_id}-retry-{run.run_id}"
     LedgerStore(_result_path()).merge(
         [
             LedgerEntry(
-                scenario_id="wo-004-st-002-planned",
+                scenario_id=scenario_id,
                 alias=profile.alias,
                 model_id=profile.model_id,
                 protocol="PLANNED->GRAPH_V2",
@@ -230,6 +354,55 @@ def _record_planned(
     )
 
 
+def _record_progressive(
+    *,
+    path: Path,
+    run: Any,
+    attempts: tuple[Any, ...],
+    status: str,
+    actual_or_simulated: str,
+    error_code: str | None,
+    endpoint_host: str,
+) -> None:
+    usage = run.usage
+    first_attempt = attempts[0] if attempts else None
+    scenario_id = "wo-003-st-003-progressive"
+    if any(entry.scenario_id == scenario_id for entry in LedgerStore(path).read()):
+        scenario_id = f"{scenario_id}-retry-{run.run_id}"
+    LedgerStore(path).merge(
+        [
+            LedgerEntry(
+                scenario_id=scenario_id,
+                alias="LOCAL_PROGRESSIVE" if actual_or_simulated == "SIMULATED" else ALIAS,
+                model_id=(
+                    "local-progressive"
+                    if actual_or_simulated == "SIMULATED"
+                    else (attempts[0].model.model if attempts else "unknown")
+                ),
+                protocol="PROGRESSIVE->REVISION",
+                endpoint_host=endpoint_host,
+                run_id=run.run_id,
+                attempt_id=(
+                    first_attempt.attempt_id if first_attempt is not None else "not-recorded"
+                ),
+                status=status,
+                actual_or_simulated=actual_or_simulated,
+                input_tokens=usage.input_tokens if usage is not None else None,
+                output_tokens=usage.output_tokens if usage is not None else None,
+                known_cost="unknown",
+                latency_ms=usage.elapsed_ms if usage is not None else None,
+                error_code=error_code,
+                output_sha256=None,
+                recorded_at=(
+                    run.completed_at.isoformat()
+                    if run.completed_at is not None
+                    else "completed"
+                ),
+            )
+        ]
+    )
+
+
 def _planned_failure_classification(run: Any, attempts: tuple[Any, ...]) -> tuple[str, str | None]:
     error = run.error
     if error is None and attempts:
@@ -242,6 +415,83 @@ def _planned_failure_classification(run: Any, attempts: tuple[Any, ...]) -> tupl
     if category == "PROVIDER_ERROR":
         return "UPSTREAM_UNSUPPORTED", category
     return "PRODUCT_DEFECT", category
+
+
+def _local_progressive_profile(alias: str, role: ModelRole) -> ModelProfile:
+    return ModelProfile(
+        alias=alias,
+        provider="local",
+        model=f"{alias}-model",
+        role=role,
+        base_url="https://local.invalid",
+        supports_structured_output=True,
+        context_window_tokens=8_192,
+        max_output_tokens=256,
+    )
+
+
+def test_progressive_local_revision(temporary_resources: Any) -> None:
+    """Run the real production Progressive path with an explicitly simulated adapter."""
+    database = temporary_resources.database_path.with_name("progressive-local.sqlite3")
+    result_path = temporary_resources.database_path.with_name("progressive-local-results.jsonl")
+    planner = LocalProgressivePlannerAdapter()
+    worker = LocalProgressiveWorkerAdapter()
+    planner_profile = _local_progressive_profile("local-progressive-planner", ModelRole.PLANNER)
+    worker_profile = _local_progressive_profile("local-progressive-worker", ModelRole.WORKER)
+    app = create_app(
+        Settings(
+            database_path=database,
+            leader_profile=planner_profile,
+            worker_profile=worker_profile,
+        ),
+        adapters={planner_profile.alias: planner, worker_profile.alias: worker},
+    )
+
+    with TestClient(app) as client:
+        final = _execute(
+            client,
+            {
+                "input": "produce a verified JSON result",
+                "routing_policy": "MANUAL",
+                "strategy": "PROGRESSIVE",
+                "budget": {"max_plan_revisions": 1, "max_attempts": 4},
+            },
+        )
+
+    async def inspect() -> tuple[Any, tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
+        async with SqliteStore(database) as store:
+            run = await store.get_run(final["run_id"])
+            attempts = await store.list_run_attempts(run.run_id)
+            rounds = await store.list_rounds(run.run_id)
+            events = await store.list_events(run.run_id)
+            return run, attempts, rounds, events
+
+    run, attempts, rounds, events = asyncio.run(inspect())
+    assert run.status is RunStatus.SUCCEEDED, run.error
+    assert run.strategy is ExecutionStrategy.PROGRESSIVE
+    assert run.graph_version == 3
+    assert [round_fact.status.value for round_fact in rounds] == ["FAILED", "VERIFIED"]
+    assert [round_fact.graph_version for round_fact in rounds] == [2, 3]
+    assert not rounds[0].evidence_ids
+    assert rounds[1].evidence_ids
+    assert len(planner.requests) == 2
+    assert len(worker.requests) == 2
+    assert len(attempts) == 4
+    assert EventType.PLAN_REVISED in {event.event_type for event in events}
+
+    _record_progressive(
+        path=result_path,
+        run=run,
+        attempts=attempts,
+        status="PASS",
+        actual_or_simulated="SIMULATED",
+        error_code=None,
+        endpoint_host="local.invalid",
+    )
+    entries = LedgerStore(result_path).read()
+    assert len(entries) == 1
+    assert entries[0].actual_or_simulated == "SIMULATED"
+    assert entries[0].status == "PASS"
 
 
 @pytest.mark.live_strategy
@@ -426,7 +676,7 @@ def test_planned_real_dag(
             "alias": "planned-planner",
             "role": ModelRole.PLANNER,
             "supports_structured_output": True,
-            "max_output_tokens": 256,
+            "max_output_tokens": 1024,
         }
     )
     worker_profile = runtime_profile.model_copy(
@@ -535,7 +785,78 @@ def test_progressive_real_revision(
         pytest.skip("real Progressive revision requires a verified real Planner DAG")
 
     validate_external_url(profile.base_url, external_config.allowed_hosts)
-    raise AssertionError(
-        "Progressive live execution requires a verified real Planner DAG and is not "
-        "implemented by a fake revision path"
+    runtime_profile = _profile_for_runtime(profile)
+    planner_profile = runtime_profile.model_copy(
+        update={
+            "alias": "progressive-planner",
+            "role": ModelRole.PLANNER,
+            "supports_structured_output": True,
+            "max_output_tokens": 4096,
+        }
+    )
+    worker_profile = runtime_profile.model_copy(
+        update={
+            "alias": "progressive-worker",
+            "role": ModelRole.WORKER,
+            "supports_structured_output": True,
+            "max_output_tokens": 256,
+        }
+    )
+    database = temporary_resources.database_path.with_name("progressive-real.sqlite3")
+    app = create_app(
+        Settings(
+            database_path=database,
+            leader_profile=planner_profile,
+            worker_profile=worker_profile,
+        )
+    )
+    with TestClient(app) as client:
+        final = _execute(
+            client,
+            {
+                "input": (
+                    "Produce a short JSON answer. Use a bounded plan and verify the "
+                    "final artifact before stopping."
+                ),
+                "routing_policy": "MANUAL",
+                "strategy": "PROGRESSIVE",
+                "budget": {"max_plan_revisions": 1, "max_attempts": 6},
+            },
+        )
+
+    run, attempts, events = asyncio.run(_facts(database, final["run_id"]))
+    if run.status is not RunStatus.SUCCEEDED:
+        classification, error_code = _planned_failure_classification(run, attempts)
+        _record_progressive(
+            path=_result_path(),
+            run=run,
+            attempts=attempts,
+            status=classification,
+            actual_or_simulated="ACTUAL",
+            error_code=error_code,
+            endpoint_host=urlsplit(profile.base_url).hostname or "unknown",
+        )
+        pytest.fail(f"real Progressive run failed: {classification}")
+
+    async def inspect_rounds() -> tuple[Any, ...]:
+        async with SqliteStore(database) as store:
+            return await store.list_rounds(run.run_id)
+
+    rounds = asyncio.run(inspect_rounds())
+    assert run.strategy is ExecutionStrategy.PROGRESSIVE
+    assert 1 <= len(rounds) <= 2
+    assert all(round_fact.evidence_ids for round_fact in rounds)
+    assert all(round_fact.graph_version >= 2 for round_fact in rounds)
+    if len(rounds) == 2:
+        assert rounds[1].graph_version > rounds[0].graph_version
+        assert rounds[1].revision_of_round_id == rounds[0].round_id
+    assert EventType.CONTROLLER_DECISION in {event.event_type for event in events}
+    _record_progressive(
+        path=_result_path(),
+        run=run,
+        attempts=attempts,
+        status="PASS",
+        actual_or_simulated="ACTUAL",
+        error_code=None,
+        endpoint_host=urlsplit(profile.base_url).hostname or "unknown",
     )

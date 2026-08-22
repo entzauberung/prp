@@ -3237,7 +3237,12 @@ class SqliteStore:
                SET usage_input_tokens = usage_input_tokens + :input_tokens,
                    usage_output_tokens = usage_output_tokens + :output_tokens,
                    usage_strong_model_tokens = usage_strong_model_tokens + :strong_model_tokens,
-                   usage_elapsed_ms = usage_elapsed_ms + :elapsed_ms
+                   usage_elapsed_ms = usage_elapsed_ms + :elapsed_ms,
+                   metrics_provider_elapsed_ms = CASE
+                       WHEN metrics_usage_known = 1
+                       THEN COALESCE(metrics_provider_elapsed_ms, 0) + :elapsed_ms
+                       ELSE metrics_provider_elapsed_ms
+                   END
              WHERE run_id = :run_id
             """,
             {

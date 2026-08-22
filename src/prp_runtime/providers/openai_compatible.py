@@ -33,6 +33,7 @@ _FINISH_REASONS: dict[str, FinishReason] = {
     "max_tokens": FinishReason.LENGTH,
     "content_filter": FinishReason.CONTENT_FILTER,
 }
+_MESSAGE_FIELDS = frozenset({"role", "content", "tool_calls", "reasoning_content"})
 
 
 def _non_negative_int(value: object) -> int | None:
@@ -232,7 +233,7 @@ class OpenAICompatibleProvider:
             code = ErrorCode.PROVIDER_AUTH_FAILED
         elif status == 429:
             code = ErrorCode.PROVIDER_RATE_LIMITED
-        elif status == 408:
+        elif status in (408, 504):
             code = ErrorCode.PROVIDER_TIMEOUT
         elif status >= 500:
             code = ErrorCode.PROVIDER_UNAVAILABLE
@@ -266,10 +267,13 @@ class OpenAICompatibleProvider:
         message = choice.get("message")
         if not isinstance(message, dict):
             raise self._invalid_response("the first choice has no message object")
-        if set(message) - {"role", "content", "tool_calls"}:
+        if set(message) - _MESSAGE_FIELDS:
             raise self._invalid_response("the message contains unsupported fields")
         if "role" in message and message["role"] != "assistant":
             raise self._invalid_response("the first choice message is not an assistant message")
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content is not None and not isinstance(reasoning_content, str):
+            raise self._invalid_response("the message reasoning content is not text")
         request_id = document.get("id")
         if "tool_calls" in message:
             if message.get("content") is not None:
