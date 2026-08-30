@@ -68,6 +68,7 @@ class ErrorCode(StrEnum):
     ATTEMPT_BUDGET_EXCEEDED = "attempt_budget_exceeded"
     REVISION_BUDGET_EXCEEDED = "revision_budget_exceeded"
     DEADLINE_EXCEEDED = "deadline_exceeded"
+    RESOURCE_BUDGET_EXCEEDED = "resource_budget_exceeded"
 
     # PROVIDER
     PROVIDER_NOT_CONFIGURED = "provider_not_configured"
@@ -104,6 +105,7 @@ ERROR_FAMILIES: Mapping[ErrorCode, ErrorFamily] = MappingProxyType(
         ErrorCode.ATTEMPT_BUDGET_EXCEEDED: ErrorFamily.BUDGET,
         ErrorCode.REVISION_BUDGET_EXCEEDED: ErrorFamily.BUDGET,
         ErrorCode.DEADLINE_EXCEEDED: ErrorFamily.BUDGET,
+        ErrorCode.RESOURCE_BUDGET_EXCEEDED: ErrorFamily.BUDGET,
         ErrorCode.PROVIDER_NOT_CONFIGURED: ErrorFamily.PROVIDER,
         ErrorCode.PROVIDER_AUTH_FAILED: ErrorFamily.PROVIDER,
         ErrorCode.PROVIDER_RATE_LIMITED: ErrorFamily.PROVIDER,

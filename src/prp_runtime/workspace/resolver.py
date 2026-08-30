@@ -130,22 +130,22 @@ class WorkspaceResolver:
         )
 
     @staticmethod
-    def _validate_root_path(root: Path) -> None:
+    def _validate_root_path(root: Path, *, kind: str = "configured") -> None:
         """Reject symlinked or non-canonical components before backend open."""
         if not root.is_absolute() or root.anchor != "/":
-            raise WorkspaceResolveError("configured workspace root is not an absolute path")
+            raise WorkspaceResolveError(f"{kind} workspace root is not an absolute path")
         current = Path(root.anchor)
         for component in root.parts[1:]:
             if component in {"", ".", ".."}:
-                raise WorkspaceResolveError("configured workspace root is not canonical")
+                raise WorkspaceResolveError(f"{kind} workspace root is not canonical")
             current /= component
             try:
                 mode = current.lstat().st_mode
             except OSError as error:
                 raise WorkspaceResolveError(
-                    "configured workspace root is unavailable"
+                    f"{kind} workspace root is unavailable"
                 ) from error
             if stat.S_ISLNK(mode):
                 raise WorkspaceResolveError(
-                    "configured workspace root contains a symlink"
+                    f"{kind} workspace root contains a symlink"
                 )

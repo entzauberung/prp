@@ -2,7 +2,33 @@
 
 本文件记录 PRP Runtime 的显著变更。
 
-`0.0.2` 是当前包身份。数据库 schema 直接替换，pre-0.1 数据不提供向后兼容或迁移。
+`0.0.3` 是当前包身份。数据库 schema 直接替换，pre-0.1 数据不提供向后兼容或迁移。
+
+## [0.0.3] - 2026-08-30
+
+### Delivered
+
+- 包身份改为 `0.0.3`。`prp local run` 是本地主路径：同一进程内执行 DIRECT 任务，不要求可达 HTTP 服务器。
+- 显式 `ExecutionLocation.LOCAL`，不会静默改成 `CLOUD` 或 `BRIDGE`。本地默认 `HOST`。
+- 顺序 `LOCAL + HOST + DIRECT + concurrency=1` 就地使用已授权工作区，不把整树 `copytree` 当作隐藏前置条件。
+- 真正并行拷贝隔离仍可用，默认 `2` 槽 / `256 MiB`，上限 `8` 槽 / `512 MiB`。
+- `prp local approve` / `prp local deny` 继续同一条 ASK 暂停的本地 run；LOCAL 不创建 Bridge claim。
+- 可选 `prp serve` 默认绑定 `127.0.0.1`，复用现有 `create_app` 接线；该命令在同步边界交给 ASGI runner，不再嵌套 `asyncio.run`。
+- 顺序 `prp local run --isolation-mode SANDBOXED` 明确拒绝，不会静默改成 HOST。
+- HOST/LOCAL `/ready` 不要求 bubblewrap；`SANDBOXED` 仍报告自身能力要求。
+- 进程级槽位、拷贝字节、并发、attempt 和 token 信封；耗尽返回结构化错误，成功、失败和取消会释放占用。
+
+### Limits
+
+- `HOST` 是路径边界，不是 OS sandbox。HOST YOLO 仍需要显式用户事实和配置。
+- 没有 Docker、cgroup-per-agent 或每 Agent 守护进程。
+- 模型不能自行提高进程信封。模型质量取决于配置的 provider。
+- 不声称完整 Codex/Claude Code/MCP/A2A 兼容、SLA 或 benchmark 优势。
+
+### Not included
+
+- 完整第三方协议实现、分布式队列、计费、SSO 或 Kubernetes。
+- 通用 shell、未注册网络或模型控制的权限升级。
 
 ## [0.0.2] - 2026-08-22
 

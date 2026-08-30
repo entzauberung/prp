@@ -85,7 +85,7 @@ WORKER_MODEL = ModelRef(provider="openai_compatible", model="weak-model")
     [
         (AgentMode, ("NORMAL", "AUTO", "PLAN", "YOLO")),
         (IsolationMode, ("SANDBOXED", "HOST")),
-        (ExecutionLocation, ("CLOUD", "BRIDGE")),
+        (ExecutionLocation, ("CLOUD", "BRIDGE", "LOCAL")),
     ],
 )
 def test_agent_execution_vocabularies_are_closed_and_json_stable(
@@ -641,9 +641,44 @@ def test_user_explicit_is_a_strict_boolean_fact() -> None:
         AgentRequestOptions(user_explicit="true")
 
 
+def test_agent_request_options_accept_local_host_without_bridge_fields() -> None:
+    options = AgentRequestOptions(
+        isolation_mode=IsolationMode.HOST,
+        execution_location=ExecutionLocation.LOCAL,
+    )
+    assert options.model_dump() == {
+        "agent_mode": "NORMAL",
+        "isolation_mode": "HOST",
+        "execution_location": "LOCAL",
+        "user_explicit": False,
+    }
+    restored = AgentRequestOptions.model_validate_json(options.model_dump_json())
+    assert restored == options
+    assert restored.execution_location is ExecutionLocation.LOCAL
+
+
+def test_agent_request_options_keep_host_yolo_guard_for_local() -> None:
+    with pytest.raises(ValidationError, match="user_explicit"):
+        AgentRequestOptions(
+            agent_mode=AgentMode.YOLO,
+            isolation_mode=IsolationMode.HOST,
+            execution_location=ExecutionLocation.LOCAL,
+        )
+    options = AgentRequestOptions(
+        agent_mode=AgentMode.YOLO,
+        isolation_mode=IsolationMode.HOST,
+        execution_location=ExecutionLocation.LOCAL,
+        user_explicit=True,
+    )
+    assert options.user_explicit is True
+    assert options.execution_location is ExecutionLocation.LOCAL
+
+
 def test_agent_request_options_reject_unknown_values_and_fields() -> None:
     with pytest.raises(ValidationError):
         AgentRequestOptions(agent_mode="ELEVATED")
+    with pytest.raises(ValidationError):
+        AgentRequestOptions(execution_location="REMOTE")
     with pytest.raises(ValidationError):
         AgentRequestOptions(allow_all=True)
 

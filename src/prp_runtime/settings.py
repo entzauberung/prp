@@ -9,6 +9,7 @@ A request never carries a provider URL or an API key.
 
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -19,9 +20,27 @@ from prp_runtime.domain.errors import ErrorCode, ProviderError
 from prp_runtime.domain.values import PrincipalId
 from prp_runtime.json_support import strict_json_loads
 from prp_runtime.providers.base import ModelProfile
+from prp_runtime.workspace.isolation import (
+    DEFAULT_ISOLATION_MAX_BYTES,
+    DEFAULT_ISOLATION_MAX_SLOTS,
+    MAX_ISOLATION_MAX_BYTES,
+    MAX_ISOLATION_MAX_SLOTS,
+)
 from prp_runtime.workspace.models import WorkspaceRootMapping
 
-__all__ = ["ENV_PREFIX", "LogLevel", "Settings", "load_credential_profiles"]
+__all__ = [
+    "DEFAULT_PROCESS_MAX_ATTEMPTS",
+    "DEFAULT_PROCESS_MAX_CONCURRENCY",
+    "DEFAULT_PROCESS_MAX_TOTAL_TOKENS",
+    "ENV_PREFIX",
+    "LogLevel",
+    "MAX_PROCESS_MAX_ATTEMPTS",
+    "MAX_PROCESS_MAX_CONCURRENCY",
+    "MAX_PROCESS_MAX_TOTAL_TOKENS",
+    "ProcessResourceEnvelope",
+    "Settings",
+    "load_credential_profiles",
+]
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -39,7 +58,21 @@ _ENV_FIELDS: dict[str, str] = {
     "PRP_SERVICE_TOKEN": "service_token",
     "PRP_SERVICE_PRINCIPAL": "service_principal",
     "PRP_WORKSPACE_ROOTS": "workspace_roots",
+    "PRP_ISOLATION_MAX_SLOTS": "isolation_max_slots",
+    "PRP_ISOLATION_MAX_BYTES": "isolation_max_bytes",
+    "PRP_PROCESS_MAX_CONCURRENCY": "process_max_concurrency",
+    "PRP_PROCESS_MAX_ATTEMPTS": "process_max_attempts",
+    "PRP_PROCESS_MAX_TOTAL_TOKENS": "process_max_total_tokens",
 }
+
+DEFAULT_PROCESS_MAX_CONCURRENCY = 1
+MAX_PROCESS_MAX_CONCURRENCY = 8
+DEFAULT_PROCESS_MAX_ATTEMPTS = 8
+MAX_PROCESS_MAX_ATTEMPTS = 32
+DEFAULT_PROCESS_MAX_TOTAL_TOKENS = 250_000
+MAX_PROCESS_MAX_TOTAL_TOKENS = 1_000_000
+DEFAULT_LOCAL_WAIT_SECONDS = 30.0
+MAX_LOCAL_WAIT_SECONDS = 300.0
 
 
 def _profile_from_json(value: object) -> object:
@@ -87,6 +120,27 @@ WorkspaceRootsValue = Annotated[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessResourceEnvelope:
+    """Process-local slot, byte, concurrency, attempt and token ceilings."""
+
+    max_slots: int
+    max_copied_bytes: int
+    max_concurrency: int
+    max_attempts: int
+    max_total_tokens: int
+
+    def public_facts(self) -> dict[str, int]:
+        """Return numeric ceilings without host paths or credentials."""
+        return {
+            "max_slots": self.max_slots,
+            "max_copied_bytes": self.max_copied_bytes,
+            "max_concurrency": self.max_concurrency,
+            "max_attempts": self.max_attempts,
+            "max_total_tokens": self.max_total_tokens,
+        }
+
+
 class Settings(BaseModel):
     """Immutable runtime settings.
 
@@ -111,6 +165,36 @@ class Settings(BaseModel):
     leader_profile: ProfileValue | None = None
     worker_profile: ProfileValue | None = None
     cascade_profiles: CascadeProfilesValue = Field(default_factory=tuple)
+    isolation_max_slots: int = Field(
+        default=DEFAULT_ISOLATION_MAX_SLOTS,
+        ge=1,
+        le=MAX_ISOLATION_MAX_SLOTS,
+    )
+    isolation_max_bytes: int = Field(
+        default=DEFAULT_ISOLATION_MAX_BYTES,
+        ge=1,
+        le=MAX_ISOLATION_MAX_BYTES,
+    )
+    process_max_concurrency: int = Field(
+        default=DEFAULT_PROCESS_MAX_CONCURRENCY,
+        ge=1,
+        le=MAX_PROCESS_MAX_CONCURRENCY,
+    )
+    process_max_attempts: int = Field(
+        default=DEFAULT_PROCESS_MAX_ATTEMPTS,
+        ge=1,
+        le=MAX_PROCESS_MAX_ATTEMPTS,
+    )
+    process_max_total_tokens: int = Field(
+        default=DEFAULT_PROCESS_MAX_TOTAL_TOKENS,
+        ge=1,
+        le=MAX_PROCESS_MAX_TOTAL_TOKENS,
+    )
+    local_wait_seconds: float = Field(
+        default=DEFAULT_LOCAL_WAIT_SECONDS,
+        gt=0,
+        le=MAX_LOCAL_WAIT_SECONDS,
+    )
 
     @model_validator(mode="after")
     def _profiles_are_consistent(self) -> "Settings":
@@ -127,6 +211,17 @@ class Settings(BaseModel):
         if len(aliases) != len(set(aliases)):
             raise ValueError("all configured profiles must use different aliases")
         return self
+
+    @property
+    def resource_envelope(self) -> ProcessResourceEnvelope:
+        """Return the process-local resource envelope owned by settings."""
+        return ProcessResourceEnvelope(
+            max_slots=self.isolation_max_slots,
+            max_copied_bytes=self.isolation_max_bytes,
+            max_concurrency=self.process_max_concurrency,
+            max_attempts=self.process_max_attempts,
+            max_total_tokens=self.process_max_total_tokens,
+        )
 
     @property
     def profiles(self) -> tuple[ModelProfile, ...]:

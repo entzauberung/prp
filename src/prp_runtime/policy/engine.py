@@ -128,7 +128,11 @@ def decide_tool_call(
         if not user_explicit_host_yolo or not (settings and settings.allow_host_yolo):
             outcome = PolicyOutcome.DENY
             reason = PolicyReasonCode.HOST_YOLO_DISABLED
-        elif execution_location not in (ExecutionLocation.CLOUD, ExecutionLocation.BRIDGE):
+        elif execution_location not in (
+            ExecutionLocation.CLOUD,
+            ExecutionLocation.BRIDGE,
+            ExecutionLocation.LOCAL,
+        ):
             outcome = PolicyOutcome.DENY
             reason = PolicyReasonCode.HOST_YOLO_DISABLED
         else:

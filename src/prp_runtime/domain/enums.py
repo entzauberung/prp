@@ -87,10 +87,16 @@ class MergeLedgerStatus(StrEnum):
 
 @unique
 class ExecutionLocation(StrEnum):
-    """Where the agent executes relative to the cloud runtime."""
+    """Where the agent executes.
+
+    ``CLOUD`` is remote server-side execution. ``BRIDGE`` is a claimed native
+    client workspace. ``LOCAL`` keeps controller, tools and workspace in one
+    process.
+    """
 
     CLOUD = "CLOUD"
     BRIDGE = "BRIDGE"
+    LOCAL = "LOCAL"
 
 
 @unique

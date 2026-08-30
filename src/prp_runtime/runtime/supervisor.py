@@ -60,6 +60,7 @@ class RunSupervisor:
             raise ValueError("scan_interval must be positive")
         self._store = store
         self._execute = execute
+        self._max_concurrency = max_concurrency
         self._scan_interval = scan_interval
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
@@ -68,6 +69,7 @@ class RunSupervisor:
         self._active: dict[str, asyncio.Task[None]] = {}
         self._queued: set[str] = set()
         self._blocked_run_ids: set[str] = set()
+        self._held_run_ids: set[str] = set()
         self._stopped = False
         self._slots = asyncio.Semaphore(max_concurrency)
         self.state = SupervisorState()
@@ -77,8 +79,31 @@ class RunSupervisor:
         return self._loop_task is not None and not self._loop_task.done()
 
     @property
+    def max_concurrency(self) -> int:
+        return self._max_concurrency
+
+    @property
     def active_run_ids(self) -> frozenset[str]:
         return frozenset(self._active)
+
+    @property
+    def held_run_ids(self) -> frozenset[str]:
+        return frozenset(self._held_run_ids)
+
+    def hold_runs(self, run_ids: Collection[str]) -> None:
+        """Keep recovered runs off later scans until an explicit release."""
+        for run_id in run_ids:
+            if not run_id.strip():
+                continue
+            self._held_run_ids.add(run_id)
+            self._queued.discard(run_id)
+
+    def release_held_run(self, run_id: str) -> None:
+        """Allow one previously held run to be queued again."""
+        self._held_run_ids.discard(run_id)
+
+    def _is_gated(self, run_id: str) -> bool:
+        return run_id in self._blocked_run_ids or run_id in self._held_run_ids
 
     async def start(
         self,
@@ -109,7 +134,7 @@ class RunSupervisor:
             raise ValueError("run_id must not be blank")
         if self._stopped:
             raise RuntimeError("supervisor has been stopped")
-        if run_id in self._blocked_run_ids:
+        if self._is_gated(run_id):
             return
         self._queued.add(run_id)
         self.state.enqueued += 1
@@ -131,7 +156,7 @@ class RunSupervisor:
         for run in runs:
             if run.status not in (RunStatus.PENDING, RunStatus.RUNNING):
                 continue
-            if run.run_id in self._blocked_run_ids:
+            if self._is_gated(run.run_id):
                 continue
             discovered.append(run.run_id)
             self._queued.add(run.run_id)
@@ -177,7 +202,7 @@ class RunSupervisor:
         pending = tuple(self._queued)
         self._queued.clear()
         for run_id in pending:
-            if run_id in self._blocked_run_ids:
+            if self._is_gated(run_id):
                 continue
             run = runs.get(run_id)
             if run is None or run.status not in (RunStatus.PENDING, RunStatus.RUNNING):

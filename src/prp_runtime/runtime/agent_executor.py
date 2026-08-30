@@ -11,17 +11,20 @@ from typing import Final, Protocol
 
 from pydantic import BaseModel, ValidationError
 
-from prp_runtime.domain.enums import ResourceAccess, ToolCallStatus, ToolEffect
+from prp_runtime.domain.enums import ExecutionLocation, ResourceAccess, ToolCallStatus, ToolEffect
 from prp_runtime.domain.models import (
     MAX_AGENT_RESULT_BYTES,
+    AgentRequestOptions,
     AgentToolCall,
     AgentToolResult,
     ExecutionScope,
 )
 from prp_runtime.domain.values import SnapshotId, utc_now
 from prp_runtime.policy.engine import PolicyOutcome, PolicyReasonCode
+from prp_runtime.domain.errors import StateError
 from prp_runtime.policy.models import (
     ApprovalDecision,
+    ApprovalIssuer,
     ApprovalOutcome,
     ApprovalRequest,
     CapabilityBudget,
@@ -37,13 +40,16 @@ from prp_runtime.runtime.agent_loop import (
 from prp_runtime.runtime.tool_worker import ToolWorker
 from prp_runtime.settings import Settings
 from prp_runtime.storage.sqlite import MissingEntityError
+from prp_runtime.tools.executor import ToolExecutionOutcome, uses_in_process_tool_settlement
 from prp_runtime.tools.models import MAX_TOOL_OUTPUT_BYTES, ToolCall, ToolResult
 from prp_runtime.tools.registry import ToolRegistry
 
 __all__ = [
     "AgentToolExecutor",
+    "ApprovalStore",
     "ProductionAgentToolExecutor",
     "WorkspaceAgentExecutor",
+    "bind_local_approval_continuation",
 ]
 
 _REJECTION_OUTPUT: Final = "tool request rejected"
@@ -123,6 +129,51 @@ class ApprovalStore(Protocol):
         completed_at: datetime | None = None,
     ) -> ToolResult:
         """Close a pending call as a persisted rejection."""
+
+    async def decide_approval(
+        self,
+        request_id: str,
+        decision: ApprovalDecision,
+        *,
+        owner_id: str,
+    ) -> ApprovalDecision:
+        """Record one immutable decision, idempotently replaying the same fact."""
+
+
+async def bind_local_approval_continuation(
+    store: ApprovalStore,
+    request_id: str,
+    *,
+    owner_id: str,
+    outcome: ApprovalOutcome,
+    reason: str | None = None,
+    run_id: str | None = None,
+    workspace_id: str | None = None,
+) -> tuple[ApprovalRequest, ApprovalDecision]:
+    """Bind one owner-scoped decision to a persisted local ASK request."""
+    approval = await store.get_approval(request_id, owner_id=owner_id)
+    if run_id is not None and approval.run_id != run_id:
+        raise MissingEntityError(f"approval request {request_id} is not persisted")
+    if workspace_id is not None and approval.workspace_id != workspace_id:
+        raise MissingEntityError(f"approval request {request_id} is not persisted")
+    decision = ApprovalDecision(
+        approval_request_id=request_id,
+        outcome=outcome,
+        issuer=ApprovalIssuer.USER,
+        reason=reason,
+        decided_at=utc_now(),
+    )
+    try:
+        existing = await store.get_approval_decision(request_id, owner_id=owner_id)
+    except MissingEntityError:
+        existing = None
+    if existing is not None:
+        if existing.outcome is not decision.outcome or existing.reason != decision.reason:
+            raise StateError("approval decision is immutable and conflicts")
+        return approval, existing
+    return approval, await store.decide_approval(
+        request_id, decision, owner_id=owner_id
+    )
 
 
 class AgentToolExecutor:
@@ -390,17 +441,11 @@ class AgentToolExecutor:
                 )
 
         try:
-            outcome = await self._worker.execute(
+            outcome = await self._settle_registered_call(
                 persisted_call,
-                options.agent_mode,
-                workspace_id=self._scope.workspace_id,
-                idempotency_key=persisted_call.call_id,
+                options,
                 resolved_paths=resolved_paths,
                 command_class=command_class,
-                isolation_mode=options.isolation_mode,
-                execution_location=options.execution_location,
-                user_explicit_host_yolo=options.user_explicit,
-                settings=self._settings,
                 approved=approved_for_worker,
             )
         except Exception:
@@ -469,6 +514,46 @@ class AgentToolExecutor:
         return AgentToolExecution(
             call=call,
             result=self._public_result(call, outcome.result),
+        )
+
+    async def _settle_registered_call(
+        self,
+        persisted_call: ToolCall,
+        options: AgentRequestOptions,
+        *,
+        resolved_paths: tuple[str, ...],
+        command_class: CommandClass | None,
+        approved: bool | None,
+    ) -> ToolExecutionOutcome:
+        """Settle LOCAL in-process through ToolWorker.
+
+        BRIDGE keeps the same worker contract so Native Agent claim create,
+        settle and submit stay outside this adapter.
+        """
+
+        kwargs = {
+            "workspace_id": self._scope.workspace_id,
+            "idempotency_key": persisted_call.call_id,
+            "resolved_paths": resolved_paths,
+            "command_class": command_class,
+            "isolation_mode": options.isolation_mode,
+            "execution_location": options.execution_location,
+            "user_explicit_host_yolo": options.user_explicit,
+            "settings": self._settings,
+            "approved": approved,
+        }
+        if uses_in_process_tool_settlement(options.execution_location):
+            return await self._worker.execute(
+                persisted_call,
+                options.agent_mode,
+                **kwargs,
+            )
+        if options.execution_location is not ExecutionLocation.BRIDGE:
+            raise ValueError("unsupported execution location for tool settlement")
+        return await self._worker.execute(
+            persisted_call,
+            options.agent_mode,
+            **kwargs,
         )
 
     @staticmethod

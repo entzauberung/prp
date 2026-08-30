@@ -7,7 +7,12 @@ from collections.abc import Awaitable, Callable, Collection
 from enum import StrEnum, unique
 from pathlib import Path
 
-from prp_runtime.domain.enums import ResourceAccess, ToolCallStatus
+from prp_runtime.domain.enums import (
+    ExecutionLocation,
+    ExecutionStrategy,
+    ResourceAccess,
+    ToolCallStatus,
+)
 from prp_runtime.domain.models import (
     AgentToolCall,
     AgentToolResult,
@@ -46,7 +51,12 @@ from prp_runtime.tools.registry import ToolDefinition, ToolRegistry
 from prp_runtime.tools.search import SearchRunner, build_search_definition
 from prp_runtime.workspace.backend import WorkspaceBackend
 from prp_runtime.workspace.changes import ChangeSet
-from prp_runtime.workspace.isolation import SlotContext
+from prp_runtime.workspace.local import canonicalize_local_root
+from prp_runtime.workspace.isolation import (
+    ExecutionCopyMode,
+    SlotContext,
+    select_execution_copy_mode,
+)
 from prp_runtime.workspace.models import (
     Snapshot,
     SnapshotManifest,
@@ -333,6 +343,14 @@ class WorkspaceToolRuntimeFactory:
         slot_context: SlotContext | None,
     ) -> WorkspaceToolRuntime:
         """Bind each handler to this non-cached backend and immutable snapshot."""
+        copy_mode = select_execution_copy_mode(
+            execution_location=scope.agent_options.execution_location,
+            isolation_mode=scope.agent_options.isolation_mode,
+            strategy=ExecutionStrategy.DIRECT,
+            concurrency=1,
+        )
+        if copy_mode is ExecutionCopyMode.IN_PLACE and slot_context is not None:
+            raise ToolRuntimeError("in-place local DIRECT cannot use isolation slots")
         slot_backend: WorkspaceBackend | None = None
         slot_acquired = False
         try:
@@ -546,7 +564,12 @@ class ScopeToolRuntimeProvider:
         self._resolver = WorkspaceResolver(settings.workspace_roots)
         self._factory = factory or WorkspaceToolRuntimeFactory()
         self._runtimes: dict[str, WorkspaceToolRuntime] = {}
+        self._local_roots: dict[str, Path] = {}
         self._lock = asyncio.Lock()
+
+    def bind_local_workspace(self, workspace_id: str, root: Path) -> None:
+        """Bind a process-local directory to a workspace identity."""
+        self._local_roots[workspace_id] = canonicalize_local_root(root)
 
     def executor_for(self, scope: ExecutionScope) -> ScopedAgentToolExecutor:
         """Return a lazy adapter without opening a workspace during construction."""
@@ -577,7 +600,36 @@ class ScopeToolRuntimeProvider:
             manifest = await self._store.get_snapshot_manifest(
                 snapshot.snapshot_id, owner_id=scope.principal_id
             )
-            resolved = self._resolver.resolve(workspace, owner_id=scope.principal_id)
+            copy_mode = select_execution_copy_mode(
+                execution_location=scope.agent_options.execution_location,
+                isolation_mode=scope.agent_options.isolation_mode,
+                strategy=ExecutionStrategy.DIRECT,
+                concurrency=1,
+            )
+            if scope.agent_options.execution_location is ExecutionLocation.LOCAL:
+                if copy_mode is not ExecutionCopyMode.IN_PLACE:
+                    raise ToolRuntimeError(
+                        "copy-backed local execution requires isolation slots"
+                    )
+                from prp_runtime.workspace.backend import WorkspaceBackend
+                from prp_runtime.workspace.resolver import (
+                    ResolvedWorkspace,
+                    WorkspaceResolver,
+                )
+
+                root = self._local_roots.get(scope.workspace_id)
+                if root is None:
+                    raise ToolRuntimeError("local workspace root is unavailable")
+                WorkspaceResolver._validate_root_path(root, kind="local")
+                resolved = ResolvedWorkspace(
+                    workspace_id=scope.workspace_id,
+                    owner_id=scope.principal_id,
+                    server_alias="local-workspace",
+                    backend=WorkspaceBackend(root),
+                    workspace_root=root,
+                )
+            else:
+                resolved = self._resolver.resolve(workspace, owner_id=scope.principal_id)
             try:
                 runtime = self._factory.build(
                     scope=scope,

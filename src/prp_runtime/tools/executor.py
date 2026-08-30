@@ -31,6 +31,7 @@ __all__ = [
     "ToolExecutionOutcome",
     "ToolExecutor",
     "ToolStore",
+    "uses_in_process_tool_settlement",
 ]
 
 
@@ -119,6 +120,16 @@ class ToolExecutionOutcome(DomainModel):
     @property
     def completed(self) -> bool:
         return self.result is not None
+
+
+def uses_in_process_tool_settlement(location: ExecutionLocation) -> bool:
+    """Return whether this process settles the tool through registered handlers.
+
+    ``LOCAL`` and ``CLOUD`` complete in-process. ``BRIDGE`` claim create, settle
+    and submit remain on the Native Agent store path and are never invoked here.
+    """
+
+    return location is not ExecutionLocation.BRIDGE
 
 
 class ToolExecutor:
@@ -241,11 +252,44 @@ class ToolExecutor:
                 f"tool call cannot execute from {persisted.status.value} state"
             )
 
+        if uses_in_process_tool_settlement(execution_location):
+            return await self._invoke_registered_handler(
+                persisted,
+                definition=definition,
+                arguments=arguments,
+                workspace_id=workspace_id,
+                resolved_paths=resolved_paths or (),
+                command_class=command_class,
+                decision=decision,
+            )
+        # BRIDGE preserves the same registered-handler completion contract.
+        # Claim create/settle/submit stay outside this executor.
+        return await self._invoke_registered_handler(
+            persisted,
+            definition=definition,
+            arguments=arguments,
+            workspace_id=workspace_id,
+            resolved_paths=resolved_paths or (),
+            command_class=command_class,
+            decision=decision,
+        )
+
+    async def _invoke_registered_handler(
+        self,
+        persisted: ToolCall,
+        *,
+        definition: Any,
+        arguments: Any,
+        workspace_id: str,
+        resolved_paths: tuple[str, ...],
+        command_class: CommandClass | None,
+        decision: PolicyDecision,
+    ) -> ToolExecutionOutcome:
         context = ExecutionContext(
             call=persisted,
             arguments=arguments,
             workspace_id=workspace_id,
-            resolved_paths=resolved_paths or (),
+            resolved_paths=resolved_paths,
             command_class=command_class,
         )
         try:

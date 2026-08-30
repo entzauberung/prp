@@ -28,6 +28,7 @@ from prp_runtime.workspace.models import (
     WorkspaceSourceType,
 )
 from prp_runtime.workspace.resolver import ResolvedWorkspace, WorkspaceResolveError
+from prp_runtime.workspace.sandbox import SandboxCapabilities
 
 T0 = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
@@ -236,3 +237,72 @@ def test_factory_binds_server_tools_to_an_owned_slot_root(tmp_path: Path) -> Non
     assert slot.path != root
     runtime.close()
     assert isolation.active_slot_count == 0
+
+
+class UnavailableSandbox:
+    def probe(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            backend="unavailable",
+            available=False,
+            reason="bubblewrap is not available in tests",
+        )
+
+    def build_argv(self, *args: object, **kwargs: object) -> list[str]:
+        raise AssertionError("unavailable sandbox must not build a host command")
+
+
+def test_host_command_binding_does_not_require_sandbox(tmp_path: Path) -> None:
+    scope, resolved, snapshot, backend = make_facts(
+        workspace_root=tmp_path,
+        access=(ResourceAccess.READ, ResourceAccess.WRITE),
+    )
+    scope = scope.model_copy(
+        update={
+            "agent_options": AgentRequestOptions(
+                isolation_mode=IsolationMode.HOST,
+                execution_location=ExecutionLocation.LOCAL,
+            )
+        }
+    )
+    runtime = WorkspaceToolRuntimeFactory().build(
+        scope=scope,
+        resolved_workspace=resolved,
+        snapshot=snapshot,
+        store=object(),  # type: ignore[arg-type]
+        snapshot_manifest=SnapshotManifest(),
+        rg_path=Path("/bin/true"),
+        sandbox_backend=UnavailableSandbox(),  # type: ignore[arg-type]
+    )
+    assert "run_targeted_test" in runtime.registry.names
+    assert "apply_patch" in runtime.registry.names
+    runtime.close()
+    assert backend.close_count == 1
+
+
+def test_sandboxed_without_capability_omits_host_commands(tmp_path: Path) -> None:
+    scope, resolved, snapshot, backend = make_facts(
+        workspace_root=tmp_path,
+        access=(ResourceAccess.READ, ResourceAccess.WRITE),
+    )
+    scope = scope.model_copy(
+        update={
+            "agent_options": AgentRequestOptions(
+                isolation_mode=IsolationMode.SANDBOXED,
+                execution_location=ExecutionLocation.LOCAL,
+            )
+        }
+    )
+    runtime = WorkspaceToolRuntimeFactory().build(
+        scope=scope,
+        resolved_workspace=resolved,
+        snapshot=snapshot,
+        store=object(),  # type: ignore[arg-type]
+        snapshot_manifest=SnapshotManifest(),
+        rg_path=Path("/bin/true"),
+        sandbox_backend=UnavailableSandbox(),  # type: ignore[arg-type]
+    )
+    assert "run_targeted_test" not in runtime.registry.names
+    assert "apply_patch" in runtime.registry.names
+    runtime.close()
+    assert backend.close_count == 1
+

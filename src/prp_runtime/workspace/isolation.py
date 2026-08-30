@@ -20,6 +20,8 @@ from typing import Protocol, TypeVar
 
 from pydantic import ConfigDict, Field
 
+from prp_runtime.domain.enums import ExecutionLocation, ExecutionStrategy, IsolationMode
+from prp_runtime.domain.errors import ErrorCode, ErrorDetail
 from prp_runtime.domain.models import DomainModel
 from prp_runtime.domain.values import new_snapshot_id, utc_now, validate_snapshot_id
 from prp_runtime.workspace.changes import (
@@ -35,6 +37,7 @@ from prp_runtime.workspace.changes import (
 
 __all__ = [
     "BaseSnapshot",
+    "ExecutionCopyMode",
     "ExecutionSlot",
     "IsolationBackend",
     "IsolationCapacityError",
@@ -44,12 +47,54 @@ __all__ = [
     "LocalIsolationBackend",
     "SlotContext",
     "SlotStatus",
+    "DEFAULT_ISOLATION_MAX_BYTES",
+    "DEFAULT_ISOLATION_MAX_SLOTS",
+    "MAX_ISOLATION_MAX_BYTES",
+    "MAX_ISOLATION_MAX_SLOTS",
+    "ensure_copy_backed",
+    "select_execution_copy_mode",
 ]
 
-_DEFAULT_MAX_SLOTS = 8
-_DEFAULT_MAX_BYTES = 10 * 1024 * 1024 * 1024
+DEFAULT_ISOLATION_MAX_SLOTS = 2
+DEFAULT_ISOLATION_MAX_BYTES = 256 * 1024 * 1024
+MAX_ISOLATION_MAX_SLOTS = 8
+MAX_ISOLATION_MAX_BYTES = 512 * 1024 * 1024
+_DEFAULT_MAX_SLOTS = DEFAULT_ISOLATION_MAX_SLOTS
+_DEFAULT_MAX_BYTES = DEFAULT_ISOLATION_MAX_BYTES
 _CHUNK_SIZE = 1024 * 1024
 _SlotResult = TypeVar("_SlotResult")
+
+
+@unique
+class ExecutionCopyMode(StrEnum):
+    IN_PLACE = "IN_PLACE"
+    COPY_BACKED = "COPY_BACKED"
+
+
+def select_execution_copy_mode(
+    *,
+    execution_location: ExecutionLocation,
+    isolation_mode: IsolationMode,
+    strategy: ExecutionStrategy,
+    concurrency: int,
+) -> ExecutionCopyMode:
+    """Choose in-place local DIRECT or explicit copy-backed isolation."""
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+    if (
+        execution_location is ExecutionLocation.LOCAL
+        and isolation_mode is IsolationMode.HOST
+        and strategy is ExecutionStrategy.DIRECT
+        and concurrency == 1
+    ):
+        return ExecutionCopyMode.IN_PLACE
+    return ExecutionCopyMode.COPY_BACKED
+
+
+def ensure_copy_backed(mode: ExecutionCopyMode) -> None:
+    """Reject copied snapshot/slot construction for sequential in-place work."""
+    if mode is ExecutionCopyMode.IN_PLACE:
+        raise IsolationError("in-place local DIRECT cannot use copied snapshots or slots")
 
 
 class IsolationError(RuntimeError):
@@ -58,6 +103,13 @@ class IsolationError(RuntimeError):
 
 class IsolationCapacityError(IsolationError):
     """The configured slot or byte capacity would be exceeded."""
+
+    def __init__(self, message: str, *, field: str) -> None:
+        super().__init__(message)
+        self.field = field
+        self.detail = ErrorDetail.for_code(
+            ErrorCode.RESOURCE_BUDGET_EXCEEDED, message, field=field
+        )
 
 
 class IsolationOwnershipError(IsolationError):
@@ -401,6 +453,10 @@ class LocalIsolationBackend:
     ) -> None:
         if max_slots <= 0 or max_bytes <= 0:
             raise ValueError("isolation capacity must be positive")
+        if max_slots > MAX_ISOLATION_MAX_SLOTS:
+            raise ValueError("isolation slot capacity is bounded")
+        if max_bytes > MAX_ISOLATION_MAX_BYTES:
+            raise ValueError("isolation byte capacity is bounded")
         self._storage_root = storage_root
         self._max_slots = max_slots
         self._max_bytes = max_bytes
@@ -415,6 +471,14 @@ class LocalIsolationBackend:
         self._slot_root.mkdir(exist_ok=True)
 
     @property
+    def max_slots(self) -> int:
+        return self._max_slots
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
     def active_slot_count(self) -> int:
         return sum(record.facts.status is SlotStatus.ACTIVE for record in self._slots.values())
 
@@ -422,13 +486,22 @@ class LocalIsolationBackend:
     def used_bytes(self) -> int:
         return self._used_bytes
 
-    def create_base_snapshot(self, source: Path, workspace_id: str) -> BaseSnapshot:
+    def create_base_snapshot(
+        self,
+        source: Path,
+        workspace_id: str,
+        *,
+        copy_mode: ExecutionCopyMode = ExecutionCopyMode.COPY_BACKED,
+    ) -> BaseSnapshot:
+        ensure_copy_backed(copy_mode)
         _ensure_directory(source)
         _reject_storage_overlap(source, self._storage_root)
         _reject_symlinks(source)
         source_hash, source_bytes, source_files = _tree_digest(source)
         if self._used_bytes + source_bytes > self._max_bytes:
-            raise IsolationCapacityError("isolation byte capacity exceeded")
+            raise IsolationCapacityError(
+                "isolation byte capacity exceeded", field="max_copied_bytes"
+            )
         snapshot_id = new_snapshot_id()
         target = self._base_root / snapshot_id
         try:
@@ -463,16 +536,22 @@ class LocalIsolationBackend:
         owner_id: str,
         *,
         lease_seconds: int = 300,
+        copy_mode: ExecutionCopyMode = ExecutionCopyMode.COPY_BACKED,
     ) -> ExecutionSlot:
+        ensure_copy_backed(copy_mode)
         if lease_seconds <= 0:
             raise ValueError("slot lease_seconds must be positive")
         if self.active_slot_count >= self._max_slots:
-            raise IsolationCapacityError("isolation slot capacity exceeded")
+            raise IsolationCapacityError(
+                "isolation slot capacity exceeded", field="max_slots"
+            )
         snapshot = self._snapshots.get(snapshot_id)
         if snapshot is None:
             raise IsolationError("base snapshot is unavailable")
         if self._used_bytes + snapshot.facts.total_bytes > self._max_bytes:
-            raise IsolationCapacityError("isolation byte capacity exceeded")
+            raise IsolationCapacityError(
+                "isolation byte capacity exceeded", field="max_copied_bytes"
+            )
         slot_id = f"slot_{secrets.token_hex(12)}"
         target = self._slot_root / slot_id
         try:
@@ -530,7 +609,9 @@ class LocalIsolationBackend:
         _reject_symlinks(record.path)
         digest, total_bytes, file_count = _tree_digest(record.path)
         if self._used_bytes + total_bytes > self._max_bytes:
-            raise IsolationCapacityError("isolation byte capacity exceeded")
+            raise IsolationCapacityError(
+                "isolation byte capacity exceeded", field="max_copied_bytes"
+            )
         snapshot_id = (
             new_snapshot_id()
             if new_snapshot_id_value is None

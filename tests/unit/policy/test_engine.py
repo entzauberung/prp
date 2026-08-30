@@ -323,3 +323,137 @@ def test_host_yolo_requires_server_setting_and_explicit_user_fact() -> None:
     )
     assert explicitly_enabled.outcome is PolicyOutcome.ALLOW
     assert explicitly_enabled.reason_code is PolicyReasonCode.YOLO_ALLOWED
+
+
+def test_local_policy_matrix_matches_colocated_cloud_facts() -> None:
+    read_call = make_call()
+    write_call = make_call("apply_patch", ToolEffect.WRITE)
+    command_call = make_call("run_targeted_test", ToolEffect.COMMAND)
+    network_call = make_call("network_fetch", ToolEffect.NETWORK)
+
+    local_read = decide_tool_call(
+        read_call,
+        AgentMode.NORMAL,
+        execution_location=ExecutionLocation.LOCAL,
+        isolation_mode=IsolationMode.HOST,
+    )
+    cloud_read = decide_tool_call(
+        read_call,
+        AgentMode.NORMAL,
+        execution_location=ExecutionLocation.CLOUD,
+        isolation_mode=IsolationMode.HOST,
+    )
+    assert local_read.outcome is cloud_read.outcome is PolicyOutcome.ALLOW
+    assert local_read.reason_code is cloud_read.reason_code is PolicyReasonCode.READ_ALLOWED
+
+    local_write = decide_tool_call(
+        write_call,
+        AgentMode.NORMAL,
+        execution_location=ExecutionLocation.LOCAL,
+        isolation_mode=IsolationMode.HOST,
+    )
+    cloud_write = decide_tool_call(
+        write_call,
+        AgentMode.NORMAL,
+        execution_location=ExecutionLocation.CLOUD,
+        isolation_mode=IsolationMode.HOST,
+    )
+    assert local_write.outcome is cloud_write.outcome is PolicyOutcome.ASK
+    assert local_write.reason_code is cloud_write.reason_code is PolicyReasonCode.APPROVAL_REQUIRED
+
+    local_command = decide_tool_call(
+        command_call,
+        AgentMode.AUTO,
+        command_class=CommandClass.TEST,
+        execution_location=ExecutionLocation.LOCAL,
+        isolation_mode=IsolationMode.HOST,
+    )
+    cloud_command = decide_tool_call(
+        command_call,
+        AgentMode.AUTO,
+        command_class=CommandClass.TEST,
+        execution_location=ExecutionLocation.CLOUD,
+        isolation_mode=IsolationMode.HOST,
+    )
+    assert local_command.outcome is cloud_command.outcome is PolicyOutcome.ALLOW
+    assert (
+        local_command.reason_code
+        is cloud_command.reason_code
+        is PolicyReasonCode.AUTO_LOW_RISK_COMMAND
+    )
+
+    for mode in AgentMode:
+        decision = decide_tool_call(
+            network_call,
+            mode,
+            known_tools={"network_fetch"},
+            execution_location=ExecutionLocation.LOCAL,
+            isolation_mode=IsolationMode.HOST,
+        )
+        assert decision.outcome is PolicyOutcome.DENY
+        assert decision.reason_code is PolicyReasonCode.NETWORK_DISABLED
+
+
+def test_local_lease_mismatch_is_denied() -> None:
+    call = make_call("apply_patch", ToolEffect.WRITE)
+    lease, now = make_lease(
+        call,
+        tools=("apply_patch",),
+        effects=(ToolEffect.WRITE,),
+    )
+    decision = decide_tool_call(
+        call,
+        AgentMode.NORMAL,
+        lease=lease,
+        workspace_id="other-workspace",
+        resolved_paths=["src/main.py"],
+        execution_location=ExecutionLocation.LOCAL,
+        isolation_mode=IsolationMode.HOST,
+        now=now,
+    )
+    assert decision.outcome is PolicyOutcome.DENY
+    assert decision.reason_code is PolicyReasonCode.LEASE_SCOPE_MISMATCH
+
+
+def test_local_host_yolo_requires_explicit_user_fact_and_settings() -> None:
+    call = make_call("apply_patch", ToolEffect.WRITE)
+    denied_defaults = decide_tool_call(
+        call,
+        AgentMode.YOLO,
+        isolation_mode=IsolationMode.HOST,
+        execution_location=ExecutionLocation.LOCAL,
+    )
+    assert denied_defaults.outcome is PolicyOutcome.DENY
+    assert denied_defaults.reason_code is PolicyReasonCode.HOST_YOLO_DISABLED
+
+    denied_settings_only = decide_tool_call(
+        call,
+        AgentMode.YOLO,
+        isolation_mode=IsolationMode.HOST,
+        execution_location=ExecutionLocation.LOCAL,
+        settings=Settings(allow_host_yolo=True),
+    )
+    assert denied_settings_only.outcome is PolicyOutcome.DENY
+    assert denied_settings_only.reason_code is PolicyReasonCode.HOST_YOLO_DISABLED
+
+    denied_explicit_only = decide_tool_call(
+        call,
+        AgentMode.YOLO,
+        isolation_mode=IsolationMode.HOST,
+        execution_location=ExecutionLocation.LOCAL,
+        user_explicit_host_yolo=True,
+    )
+    assert denied_explicit_only.outcome is PolicyOutcome.DENY
+    assert denied_explicit_only.reason_code is PolicyReasonCode.HOST_YOLO_DISABLED
+
+    allowed = decide_tool_call(
+        call,
+        AgentMode.YOLO,
+        isolation_mode=IsolationMode.HOST,
+        execution_location=ExecutionLocation.LOCAL,
+        user_explicit_host_yolo=True,
+        settings=Settings(allow_host_yolo=True),
+    )
+    assert allowed.outcome is PolicyOutcome.ALLOW
+    assert allowed.reason_code is PolicyReasonCode.YOLO_ALLOWED
+

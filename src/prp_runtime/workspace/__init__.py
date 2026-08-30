@@ -40,6 +40,7 @@ from prp_runtime.workspace.models import (
     WorkspaceSourceType,
     WorkspaceStatus,
 )
+from prp_runtime.workspace.local import LocalWorkspaceHandle, resolve_local_workspace
 from prp_runtime.workspace.resolver import (
     ResolvedWorkspace,
     WorkspaceResolveError,
@@ -82,9 +83,11 @@ __all__ = [
     "WorkspaceSource",
     "WorkspaceSourceType",
     "WorkspaceStatus",
+    "LocalWorkspaceHandle",
     "ResolvedWorkspace",
     "WorkspaceResolveError",
     "WorkspaceResolver",
+    "resolve_local_workspace",
     "BaseSnapshot",
     "ExecutionSlot",
     "IsolationBackend",

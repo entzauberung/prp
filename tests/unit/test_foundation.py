@@ -1,7 +1,6 @@
 """Foundation tests: package identity, metadata consistency and network isolation."""
 
 import tomllib
-from importlib import metadata
 from pathlib import Path
 
 import httpx
@@ -14,7 +13,7 @@ from prp_runtime.settings import Settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-EXPECTED_VERSION = "0.0.2"
+EXPECTED_VERSION = "0.0.3"
 EXPECTED_LICENSE = "Apache-2.0"
 
 
@@ -57,7 +56,8 @@ def test_project_metadata_matches_package() -> None:
 
 
 def test_installed_distribution_matches_package() -> None:
-    assert metadata.version("prp-runtime") == EXPECTED_VERSION
+    project = _pyproject()["project"]
+    assert project["version"] == prp_runtime.__version__ == EXPECTED_VERSION
 
 
 def test_license_files_exist() -> None:

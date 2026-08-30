@@ -12,6 +12,7 @@ from prp_runtime.workspace.models import (
     WorkspaceSourceType,
     WorkspaceStatus,
 )
+from prp_runtime.workspace.local import resolve_local_workspace
 from prp_runtime.workspace.resolver import WorkspaceResolveError, WorkspaceResolver
 
 T0 = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
@@ -134,3 +135,71 @@ def test_resolver_rejects_an_intermediate_root_symlink(tmp_path) -> None:
 def test_resolver_rejects_invalid_root_configuration_without_io() -> None:
     with pytest.raises(ValidationError):
         WorkspaceRootMapping.model_validate({"repo-main": "relative"})
+
+
+def test_local_root_resolves_to_a_redacted_backend_handle(tmp_path) -> None:
+    root = tmp_path / "local-repo"
+    root.mkdir()
+    (root / "README.md").write_text("safe", encoding="utf-8")
+
+    handle = resolve_local_workspace(root, owner_id="local-owner")
+    try:
+        assert handle.owner_id == "local-owner"
+        assert handle.public_identity() == {
+            "workspace_id": handle.workspace_id,
+            "owner_id": "local-owner",
+        }
+        assert handle.backend.read_file("README.md").content == "safe"
+        assert str(root) not in repr(handle)
+        assert str(root) not in str(handle.public_identity())
+        assert not any(path.name == ".snapshot" for path in root.iterdir())
+    finally:
+        handle.close()
+        handle.close()
+    with pytest.raises(WorkspaceResolveError, match="closed"):
+        _ = handle.backend
+
+
+def test_local_root_validation_fails_closed_without_exposing_path(tmp_path) -> None:
+    root = tmp_path / "local-repo"
+    root.mkdir()
+    missing = tmp_path / "missing"
+    file_root = tmp_path / "file"
+    file_root.write_text("not a directory", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+
+    cases = [
+        ("missing", str(missing)),
+        ("file", str(file_root)),
+        ("symlink", str(link)),
+    ]
+    for label, candidate in cases:
+        del label
+        with pytest.raises(WorkspaceResolveError) as excinfo:
+            resolve_local_workspace(candidate)
+        assert str(root) not in str(excinfo.value)
+        assert str(candidate) not in str(excinfo.value)
+        assert ".." not in str(excinfo.value)
+
+
+def test_local_relative_and_noncanonical_roots_share_identity(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "local-repo"
+    root.mkdir()
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(tmp_path)
+    absolute = resolve_local_workspace(root, owner_id="local-owner")
+    relative = resolve_local_workspace("local-repo", owner_id="local-owner")
+    dotted = resolve_local_workspace(nested / ".." / "local-repo", owner_id="local-owner")
+    try:
+        assert absolute.workspace_id == relative.workspace_id == dotted.workspace_id
+        assert str(root) not in absolute.workspace_id
+        assert str(root) not in str(absolute.public_identity())
+    finally:
+        absolute.close()
+        relative.close()
+        dotted.close()
+

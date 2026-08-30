@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prp-runtime"
-version = "0.0.2"
-description = "Progressive Reasoning Protocol reference runtime"
+version = "0.0.3"
+description = "Local-first Progressive Reasoning Protocol agent runtime"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

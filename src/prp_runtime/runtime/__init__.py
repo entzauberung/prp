@@ -17,6 +17,12 @@ from prp_runtime.runtime.context import (
     WorkerContext,
     build_worker_context,
 )
+from prp_runtime.runtime.composition import (
+    RuntimeComposition,
+    build_adapters,
+    open_runtime_composition,
+)
+from prp_runtime.runtime.local import LocalRuntime, LocalRuntimeState
 from prp_runtime.runtime.coordinator import (
     CoordinationBatch,
     CoordinationMode,
@@ -80,4 +86,9 @@ __all__ = [
     "CoordinationPlan",
     "Coordinator",
     "plan_coordination",
+    "RuntimeComposition",
+    "LocalRuntime",
+    "LocalRuntimeState",
+    "build_adapters",
+    "open_runtime_composition",
 ]

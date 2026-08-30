@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,3 +160,128 @@ def test_watch_without_root_fails_before_local_execution(
     assert cli.main(["watch"]) == 1
 
     assert "workspace-root" in capsys.readouterr().err
+
+
+def test_local_run_parser_is_distinct_from_remote_run() -> None:
+    parser = cli.build_parser()
+    local = parser.parse_args(["local", "run", "summarise the report"])
+    assert local.command == "local"
+    assert local.local_command == "run"
+    assert local.prompt == "summarise the report"
+    assert local.workspace is None
+    assert local.agent_mode == "NORMAL"
+    assert local.isolation_mode == "HOST"
+    assert local.user_explicit is False
+    remote = parser.parse_args(["run", "summarise the report"])
+    assert remote.command == "run"
+    assert remote.input_text == "summarise the report"
+    assert remote.isolation_mode == "SANDBOXED"
+
+
+def test_local_run_help_explains_in_process_path_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["local", "run", "--help"])
+    assert error.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "in-process" in help_text
+    assert "path-boundary" in help_text
+    assert "not an operating-system sandbox" in help_text
+
+
+def test_local_run_parser_does_not_require_bridge_inputs() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "local",
+            "run",
+            "hello",
+            "--workspace",
+            ".",
+            "--agent-mode",
+            "AUTO",
+        ]
+    )
+    assert args.command == "local"
+    assert args.workspace == Path(".")
+    assert args.agent_mode == "AUTO"
+    assert args.isolation_mode == "HOST"
+    assert not hasattr(args, "input_text")
+    sandboxed = parser.parse_args(
+        ["local", "run", "hello", "--isolation-mode", "SANDBOXED"]
+    )
+    assert sandboxed.isolation_mode == "SANDBOXED"
+    assert sandboxed.command == "local"
+
+
+def test_local_approve_and_deny_parse_without_bridge_inputs() -> None:
+    parser = cli.build_parser()
+    approve = parser.parse_args(["local", "approve", "apr_abc123"])
+    assert approve.command == "local"
+    assert approve.local_command == "approve"
+    assert approve.request_id == "apr_abc123"
+    assert approve.workspace is None
+    deny = parser.parse_args(
+        ["local", "deny", "apr_abc123", "--reason", "not needed"]
+    )
+    assert deny.command == "local"
+    assert deny.local_command == "deny"
+    assert deny.reason == "not needed"
+    remote = parser.parse_args(["approve", "apr_remote"])
+    assert remote.command == "approve"
+    assert remote.request_id == "apr_remote"
+
+
+def test_local_deny_requires_a_reason() -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["local", "deny", "apr_abc123"])
+
+
+def test_serve_defaults_to_loopback_and_is_not_local_run() -> None:
+    parser = cli.build_parser()
+    serve = parser.parse_args(["serve"])
+    assert serve.command == "serve"
+    assert serve.host == "127.0.0.1"
+    assert serve.port == 8000
+    local = parser.parse_args(["local", "run", "hello"])
+    assert local.command == "local"
+    assert local.local_command == "run"
+
+
+def test_serve_dispatch_is_synchronous_and_does_not_start_a_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: dict[str, object] = {}
+
+    def fake_serve_app(*, host: str, port: int, **kwargs: object) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            nested = False
+        else:
+            nested = True
+        called["host"] = host
+        called["port"] = port
+        called["nested"] = nested
+        called["kwargs"] = kwargs
+
+    monkeypatch.setattr("prp_runtime.client.serve.serve_app", fake_serve_app)
+    assert cli.main(["serve"]) == 0
+    assert called["host"] == "127.0.0.1"
+    assert called["port"] == 8000
+    assert called["nested"] is False
+    assert called["kwargs"] == {}
+
+
+def test_serve_help_explains_loopback(capsys: pytest.CaptureFixture[str]) -> None:
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["serve", "--help"])
+    assert error.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "127.0.0.1" in help_text
+    assert "create_app" in help_text
+    assert "Local run does not use this command" in help_text

@@ -5,9 +5,8 @@ connection, or start a background task. All wiring happens inside
 ``create_app`` and its lifespan.
 """
 
-from collections.abc import AsyncIterator, Collection, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -23,18 +22,11 @@ from prp_runtime.api.openai_chat import create_router as create_openai_chat_rout
 from prp_runtime.api.openai_responses import (
     create_router as create_openai_responses_router,
 )
-from prp_runtime.control.controller import RunController
-from prp_runtime.control.routing import facts_from_request
-from prp_runtime.domain.enums import RunStatus
-from prp_runtime.domain.errors import ErrorCode, ErrorDetail, ProviderError, PrpError
-from prp_runtime.domain.models import ErrorCategory, ErrorInfo, Run
+from prp_runtime.domain.enums import ExecutionLocation, IsolationMode
+from prp_runtime.domain.errors import ErrorCode, ErrorDetail, PrpError
 from prp_runtime.providers.base import ProviderAdapter
-from prp_runtime.providers.factory import build_provider_adapter
-from prp_runtime.runtime.event_bus import EventBus
-from prp_runtime.runtime.supervisor import RunSupervisor
-from prp_runtime.runtime.tooling import ScopeToolRuntimeProvider
+from prp_runtime.runtime.composition import RuntimeComposition, build_adapters
 from prp_runtime.settings import Settings
-from prp_runtime.storage.recovery import recover_after_restart
 from prp_runtime.storage.sqlite import SqliteStore
 from prp_runtime.workspace.sandbox import SandboxCapabilities, probe_bwrap
 
@@ -44,16 +36,6 @@ __all__ = [
     "build_adapters",
     "create_app",
 ]
-
-
-class _SqlitePendingRunScanner:
-    """Read pending run ids from the Store without making them queue state."""
-
-    def __init__(self, store: SqliteStore) -> None:
-        self._store = store
-
-    async def list_pending_runs(self) -> Collection[Run]:
-        return await self._store.list_recoverable_runs()
 
 
 class HealthResponse(BaseModel):
@@ -71,14 +53,11 @@ class ReadinessResponse(BaseModel):
     controller_present: bool
     profiles_configured: bool
     adapters_ready: bool
+    path_boundary_ready: bool
     sandbox_ready: bool
-
-
-def build_adapters(settings: Settings) -> dict[str, ProviderAdapter]:
-    """Build one outbound adapter per configured model profile."""
-    return {
-        profile.alias: build_provider_adapter(profile) for profile in settings.profiles
-    }
+    sandbox_required: bool
+    execution_location: ExecutionLocation
+    isolation_mode: IsolationMode
 
 
 def create_app(
@@ -86,6 +65,9 @@ def create_app(
     *,
     adapters: Mapping[str, ProviderAdapter] | None = None,
     store: SqliteStore | None = None,
+    execution_location: ExecutionLocation = ExecutionLocation.CLOUD,
+    isolation_mode: IsolationMode = IsolationMode.SANDBOXED,
+    sandbox_capabilities: SandboxCapabilities | None = None,
 ) -> FastAPI:
     """Build the ASGI application for the given settings.
 
@@ -94,120 +76,45 @@ def create_app(
     """
     injected_store = store
     resolved_adapters = dict(adapters) if adapters is not None else None
-    owns_adapters = adapters is None
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        owns_store = injected_store is None
-        event_bus = EventBus()
-        active = (
-            SqliteStore(Path(settings.database_path), event_bus=event_bus)
-            if injected_store is None
-            else injected_store
+        composition = RuntimeComposition(
+            settings,
+            adapters=resolved_adapters,
+            store=injected_store,
+            execution_location=execution_location,
+            isolation_mode=isolation_mode,
         )
-        active.set_event_bus(event_bus)
-        application.state.event_bus = event_bus
-        runtime_adapters: Mapping[str, ProviderAdapter] = {}
-        supervisor: RunSupervisor | None = None
-        tool_runtime_provider: ScopeToolRuntimeProvider | None = None
         try:
-            await active.open()
-            application.state.store = active
-            recovery = await recover_after_restart(active)
-            application.state.recovery = recovery
-            runtime_adapters = (
-                resolved_adapters if resolved_adapters is not None else build_adapters(settings)
+            await composition.open()
+            application.state.event_bus = composition.event_bus
+            application.state.store = composition.store
+            application.state.recovery = composition.recovery
+            application.state.adapters = composition.adapters
+            application.state.sandbox_capabilities = (
+                sandbox_capabilities
+                if sandbox_capabilities is not None
+                else probe_bwrap()
             )
-            application.state.adapters = runtime_adapters
-            application.state.sandbox_capabilities = probe_bwrap()
-            tool_runtime_provider = ScopeToolRuntimeProvider(active, settings)
-            application.state.tool_runtime_provider = tool_runtime_provider
-            controller = RunController(
-                active,
-                settings,
-                application.state.adapters,
-                tool_executor_provider=tool_runtime_provider.executor_for,
-            )
-            application.state.controller = controller
-
-            async def execute_persisted(run_id: str) -> Run:
-                run = await active.get_run(run_id)
-                try:
-                    return await controller.execute(
-                        run_id,
-                        routing_facts=facts_from_request(run.request),
-                        principal_id=settings.service_principal,
-                    )
-                except PrpError as error:
-                    current = await active.get_run(run_id)
-                    if current.status.is_terminal:
-                        return current
-                    if current.status is RunStatus.CANCELLING:
-                        return await controller._finish_run(
-                            current, RunStatus.CANCELLED
-                        )
-                    category = (
-                        ErrorCategory.PROVIDER_ERROR
-                        if isinstance(error, ProviderError)
-                        else ErrorCategory.UNKNOWN
-                    )
-                    return await controller._finish_run(
-                        current,
-                        RunStatus.FAILED,
-                        error=ErrorInfo(category=category, message=str(error)),
-                    )
-
-            supervisor = RunSupervisor(
-                _SqlitePendingRunScanner(active), execute_persisted
-            )
-            application.state.supervisor = supervisor
-            await supervisor.start(
-                recoverable_run_ids=recovery.recoverable_run_ids,
-                blocked_run_ids=recovery.blocked_run_ids,
-            )
+            application.state.execution_location = composition.execution_location
+            application.state.isolation_mode = composition.isolation_mode
+            application.state.tool_runtime_provider = composition.tool_runtime_provider
+            application.state.controller = composition.controller
+            application.state.supervisor = composition.supervisor
             yield
         finally:
-            close_error: BaseException | None = None
-            if supervisor is not None:
-                try:
-                    await supervisor.stop(drain=True)
-                except BaseException as error:
-                    close_error = error
-            if tool_runtime_provider is not None:
-                try:
-                    tool_runtime_provider.close()
-                except BaseException as error:
-                    if close_error is None:
-                        close_error = error
-            try:
-                await event_bus.close()
-            except BaseException as error:
-                if close_error is None:
-                    close_error = error
-            active.set_event_bus(None)
             application.state.event_bus = None
             application.state.supervisor = None
             application.state.tool_runtime_provider = None
             application.state.controller = None
-            if owns_adapters:
-                for adapter in runtime_adapters.values():
-                    try:
-                        await adapter.aclose()
-                    except BaseException as error:
-                        if close_error is None:
-                            close_error = error
-            if owns_store:
-                try:
-                    await active.close()
-                except BaseException as error:
-                    if close_error is None:
-                        close_error = error
-            if close_error is not None:
-                raise close_error
+            await composition.close()
 
     app = FastAPI(title="PRP Runtime", version=__version__, lifespan=lifespan)
     app.state.settings = settings
-    app.state.sandbox_capabilities = None
+    app.state.execution_location = execution_location
+    app.state.isolation_mode = isolation_mode
+    app.state.sandbox_capabilities = sandbox_capabilities
     app.state.store = None
     app.state.controller = None
     app.state.event_bus = None
@@ -254,21 +161,29 @@ def create_app(
         adapters_ready = configured_aliases <= set(active_adapters)
         capabilities = app.state.sandbox_capabilities
         sandbox_ready = isinstance(capabilities, SandboxCapabilities) and capabilities.ready
+        selected_location = getattr(app.state, "execution_location", execution_location)
+        selected_isolation = getattr(app.state, "isolation_mode", isolation_mode)
+        path_boundary_ready = getattr(app.state, "tool_runtime_provider", None) is not None
+        sandbox_required = selected_isolation is IsolationMode.SANDBOXED
+        components_ready = (
+            store_open
+            and controller_present
+            and profiles_configured
+            and adapters_ready
+            and path_boundary_ready
+        )
+        sandbox_ok = sandbox_ready if sandbox_required else True
         response = ReadinessResponse(
-            status=(
-                "ready"
-                if store_open
-                and controller_present
-                and profiles_configured
-                and adapters_ready
-                and sandbox_ready
-                else "not_ready"
-            ),
+            status="ready" if components_ready and sandbox_ok else "not_ready",
             store_open=store_open,
             controller_present=controller_present,
             profiles_configured=profiles_configured,
             adapters_ready=adapters_ready,
+            path_boundary_ready=path_boundary_ready,
             sandbox_ready=sandbox_ready,
+            sandbox_required=sandbox_required,
+            execution_location=selected_location,
+            isolation_mode=selected_isolation,
         )
         return JSONResponse(
             status_code=200 if response.status == "ready" else 503,

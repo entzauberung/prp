@@ -109,6 +109,81 @@ def build_parser() -> argparse.ArgumentParser:
     deny = commands.add_parser("deny", help="deny one pending tool request")
     deny.add_argument("request_id")
     deny.add_argument("--reason", required=True)
+
+    local = commands.add_parser(
+        "local",
+        help="run one in-process local prompt without HTTP or Bridge",
+    )
+    local_commands = local.add_subparsers(dest="local_command", required=True)
+    local_run = local_commands.add_parser(
+        "run",
+        help=(
+            "execute one prompt in-process through LocalRuntime; HOST isolation "
+            "is a path-boundary only, not an operating-system sandbox"
+        ),
+        description=(
+            "Execute one prompt in-process through LocalRuntime. HOST isolation "
+            "is a path-boundary only, not an operating-system sandbox."
+        ),
+    )
+    local_run.add_argument("prompt", help="prompt text executed in-process")
+    local_run.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="local workspace directory; defaults to the current directory",
+    )
+    local_run.add_argument("--agent-mode", choices=_choices("agent"), default="NORMAL")
+    local_run.add_argument(
+        "--isolation-mode",
+        choices=_choices("isolation"),
+        default="HOST",
+        help="HOST is a path-boundary only; local execution stays in-process",
+    )
+    local_run.add_argument(
+        "--user-explicit",
+        action="store_true",
+        help="record explicit user intent for HOST YOLO",
+    )
+
+    local_approve = local_commands.add_parser(
+        "approve",
+        help="approve one paused local tool request in-process",
+        description="Approve one durable local ASK request without HTTP or Bridge.",
+    )
+    local_approve.add_argument("request_id")
+    local_approve.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="local workspace directory; defaults to the current directory",
+    )
+    local_approve.add_argument("--reason", default=None)
+
+    local_deny = local_commands.add_parser(
+        "deny",
+        help="deny one paused local tool request in-process",
+        description="Deny one durable local ASK request without HTTP or Bridge.",
+    )
+    local_deny.add_argument("request_id")
+    local_deny.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="local workspace directory; defaults to the current directory",
+    )
+    local_deny.add_argument("--reason", required=True)
+
+    serve = commands.add_parser(
+        "serve",
+        help="serve the existing ASGI app on loopback for local programs",
+        description=(
+            "Optional loopback HTTP surface over create_app. Default host is "
+            "127.0.0.1; a wider bind must be explicit. Local run does not use this command."
+        ),
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
     return parser
 
 
@@ -262,19 +337,49 @@ async def _decide(args: argparse.Namespace, outcome: str) -> None:
     _print_json(response)
 
 
-async def _dispatch(args: argparse.Namespace) -> None:
+async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "connect":
         await _connect(args)
-    elif args.command == "run":
+        return 0
+    if args.command == "run":
         await _run(args)
-    elif args.command in {"watch", "resume"}:
+        return 0
+    if args.command in {"watch", "resume"}:
         await _watch(args)
-    elif args.command == "approve":
+        return 0
+    if args.command == "approve":
         await _decide(args, "APPROVE")
-    elif args.command == "deny":
+        return 0
+    if args.command == "deny":
         await _decide(args, "DENY")
-    else:
-        raise CliError(f"unknown command: {args.command}")
+        return 0
+    if args.command == "serve":
+        raise CliError("serve must run on the synchronous CLI boundary")
+    if args.command == "local":
+        from prp_runtime.client.local_cli import (
+            dispatch_local_approve,
+            dispatch_local_deny,
+            dispatch_local_run,
+        )
+
+        if args.local_command == "run":
+            return await dispatch_local_run(args)
+        if args.local_command == "approve":
+            return await dispatch_local_approve(args)
+        if args.local_command == "deny":
+            return await dispatch_local_deny(args)
+        raise CliError(f"unknown local command: {args.local_command}")
+    raise CliError(f"unknown command: {args.command}")
+
+
+def _serve_sync(args: argparse.Namespace) -> int:
+    """Hand serve to the installed runner outside any asyncio.run loop."""
+    from prp_runtime.client.serve import MAX_SERVE_PORT, MIN_SERVE_PORT, serve_app
+
+    if args.port < MIN_SERVE_PORT or args.port > MAX_SERVE_PORT:
+        raise CliError("serve port must be between 1 and 65535")
+    serve_app(host=args.host, port=args.port)
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -282,8 +387,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        asyncio.run(_dispatch(args))
+        if args.command == "serve":
+            return _serve_sync(args)
+        return asyncio.run(_dispatch(args))
     except (BridgeError, CliError, OSError, ValueError) as error:
         print(f"prp: {error}", file=sys.stderr)
         return 1
-    return 0

@@ -7,7 +7,15 @@ from pydantic import ValidationError
 
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.providers.base import ProviderProtocol
-from prp_runtime.settings import Settings
+from prp_runtime.settings import (
+    DEFAULT_PROCESS_MAX_ATTEMPTS,
+    DEFAULT_PROCESS_MAX_CONCURRENCY,
+    DEFAULT_PROCESS_MAX_TOTAL_TOKENS,
+    MAX_PROCESS_MAX_ATTEMPTS,
+    MAX_PROCESS_MAX_CONCURRENCY,
+    MAX_PROCESS_MAX_TOTAL_TOKENS,
+    Settings,
+)
 
 
 def _profile(protocol: str | None = None, **extra: object) -> dict[str, object]:
@@ -73,3 +81,60 @@ def test_settings_reject_protocol_version_mismatch_and_unknown_protocol() -> Non
         Settings.from_env(
             {"PRP_WORKER_PROFILE": json.dumps(_profile("UNKNOWN_PROTOCOL"))}
         )
+
+
+def test_settings_expose_bounded_isolation_capacity() -> None:
+    settings = Settings()
+    assert settings.isolation_max_slots == 2
+    assert settings.isolation_max_bytes == 256 * 1024 * 1024
+    from_env = Settings.from_env(
+        {
+            "PRP_ISOLATION_MAX_SLOTS": "1",
+            "PRP_ISOLATION_MAX_BYTES": "1048576",
+        }
+    )
+    assert from_env.isolation_max_slots == 1
+    assert from_env.isolation_max_bytes == 1_048_576
+    with pytest.raises(ValidationError):
+        Settings(isolation_max_slots=0)
+    with pytest.raises(ValidationError):
+        Settings(isolation_max_bytes=0)
+    with pytest.raises(ValidationError):
+        Settings(isolation_max_slots=9)
+    with pytest.raises(ValidationError):
+        Settings(isolation_max_bytes=512 * 1024 * 1024 + 1)
+
+
+def test_settings_expose_bounded_process_resource_envelope() -> None:
+    settings = Settings()
+    envelope = settings.resource_envelope
+    assert settings.process_max_concurrency == DEFAULT_PROCESS_MAX_CONCURRENCY
+    assert settings.process_max_attempts == DEFAULT_PROCESS_MAX_ATTEMPTS
+    assert settings.process_max_total_tokens == DEFAULT_PROCESS_MAX_TOTAL_TOKENS
+    assert envelope.max_slots == settings.isolation_max_slots
+    assert envelope.max_copied_bytes == settings.isolation_max_bytes
+    assert envelope.max_concurrency == 1
+    assert envelope.max_attempts == 8
+    assert envelope.max_total_tokens == 250_000
+    from_env = Settings.from_env(
+        {
+            "PRP_PROCESS_MAX_CONCURRENCY": "2",
+            "PRP_PROCESS_MAX_ATTEMPTS": "4",
+            "PRP_PROCESS_MAX_TOTAL_TOKENS": "1024",
+        }
+    )
+    assert from_env.process_max_concurrency == 2
+    assert from_env.process_max_attempts == 4
+    assert from_env.process_max_total_tokens == 1024
+    with pytest.raises(ValidationError):
+        Settings(process_max_concurrency=0)
+    with pytest.raises(ValidationError):
+        Settings(process_max_attempts=-1)
+    with pytest.raises(ValidationError):
+        Settings(process_max_total_tokens=0)
+    with pytest.raises(ValidationError):
+        Settings(process_max_concurrency=MAX_PROCESS_MAX_CONCURRENCY + 1)
+    with pytest.raises(ValidationError):
+        Settings(process_max_attempts=MAX_PROCESS_MAX_ATTEMPTS + 1)
+    with pytest.raises(ValidationError):
+        Settings(process_max_total_tokens=MAX_PROCESS_MAX_TOTAL_TOKENS + 1)

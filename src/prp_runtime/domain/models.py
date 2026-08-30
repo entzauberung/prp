@@ -795,7 +795,12 @@ class RoutingIntent(DomainModel):
 
 
 class AgentRequestOptions(DomainModel):
-    """Orthogonal agent execution facts carried by a native request."""
+    """Orthogonal agent execution facts carried by a native request.
+
+    ``LOCAL`` may combine with ``HOST``. That combination does not create a
+    Bridge claim and does not weaken HOST YOLO, which still requires
+    ``user_explicit=true``.
+    """
 
     agent_mode: AgentMode = AgentMode.NORMAL
     isolation_mode: IsolationMode = IsolationMode.SANDBOXED
