@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from prp_runtime.domain.models import new_client_id
 from prp_runtime.domain.values import (
     new_snapshot_id,
     new_workspace_id,
@@ -12,6 +13,7 @@ from prp_runtime.domain.values import (
     validate_workspace_id,
 )
 from prp_runtime.workspace.models import (
+    BridgeManifestPublication,
     Snapshot,
     SnapshotEntry,
     SnapshotEntryType,
@@ -188,3 +190,41 @@ def test_workspace_and_snapshot_ids_are_typed_and_bounded() -> None:
         validate_workspace_id(snapshot_id)
     with pytest.raises(ValueError):
         validate_snapshot_id(workspace_id)
+
+
+def test_bridge_manifest_publication_is_content_free_and_hash_bound() -> None:
+    entries = (make_entry("src/main.py"), make_entry("README.md", size=2, sha256="b" * 64))
+    manifest = SnapshotManifest(entries=entries)
+    publication = BridgeManifestPublication(
+        snapshot_id=new_snapshot_id(),
+        client_id=new_client_id(),
+        workspace_id=new_workspace_id(),
+        entries=entries,
+        manifest_hash=manifest.manifest_hash,
+    )
+    assert publication.manifest.manifest_hash == manifest.manifest_hash
+    assert "root" not in publication.model_dump()
+    assert "content" not in publication.model_dump()
+    with pytest.raises(ValidationError):
+        BridgeManifestPublication(
+            snapshot_id=new_snapshot_id(),
+            client_id=new_client_id(),
+            workspace_id=new_workspace_id(),
+            entries=entries,
+            manifest_hash="c" * 64,
+        )
+    with pytest.raises(ValidationError):
+        BridgeManifestPublication(
+            snapshot_id=new_snapshot_id(),
+            client_id=new_client_id(),
+            workspace_id=new_workspace_id(),
+            entries=entries,
+            workspace_root="/tmp/project",
+        )
+    with pytest.raises(ValidationError):
+        BridgeManifestPublication(
+            snapshot_id=new_snapshot_id(),
+            client_id=new_client_id(),
+            workspace_id=new_workspace_id(),
+            entries=(make_entry("../secret"),),
+        )

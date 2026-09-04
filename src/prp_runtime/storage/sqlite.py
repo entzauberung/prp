@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, Self, SupportsInt
 
 import aiosqlite
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from prp_runtime.domain.enums import (
     AttemptStatus,
@@ -46,6 +46,7 @@ from prp_runtime.domain.events import (
     next_sequence,
     payload_from_agent_history,
     payload_from_bridge_claim,
+    payload_from_bridge_result_wake,
     payload_from_merge_ledger,
     payload_from_tool_call,
     payload_from_tool_result,
@@ -67,15 +68,29 @@ from prp_runtime.domain.models import (
     OutputRequirement,
     Run,
     RunMetrics,
+    ClientCapabilityDescriptor,
+    MAX_BRIDGE_HEARTBEAT_TTL_SECONDS,
+    MAX_BRIDGE_LEASE_RENEW_SECONDS,
+    MAX_BRIDGE_LEASE_RENEWS,
+    MAX_BRIDGE_LEASE_SECONDS,
+    MAX_BRIDGE_LEASE_TOTAL_SECONDS,
+    RegisteredBridgeClient,
     Session,
     SessionStatus,
     Usage,
     VerificationResult,
     WorkspaceGrant,
     WorkUnit,
+    BridgeClientStatus,
 )
 from prp_runtime.domain.transitions import transition_merge
-from prp_runtime.domain.values import ModelRef, ResourceClaim, new_reservation_id, utc_now
+from prp_runtime.domain.values import (
+    ModelRef,
+    ResourceClaim,
+    new_reservation_id,
+    new_snapshot_id,
+    utc_now,
+)
 from prp_runtime.json_support import strict_json_loads
 from prp_runtime.policy.models import (
     ApprovalDecision,
@@ -92,14 +107,21 @@ from prp_runtime.tools.models import (
     ToolResult,
     validate_tool_rejection_reason,
 )
+from prp_runtime.tools.patch import materialize_patched_contents
 from prp_runtime.workspace.changes import (
     ChangeSet,
     FileChange,
     FileChangeAction,
     FileContent,
     Patch,
+    apply_patch_facts_to_manifest,
+    new_change_set_id,
+    parse_bridge_patch_facts,
+    validate_patch_facts_against_manifest,
 )
 from prp_runtime.workspace.models import (
+    BridgeManifestAcceptance,
+    BridgeManifestPublication,
     Snapshot,
     SnapshotEntry,
     SnapshotEntryType,
@@ -126,7 +148,7 @@ __all__ = [
     "SqliteStore",
 ]
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
@@ -247,20 +269,22 @@ def _bridge_claim_fingerprint(
     run_id: str,
     session_id: str,
     workspace_id: str,
+    snapshot_id: str,
     owner_id: str,
-    claimant_id: str,
+    client_id: str,
     idempotency_key: str,
 ) -> str:
     """Hash only public claim identity; never persist a bearer secret."""
     material = json.dumps(
         {
             "call_id": call_id,
+            "client_id": client_id,
+            "idempotency_key": idempotency_key,
+            "owner_id": owner_id,
             "run_id": run_id,
             "session_id": session_id,
+            "snapshot_id": snapshot_id,
             "workspace_id": workspace_id,
-            "owner_id": owner_id,
-            "claimant_id": claimant_id,
-            "idempotency_key": idempotency_key,
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -269,9 +293,43 @@ def _bridge_claim_fingerprint(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _bridge_capability_columns(
+    capabilities: ClientCapabilityDescriptor,
+) -> tuple[str, str, int, int, int | None]:
+    tools_json = json.dumps(
+        list(capabilities.tools),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    effects_json = json.dumps(
+        [effect.value for effect in capabilities.effects],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (
+        tools_json,
+        effects_json,
+        capabilities.max_argument_bytes,
+        capabilities.max_output_bytes,
+        capabilities.max_runtime_ms,
+    )
+
+
 def _bridge_results_match(existing: ToolResult, candidate: ToolResult) -> bool:
     """Compare client-proven result facts without trusting server timestamps."""
     return existing.model_copy(update={"completed_at": candidate.completed_at}) == candidate
+
+
+def _bridge_result_artifact_id(call_id: str) -> str:
+    digest = hashlib.sha256(f"bridge-result:{call_id}".encode("utf-8")).hexdigest()
+    return f"art_{digest[:32]}"
+
+
+def _bridge_result_evidence_id(call_id: str) -> str:
+    digest = hashlib.sha256(f"bridge-evidence:{call_id}".encode("utf-8")).hexdigest()
+    return f"ev_{digest[:32]}"
 
 
 def _usage_or_none(row: aiosqlite.Row) -> Usage | None:
@@ -325,6 +383,10 @@ class SqliteStore:
         self._capacity_limits: dict[str, int] = {}
         self._event_bus = event_bus
         self._pending_event_hints: list[tuple[str, int]] = []
+        self._bridge_heartbeats: dict[str, dict[str, object]] = {}
+        self._bridge_renew_counts: dict[str, int] = {}
+        self._bridge_lease_extensions: dict[str, datetime] = {}
+        self._heartbeat_ttl = timedelta(seconds=MAX_BRIDGE_HEARTBEAT_TTL_SECONDS)
 
     @property
     def database_path(self) -> Path:
@@ -668,6 +730,231 @@ class SqliteStore:
                 raise _translate_integrity_error(error, "session") from error
         return session
 
+    async def register_bridge_client(
+        self, client: RegisteredBridgeClient
+    ) -> RegisteredBridgeClient:
+        """Persist one owner-scoped Bridge client after checking its workspace."""
+        async with self.transaction() as connection:
+            workspace = await self._fetch_one(
+                "SELECT workspace_id FROM workspaces WHERE workspace_id = ? AND owner_id = ?",
+                (client.workspace_id, client.principal_id),
+            )
+            if workspace is None:
+                raise MissingEntityError(
+                    "workspace is outside the authenticated principal scope"
+                )
+            existing = await self._fetch_one(
+                "SELECT * FROM bridge_clients WHERE client_id = ?",
+                (client.client_id,),
+            )
+            if existing is not None:
+                if str(existing["principal_id"]) != client.principal_id:
+                    raise MissingEntityError(
+                        "bridge client is outside the authenticated principal scope"
+                    )
+                persisted = self._row_to_bridge_client(existing)
+                if persisted == client:
+                    return persisted
+                raise DuplicateEntityError("bridge client is already persisted")
+            tools_json, effects_json, max_argument_bytes, max_output_bytes, max_runtime_ms = (
+                _bridge_capability_columns(client.capabilities)
+            )
+            try:
+                await connection.execute(
+                    """
+                    INSERT INTO bridge_clients (
+                        client_id, principal_id, workspace_id, tools_json, effects_json,
+                        max_argument_bytes, max_output_bytes, max_runtime_ms,
+                        capability_fingerprint, status, created_at, last_seen_at, disabled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        client.client_id,
+                        client.principal_id,
+                        client.workspace_id,
+                        tools_json,
+                        effects_json,
+                        max_argument_bytes,
+                        max_output_bytes,
+                        max_runtime_ms,
+                        client.capability_fingerprint,
+                        client.status.value,
+                        _require_iso(client.created_at),
+                        _iso(client.last_seen_at),
+                        _iso(client.disabled_at),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise _translate_integrity_error(error, "bridge client") from error
+        return client
+
+    async def get_bridge_client(
+        self, client_id: str, *, principal_id: str
+    ) -> RegisteredBridgeClient:
+        """Read a registered client only through its authenticated principal."""
+        row = await self._fetch_one(
+            """
+            SELECT c.* FROM bridge_clients AS c
+            JOIN workspaces AS w ON w.workspace_id = c.workspace_id
+            WHERE c.client_id = ? AND c.principal_id = ? AND w.owner_id = ?
+            """,
+            (client_id, principal_id, principal_id),
+        )
+        if row is None:
+            raise MissingEntityError(
+                "bridge client is outside the authenticated principal scope"
+            )
+        return self._row_to_bridge_client(row)
+
+    async def list_bridge_clients(
+        self,
+        *,
+        principal_id: str,
+        workspace_id: str | None = None,
+    ) -> tuple[RegisteredBridgeClient, ...]:
+        """List clients owned by one principal, optionally for one workspace."""
+        sql = """
+            SELECT c.* FROM bridge_clients AS c
+            JOIN workspaces AS w ON w.workspace_id = c.workspace_id
+            WHERE c.principal_id = ? AND w.owner_id = ?
+        """
+        params: list[object] = [principal_id, principal_id]
+        if workspace_id is not None:
+            sql += " AND c.workspace_id = ?"
+            params.append(workspace_id)
+        sql += " ORDER BY c.created_at, c.client_id"
+        rows = await self._fetch_all(sql, params)
+        return tuple(self._row_to_bridge_client(row) for row in rows)
+
+    async def list_active_bridge_claim_counts(
+        self,
+        *,
+        principal_id: str,
+        workspace_id: str,
+    ) -> dict[str, int]:
+        """Count ACTIVE leases per client in one owner-scoped workspace."""
+        rows = await self._fetch_all(
+            """
+            SELECT bc.client_id AS client_id, COUNT(*) AS active_count
+              FROM bridge_claims AS bc
+              JOIN workspaces AS w ON w.workspace_id = bc.workspace_id
+             WHERE bc.workspace_id = ? AND bc.owner_id = ?
+               AND w.owner_id = ? AND bc.status = 'ACTIVE'
+             GROUP BY bc.client_id
+            """,
+            (workspace_id, principal_id, principal_id),
+        )
+        return {str(row["client_id"]): int(row["active_count"]) for row in rows}
+
+    async def list_active_bridge_call_ids(
+        self,
+        *,
+        principal_id: str,
+        workspace_id: str,
+    ) -> tuple[str, ...]:
+        """Return ACTIVE claimed call ids in one owner-scoped workspace."""
+        rows = await self._fetch_all(
+            """
+            SELECT bc.call_id AS call_id
+              FROM bridge_claims AS bc
+              JOIN workspaces AS w ON w.workspace_id = bc.workspace_id
+             WHERE bc.workspace_id = ? AND bc.owner_id = ?
+               AND w.owner_id = ? AND bc.status = 'ACTIVE'
+             ORDER BY bc.call_id
+            """,
+            (workspace_id, principal_id, principal_id),
+        )
+        return tuple(str(row["call_id"]) for row in rows)
+
+    async def record_bridge_heartbeat(
+        self,
+        client_id: str,
+        *,
+        principal_id: str,
+        fingerprint: str,
+        at: datetime,
+    ) -> None:
+        """Refresh liveness for one registered client without storing secrets."""
+        async with self.transaction() as connection:
+            client = await self.get_bridge_client(client_id, principal_id=principal_id)
+            if client.status is BridgeClientStatus.DISABLED:
+                raise StateError("disabled Bridge client cannot heartbeat")
+            if client.capability_fingerprint != fingerprint:
+                raise StateError("capability fingerprint mismatch requires re-handshake")
+            if at.tzinfo is None:
+                raise ValueError("heartbeat time must be timezone-aware")
+            if at < client.created_at:
+                raise ValueError("last_seen_at cannot precede created_at")
+            await connection.execute(
+                """
+                UPDATE bridge_clients
+                SET last_seen_at = ?
+                WHERE client_id = ? AND principal_id = ?
+                """,
+                (_require_iso(at), client_id, principal_id),
+            )
+        self._bridge_heartbeats[client_id] = {
+            "principal_id": principal_id,
+            "fingerprint": fingerprint,
+            "last_seen": at,
+        }
+
+    def bridge_client_liveness(
+        self,
+        client_id: str,
+        *,
+        now: datetime,
+        principal_id: str | None = None,
+        fingerprint: str | None = None,
+    ):
+        from prp_runtime.domain.enums import BridgeClientLiveness
+
+        record = self._bridge_heartbeats.get(client_id)
+        if record is None:
+            return BridgeClientLiveness.OFFLINE
+        if principal_id is not None and record.get("principal_id") != principal_id:
+            return BridgeClientLiveness.OFFLINE
+        if fingerprint is not None and record.get("fingerprint") != fingerprint:
+            return BridgeClientLiveness.OFFLINE
+        last_seen = record.get("last_seen")
+        if not isinstance(last_seen, datetime) or now - last_seen > self._heartbeat_ttl:
+            return BridgeClientLiveness.EXPIRED
+        return BridgeClientLiveness.LIVE
+
+    def set_heartbeat_ttl(self, seconds: float) -> None:
+        if seconds <= 0:
+            raise ValueError("heartbeat ttl must be positive")
+        if seconds > MAX_BRIDGE_HEARTBEAT_TTL_SECONDS:
+            raise ValueError("heartbeat ttl cannot exceed the server limit")
+        self._heartbeat_ttl = timedelta(seconds=seconds)
+
+    async def disable_bridge_client(
+        self, client_id: str, *, principal_id: str, at: datetime
+    ) -> RegisteredBridgeClient:
+        async with self.transaction() as connection:
+            current = await self.get_bridge_client(client_id, principal_id=principal_id)
+            if current.status is BridgeClientStatus.DISABLED:
+                if current.disabled_at == at:
+                    return current
+                raise DuplicateEntityError("bridge client is already disabled")
+            disabled = current.model_copy(
+                update={"status": BridgeClientStatus.DISABLED, "disabled_at": at}
+            )
+            await connection.execute(
+                """
+                UPDATE bridge_clients
+                SET status = ?, disabled_at = ?
+                WHERE client_id = ? AND principal_id = ?
+                """,
+                (
+                    disabled.status.value,
+                    _require_iso(at),
+                    client_id,
+                    principal_id,
+                ),
+            )
+        return disabled
+
     async def get_session(self, session_id: str, *, principal_id: str) -> Session:
         """Read a session only through its authenticated principal boundary."""
         row = await self._fetch_one(
@@ -783,6 +1070,7 @@ class SqliteStore:
         manifest: SnapshotManifest,
         *,
         owner_id: str,
+        file_contents: Mapping[str, str] | None = None,
     ) -> Snapshot:
         """Insert or idempotently replay an owner-scoped immutable snapshot."""
         workspace = await self._fetch_one(
@@ -830,12 +1118,24 @@ class SqliteStore:
                         "completed_at": _iso(persisted.completed_at),
                     },
                 )
+                contents = {} if file_contents is None else dict(file_contents)
                 for entry in manifest.entries:
+                    content = None
+                    if entry.entry_type is SnapshotEntryType.FILE:
+                        text = contents.get(entry.path)
+                        if text is not None:
+                            payload = text.encode("utf-8")
+                            digest = hashlib.sha256(payload).hexdigest()
+                            if digest != entry.sha256 or len(payload) != entry.size:
+                                raise StateError(
+                                    "snapshot file content does not match the manifest"
+                                )
+                            content = text
                     await connection.execute(
                         """
                         INSERT INTO snapshot_files (
-                            snapshot_id, path, sha256, size, entry_type
-                        ) VALUES (:snapshot_id, :path, :sha256, :size, :entry_type)
+                            snapshot_id, path, sha256, size, entry_type, content
+                        ) VALUES (:snapshot_id, :path, :sha256, :size, :entry_type, :content)
                         """,
                         {
                             "snapshot_id": persisted.snapshot_id,
@@ -843,6 +1143,7 @@ class SqliteStore:
                             "sha256": entry.sha256,
                             "size": entry.size,
                             "entry_type": entry.entry_type.value,
+                            "content": content,
                         },
                     )
             except sqlite3.IntegrityError as error:
@@ -897,6 +1198,80 @@ class SqliteStore:
                 )
                 for row in rows
             )
+        )
+
+    async def get_snapshot_file_contents(
+        self, snapshot_id: str, *, owner_id: str
+    ) -> dict[str, str]:
+        """Read persisted UTF-8 snapshot bytes without opening a live root."""
+        snapshot = await self.get_snapshot(snapshot_id, owner_id=owner_id)
+        rows = await self._fetch_all(
+            "SELECT path, content FROM snapshot_files "
+            "WHERE snapshot_id = ? AND entry_type = 'FILE' AND content IS NOT NULL "
+            "ORDER BY path",
+            (snapshot.snapshot_id,),
+        )
+        return {str(row["path"]): str(row["content"]) for row in rows}
+
+    async def publish_bridge_manifest(
+        self,
+        publication: BridgeManifestPublication,
+        *,
+        principal_id: str,
+        published_at: datetime | None = None,
+    ) -> BridgeManifestAcceptance:
+        """Persist one client-owned manifest without roots or file contents."""
+        client = await self.get_bridge_client(
+            publication.client_id, principal_id=principal_id
+        )
+        if client.status is BridgeClientStatus.DISABLED:
+            raise StateError("disabled Bridge client cannot publish a manifest")
+        if client.workspace_id != publication.workspace_id:
+            raise StateError("Bridge manifest workspace does not match the registered client")
+        manifest = publication.manifest
+        now = published_at or utc_now()
+        existing_row = await self._fetch_one(
+            "SELECT s.* FROM snapshots AS s "
+            "JOIN workspaces AS w ON w.workspace_id = s.workspace_id "
+            "WHERE s.snapshot_id = ? AND w.owner_id = ?",
+            (publication.snapshot_id, principal_id),
+        )
+        if existing_row is not None:
+            existing = self._row_to_snapshot(existing_row)
+            if existing.workspace_id != publication.workspace_id:
+                raise DuplicateEntityError("snapshot id belongs to another workspace")
+            existing_manifest = await self.get_snapshot_manifest(
+                existing.snapshot_id, owner_id=principal_id
+            )
+            if existing_manifest.manifest_hash != manifest.manifest_hash:
+                raise StateError("stale Bridge manifest cannot replace a published snapshot")
+            return BridgeManifestAcceptance(
+                snapshot_id=existing.snapshot_id,
+                client_id=client.client_id,
+                workspace_id=existing.workspace_id,
+                manifest_hash=existing_manifest.manifest_hash,
+                file_count=len(existing_manifest.entries),
+                total_size=existing_manifest.total_size,
+                status=existing.status,
+            )
+        snapshot = Snapshot(
+            snapshot_id=publication.snapshot_id,
+            workspace_id=publication.workspace_id,
+            status=SnapshotStatus.READY,
+            created_at=now,
+            completed_at=now,
+        )
+        persisted = await self.create_snapshot(
+            snapshot, manifest, owner_id=principal_id
+        )
+        return BridgeManifestAcceptance(
+            snapshot_id=persisted.snapshot_id,
+            client_id=client.client_id,
+            workspace_id=persisted.workspace_id,
+            manifest_hash=manifest.manifest_hash,
+            file_count=len(manifest.entries),
+            total_size=manifest.total_size,
+            status=persisted.status,
         )
 
     # --- ChangeSets ------------------------------------------------------------
@@ -2134,7 +2509,7 @@ class SqliteStore:
         call_id: str,
         *,
         principal_id: str,
-        claimant_id: str,
+        client_id: str,
         idempotency_key: str,
         claimed_at: datetime | None = None,
         expires_at: datetime | None = None,
@@ -2144,7 +2519,8 @@ class SqliteStore:
 
         The call must already be RUNNING in a BRIDGE Session. An expired active
         claim is closed before a new idempotency key can claim the call, so two
-        clients cannot observe simultaneous lease ownership.
+        clients cannot observe simultaneous lease ownership. The assigned client
+        may replay its ACTIVE lease with a different idempotency key.
         """
         if (
             not idempotency_key
@@ -2152,10 +2528,14 @@ class SqliteStore:
             or len(idempotency_key) > 128
         ):
             raise ValueError("Idempotency-Key must be 1 to 128 non-whitespace characters")
-        if not claimant_id or claimant_id != claimant_id.strip() or len(claimant_id) > 128:
-            raise ValueError("claimant_id must be 1 to 128 non-whitespace characters")
+        if not client_id or client_id != client_id.strip():
+            raise ValueError("client_id must identify one registered Bridge client")
         now = claimed_at or utc_now()
-        expiry = expires_at or (now + timedelta(seconds=60))
+        server_expiry = now + timedelta(seconds=MAX_BRIDGE_LEASE_SECONDS)
+        if expires_at is None:
+            expiry = server_expiry
+        else:
+            expiry = min(expires_at, server_expiry)
         if now.tzinfo is None or expiry.tzinfo is None:
             raise ValueError("Bridge claim timestamps must be timezone-aware")
         if expiry <= now:
@@ -2175,7 +2555,7 @@ class SqliteStore:
             )
             if existing is not None:
                 replay = self._row_to_bridge_claim(existing)
-                if replay.call_id != call_id or replay.claimant_id != claimant_id:
+                if replay.call_id != call_id or replay.client_id != client_id:
                     raise DuplicateEntityError(
                         "Idempotency-Key already belongs to a different Bridge claim"
                     )
@@ -2241,6 +2621,39 @@ class SqliteStore:
                     f"cannot claim tool call in {call.status.value} state"
                 )
 
+            client_row = await self._fetch_one(
+                """
+                SELECT c.* FROM bridge_clients AS c
+                JOIN workspaces AS w ON w.workspace_id = c.workspace_id
+                WHERE c.client_id = ? AND c.principal_id = ? AND w.owner_id = ?
+                """,
+                (client_id, principal_id, principal_id),
+            )
+            if client_row is None:
+                raise MissingEntityError(
+                    "bridge client is outside the authenticated principal scope"
+                )
+            client = self._row_to_bridge_client(client_row)
+            if client.status is BridgeClientStatus.DISABLED:
+                raise StateError("disabled Bridge client cannot claim")
+            if client.workspace_id != str(row["workspace_id"]):
+                raise StateError("Bridge client workspace does not match the call")
+
+            latest_row = await self._fetch_one(
+                """
+                SELECT * FROM bridge_claims
+                 WHERE call_id = ?
+                 ORDER BY claimed_at DESC, claim_id DESC
+                """,
+                (call_id,),
+            )
+            if latest_row is not None:
+                latest = self._row_to_bridge_claim(latest_row)
+                if (
+                    latest.status is BridgeClaimStatus.EXPIRED
+                    and call.effect in {ToolEffect.WRITE, ToolEffect.COMMAND}
+                ):
+                    raise StateError("uncertain write cannot be reassigned")
             active_row = await self._fetch_one(
                 "SELECT * FROM bridge_claims WHERE call_id = ? AND status = 'ACTIVE'",
                 (call_id,),
@@ -2248,6 +2661,8 @@ class SqliteStore:
             if active_row is not None:
                 active = self._row_to_bridge_claim(active_row)
                 if active.expires_at <= now:
+                    if call.effect in {ToolEffect.WRITE, ToolEffect.COMMAND}:
+                        raise StateError("uncertain write cannot be reassigned")
                     expired = active.expire(at=now)
                     await connection.execute(
                         "UPDATE bridge_claims SET status = ?, closed_at = ? "
@@ -2260,16 +2675,34 @@ class SqliteStore:
                         payload_from_bridge_claim(expired),
                         timestamp=now,
                     )
+                elif active.client_id == client_id:
+                    return active
                 else:
                     raise DuplicateEntityError("tool call already has an active Bridge claim")
 
+            snapshot_id = call.snapshot_id
+            if snapshot_id is None:
+                raise StateError("Bridge claim requires a workspace snapshot")
+            if call.effect in {ToolEffect.WRITE, ToolEffect.COMMAND}:
+                snapshot_row = await self._fetch_one(
+                    "SELECT status, workspace_id FROM snapshots WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                )
+                if (
+                    snapshot_row is None
+                    or SnapshotStatus(str(snapshot_row["status"])) is not SnapshotStatus.READY
+                ):
+                    raise StateError("mutating Bridge claim requires a ready base snapshot")
+                if str(snapshot_row["workspace_id"]) != str(row["workspace_id"]):
+                    raise StateError("Bridge snapshot workspace does not match the call")
             claim_fingerprint = fingerprint or _bridge_claim_fingerprint(
                 call_id=call_id,
                 run_id=run_id,
                 session_id=session_id,
                 workspace_id=str(row["workspace_id"]),
+                snapshot_id=snapshot_id,
                 owner_id=principal_id,
-                claimant_id=claimant_id,
+                client_id=client.client_id,
                 idempotency_key=idempotency_key,
             )
             claim = BridgeClaim(
@@ -2277,8 +2710,9 @@ class SqliteStore:
                 run_id=run_id,
                 session_id=session_id,
                 workspace_id=str(row["workspace_id"]),
+                snapshot_id=snapshot_id,
                 owner_id=principal_id,
-                claimant_id=claimant_id,
+                client_id=client.client_id,
                 idempotency_key=idempotency_key,
                 fingerprint=claim_fingerprint,
                 claimed_at=now,
@@ -2288,10 +2722,10 @@ class SqliteStore:
                 await connection.execute(
                     """
                     INSERT INTO bridge_claims (
-                        claim_id, call_id, run_id, session_id, workspace_id, owner_id,
-                        claimant_id, idempotency_key, fingerprint, status, claimed_at,
-                        expires_at, closed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        claim_id, call_id, run_id, session_id, workspace_id, snapshot_id,
+                        owner_id, client_id, idempotency_key, fingerprint, status,
+                        claimed_at, expires_at, closed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         claim.claim_id,
@@ -2299,8 +2733,9 @@ class SqliteStore:
                         claim.run_id,
                         claim.session_id,
                         claim.workspace_id,
+                        claim.snapshot_id,
                         claim.owner_id,
-                        claim.claimant_id,
+                        claim.client_id,
                         claim.idempotency_key,
                         claim.fingerprint,
                         claim.status.value,
@@ -2401,6 +2836,103 @@ class SqliteStore:
             )
             return expired
 
+    async def renew_bridge_claim(
+        self,
+        claim_id: str,
+        *,
+        principal_id: str,
+        at: datetime,
+        extend_seconds: int | None = None,
+    ) -> BridgeClaim:
+        """Extend an active owner-scoped claim without exceeding the finite window."""
+        if at.tzinfo is None:
+            raise ValueError("Bridge claim renewal time must be timezone-aware")
+        if extend_seconds is not None and (
+            extend_seconds <= 0 or extend_seconds > MAX_BRIDGE_LEASE_RENEW_SECONDS
+        ):
+            raise ValueError("Bridge claim renewal is a finite server window")
+        extension = MAX_BRIDGE_LEASE_RENEW_SECONDS
+        async with self.transaction() as connection:
+            row = await self._fetch_one(
+                """
+                SELECT bc.*
+                  FROM bridge_claims AS bc
+                  JOIN sessions AS s ON s.session_id = bc.session_id
+                  JOIN workspaces AS w ON w.workspace_id = bc.workspace_id
+                 WHERE bc.claim_id = ? AND bc.owner_id = ?
+                   AND s.principal_id = ? AND w.owner_id = ?
+                """,
+                (claim_id, principal_id, principal_id, principal_id),
+            )
+            if row is None:
+                raise MissingEntityError("Bridge claim is outside the authenticated scope")
+            current = self._row_to_bridge_claim(row)
+            if current.status is not BridgeClaimStatus.ACTIVE or current.expires_at <= at:
+                raise StateError("only an active unexpired Bridge claim can renew")
+            remaining = current.expires_at - at
+            if remaining > timedelta(seconds=extension):
+                raise StateError("Bridge claim renewal is not due yet")
+            renews_used = self._bridge_renew_counts.get(claim_id, 0)
+            if renews_used >= MAX_BRIDGE_LEASE_RENEWS:
+                raise StateError("Bridge claim renewal cannot exceed the finite lease window")
+            ceiling = current.claimed_at + timedelta(seconds=MAX_BRIDGE_LEASE_TOTAL_SECONDS)
+            renewed_until = min(current.expires_at + timedelta(seconds=extension), ceiling)
+            if renewed_until <= current.expires_at:
+                raise StateError("Bridge claim renewal cannot exceed the finite lease window")
+            self._bridge_renew_counts[claim_id] = renews_used + 1
+            self._bridge_lease_extensions[claim_id] = renewed_until
+            return current.model_copy(update={"expires_at": renewed_until})
+
+    async def release_bridge_claim(
+        self,
+        claim_id: str,
+        *,
+        principal_id: str,
+        at: datetime,
+    ) -> BridgeClaim:
+        """Release one owner-scoped active claim idempotently."""
+        if at.tzinfo is None:
+            raise ValueError("Bridge claim release time must be timezone-aware")
+        from prp_runtime.domain.transitions import transition_bridge_claim
+
+        async with self.transaction() as connection:
+            row = await self._fetch_one(
+                """
+                SELECT bc.*
+                  FROM bridge_claims AS bc
+                  JOIN sessions AS s ON s.session_id = bc.session_id
+                  JOIN workspaces AS w ON w.workspace_id = bc.workspace_id
+                 WHERE bc.claim_id = ? AND bc.owner_id = ?
+                   AND s.principal_id = ? AND w.owner_id = ?
+                """,
+                (claim_id, principal_id, principal_id, principal_id),
+            )
+            if row is None:
+                raise MissingEntityError("Bridge claim is outside the authenticated scope")
+            current = self._row_to_bridge_claim(row)
+            target = transition_bridge_claim(
+                current.status,
+                BridgeClaimStatus.RELEASED,
+                idempotent_terminal=True,
+            )
+            if current.status is BridgeClaimStatus.RELEASED:
+                return current
+            released = current.release(at=at)
+            if released.status is not target:
+                raise StateError("Bridge claim release transition is illegal")
+            await connection.execute(
+                "UPDATE bridge_claims SET status = ?, closed_at = ? "
+                "WHERE claim_id = ? AND status = 'ACTIVE'",
+                (released.status.value, _require_iso(at), claim_id),
+            )
+            await self.append_event(
+                current.run_id,
+                EventType.BRIDGE_CLAIM_RELEASED,
+                payload_from_bridge_claim(released),
+                timestamp=at,
+            )
+            return released
+
     async def submit_bridge_tool_result(
         self,
         session_id: str,
@@ -2409,8 +2941,10 @@ class SqliteStore:
         result: ToolResult,
         *,
         principal_id: str,
-        claimant_id: str,
+        client_id: str,
         settled_at: datetime | None = None,
+        snapshot_id: str | None = None,
+        round_id: str | None = None,
     ) -> tuple[ToolResult, bool]:
         """Complete a claimed call and settle its lease in one transaction.
 
@@ -2435,8 +2969,10 @@ class SqliteStore:
                     call_id,
                     result,
                     principal_id=principal_id,
-                    claimant_id=claimant_id,
+                    client_id=client_id,
                     settled_at=settled_at,
+                    snapshot_id=snapshot_id,
+                    round_id=round_id,
                 )
             except DuplicateEntityError as error:
                 existing = await self._get_tool_result_if_present(call_id)
@@ -2458,8 +2994,10 @@ class SqliteStore:
         result: ToolResult,
         *,
         principal_id: str,
-        claimant_id: str,
+        client_id: str,
         settled_at: datetime | None,
+        snapshot_id: str | None,
+        round_id: str | None,
     ) -> tuple[ToolResult, bool]:
         """Apply one atomic Bridge result submission attempt."""
         async with self.transaction() as connection:
@@ -2472,7 +3010,7 @@ class SqliteStore:
                   JOIN sessions AS s ON s.session_id = bc.session_id
                   JOIN workspaces AS w ON w.workspace_id = bc.workspace_id
                  WHERE bc.session_id = ? AND bc.run_id = ? AND bc.call_id = ?
-                   AND bc.owner_id = ? AND bc.claimant_id = ?
+                   AND bc.owner_id = ? AND bc.client_id = ?
                    AND s.principal_id = ? AND w.owner_id = ?
                 """,
                 (
@@ -2480,7 +3018,7 @@ class SqliteStore:
                     run_id,
                     call_id,
                     principal_id,
-                    claimant_id,
+                    client_id,
                     principal_id,
                     principal_id,
                 ),
@@ -2534,10 +3072,54 @@ class SqliteStore:
             if call_row is None:
                 raise MissingEntityError("tool call is not persisted")
             current = self._row_to_tool_call(call_row)
+            if str(call_row["workspace_id"]) != claim.workspace_id:
+                raise StateError("tool call workspace does not match the Bridge claim")
+            if current.snapshot_id != claim.snapshot_id:
+                raise StateError("Bridge result base snapshot does not match the assigned call")
+            if snapshot_id is not None and snapshot_id != claim.snapshot_id:
+                raise StateError("Bridge result base snapshot does not match the assigned call")
+            snapshot_row = await self._fetch_one(
+                "SELECT status FROM snapshots WHERE snapshot_id = ? AND workspace_id = ?",
+                (claim.snapshot_id, claim.workspace_id),
+            )
+            if (
+                snapshot_row is None
+                or SnapshotStatus(str(snapshot_row["status"])) is not SnapshotStatus.READY
+            ):
+                raise StateError("Bridge result requires a ready base snapshot")
+            round_row = await self._fetch_one(
+                """
+                SELECT round_id FROM progressive_rounds
+                 WHERE run_id = ?
+                 ORDER BY round_index DESC
+                 LIMIT 1
+                """,
+                (run_id,),
+            )
+            current_round_id = None if round_row is None else str(round_row["round_id"])
+            if round_id is not None and round_id != current_round_id:
+                raise StateError("Bridge result round does not match the assigned run")
+            attempt_row = await self._fetch_one(
+                """
+                SELECT attempt_id FROM attempts
+                 WHERE work_unit_id = ?
+                 ORDER BY CASE status WHEN 'RUNNING' THEN 0 ELSE 1 END,
+                          attempt_index DESC
+                 LIMIT 1
+                """,
+                (current.work_unit_id,),
+            )
             if current.status is not ToolCallStatus.RUNNING:
                 raise StateError(
                     f"cannot complete tool call in {current.status.value} state"
                 )
+            attempt_id = None if attempt_row is None else str(attempt_row["attempt_id"])
+            await self._persist_bridge_result_observation(
+                current,
+                result,
+                claim=claim,
+                principal_id=principal_id,
+            )
             transitioned = current.transition(result.status)
             try:
                 await connection.execute(
@@ -2579,6 +3161,13 @@ class SqliteStore:
                 payload_from_tool_result(result),
                 timestamp=result.completed_at,
             )
+            await self._record_bridge_result_facts(
+                current,
+                result,
+                claim=claim,
+                attempt_id=attempt_id,
+                round_id=current_round_id,
+            )
             settled = claim.settle(at=settlement_time)
             await connection.execute(
                 "UPDATE bridge_claims SET status = ?, closed_at = ? "
@@ -2591,7 +3180,170 @@ class SqliteStore:
                 payload_from_bridge_claim(settled),
                 timestamp=settlement_time,
             )
+            await self.append_event(
+                run_id,
+                EventType.BRIDGE_RESULT_WAKE,
+                payload_from_bridge_result_wake(
+                    call_id=call_id, status=result.status.value
+                ),
+                timestamp=settlement_time,
+            )
             return result, False
+
+    async def _persist_bridge_result_observation(
+        self,
+        call: ToolCall,
+        result: ToolResult,
+        *,
+        claim: BridgeClaim,
+        principal_id: str,
+    ) -> None:
+        """Validate bounded observations before the call is completed."""
+        try:
+            facts = parse_bridge_patch_facts(result.result)
+        except ValueError as error:
+            raise StateError(str(error)) from error
+        if facts is None:
+            return
+        if call.effect is not ToolEffect.WRITE:
+            raise StateError("read result cannot claim a ChangeSet")
+        patch, files = facts
+        if patch.base_snapshot_id != claim.snapshot_id:
+            raise StateError("ChangeSet does not match its tool call context")
+        if result.changed_paths and set(result.changed_paths) != {item.path for item in files}:
+            raise StateError("changed_paths do not match validated patch facts")
+        manifest = await self.get_snapshot_manifest(
+            claim.snapshot_id, owner_id=principal_id
+        )
+        try:
+            validate_patch_facts_against_manifest(manifest, files)
+            applied = apply_patch_facts_to_manifest(manifest, files)
+        except ValueError as error:
+            raise StateError(str(error)) from error
+        if applied.manifest_hash == manifest.manifest_hash:
+            raise StateError("ChangeSet must produce a new snapshot")
+
+    async def _record_bridge_result_facts(
+        self,
+        call: ToolCall,
+        result: ToolResult,
+        *,
+        claim: BridgeClaim,
+        attempt_id: str | None,
+        round_id: str | None,
+    ) -> None:
+        """Persist Artifact/Evidence and optional base-bound ChangeSet facts."""
+        if attempt_id is None:
+            return
+        artifact_content = json.dumps(
+            {
+                "attempt_id": attempt_id,
+                "call_id": call.call_id,
+                "changed_paths": list(result.changed_paths),
+                "exit_code": result.exit_code,
+                "output_sha256": hashlib.sha256(result.output.encode("utf-8")).hexdigest(),
+                "result": result.result,
+                "round_id": round_id,
+                "snapshot_id": claim.snapshot_id,
+                "status": result.status.value,
+                "truncated": result.truncated,
+                "work_unit_id": call.work_unit_id,
+            },
+            allow_nan=False,
+            sort_keys=True,
+        )
+        artifact = Artifact(
+            artifact_id=_bridge_result_artifact_id(call.call_id),
+            run_id=call.run_id,
+            work_unit_id=call.work_unit_id,
+            attempt_id=attempt_id,
+            name="bridge-result",
+            kind=ArtifactKind.JSON,
+            content=artifact_content,
+            created_at=result.completed_at,
+        )
+        if result.status is ToolCallStatus.FAILED:
+            verdict = VerificationResult.FAIL
+        elif result.truncated or result.status is ToolCallStatus.CANCELLED:
+            verdict = VerificationResult.INCONCLUSIVE
+        else:
+            verdict = VerificationResult.PASS
+        evidence = Evidence(
+            evidence_id=_bridge_result_evidence_id(call.call_id),
+            run_id=call.run_id,
+            work_unit_id=call.work_unit_id,
+            artifact_id=artifact.artifact_id,
+            kind=EvidenceKind.DETERMINISTIC_CHECK,
+            rule="bridge.result.observation",
+            result=verdict,
+            detail=(
+                f"call={call.call_id} snapshot={claim.snapshot_id} "
+                f"round={round_id or 'none'} attempt={attempt_id} "
+                f"truncated={int(result.truncated)}"
+            ),
+            created_at=result.completed_at,
+        )
+        await self.add_artifact(artifact)
+        await self.append_event(
+            call.run_id,
+            EventType.ARTIFACT_PRODUCED,
+            {
+                "work_unit_id": artifact.work_unit_id,
+                "artifact_id": artifact.artifact_id,
+                "name": artifact.name,
+                "kind": artifact.kind.value,
+            },
+            timestamp=result.completed_at,
+        )
+        await self.add_evidence(evidence)
+        await self.append_event(
+            call.run_id,
+            EventType.EVIDENCE_RECORDED,
+            {
+                "work_unit_id": evidence.work_unit_id,
+                "evidence_id": evidence.evidence_id,
+                "result": evidence.result.value,
+            },
+            timestamp=result.completed_at,
+        )
+        facts = parse_bridge_patch_facts(result.result)
+        if facts is None or result.status is not ToolCallStatus.SUCCEEDED:
+            return
+        patch, files = facts
+        manifest = await self.get_snapshot_manifest(
+            claim.snapshot_id, owner_id=claim.owner_id
+        )
+        validate_patch_facts_against_manifest(manifest, files)
+        applied = apply_patch_facts_to_manifest(manifest, files)
+        previous = await self.get_snapshot_file_contents(
+            claim.snapshot_id, owner_id=claim.owner_id
+        )
+        file_contents = materialize_patched_contents(previous, patch, files)
+        new_snapshot = await self.create_snapshot(
+            Snapshot(
+                snapshot_id=new_snapshot_id(),
+                workspace_id=claim.workspace_id,
+                status=SnapshotStatus.READY,
+                created_at=result.completed_at,
+                completed_at=result.completed_at,
+            ),
+            applied,
+            owner_id=claim.owner_id,
+            file_contents=file_contents,
+        )
+        await self.create_change_set(
+            ChangeSet(
+                change_set_id=new_change_set_id(),
+                run_id=call.run_id,
+                tool_call_id=call.call_id,
+                workspace_id=claim.workspace_id,
+                base_snapshot_id=claim.snapshot_id,
+                new_snapshot_id=new_snapshot.snapshot_id,
+                patch=patch,
+                files=files,
+                created_at=result.completed_at,
+            )
+        )
 
     # --- approvals and leases --------------------------------------------------
 
@@ -3094,16 +3846,16 @@ class SqliteStore:
             completed_at=_require_datetime(row["completed_at"]),
         )
 
-    @staticmethod
-    def _row_to_bridge_claim(row: aiosqlite.Row) -> BridgeClaim:
-        return BridgeClaim(
+    def _row_to_bridge_claim(self, row: aiosqlite.Row) -> BridgeClaim:
+        claim = BridgeClaim(
             claim_id=str(row["claim_id"]),
             call_id=str(row["call_id"]),
             run_id=str(row["run_id"]),
             session_id=str(row["session_id"]),
             workspace_id=str(row["workspace_id"]),
+            snapshot_id=str(row["snapshot_id"]),
             owner_id=str(row["owner_id"]),
-            claimant_id=str(row["claimant_id"]),
+            client_id=str(row["client_id"]),
             idempotency_key=str(row["idempotency_key"]),
             fingerprint=str(row["fingerprint"]),
             status=BridgeClaimStatus(str(row["status"])),
@@ -3111,6 +3863,14 @@ class SqliteStore:
             expires_at=_require_datetime(row["expires_at"]),
             closed_at=_parse_datetime(row["closed_at"]),
         )
+        extended = self._bridge_lease_extensions.get(claim.claim_id)
+        if (
+            extended is not None
+            and claim.status is BridgeClaimStatus.ACTIVE
+            and extended > claim.expires_at
+        ):
+            return claim.model_copy(update={"expires_at": extended})
+        return claim
 
     @staticmethod
     def _row_to_workspace(row: aiosqlite.Row) -> Workspace:
@@ -3129,6 +3889,44 @@ class SqliteStore:
             created_at=_require_datetime(row["created_at"]),
             closed_at=_parse_datetime(row["closed_at"]),
         )
+
+    def _row_to_bridge_client(self, row: aiosqlite.Row) -> RegisteredBridgeClient:
+        tools = strict_json_loads(str(row["tools_json"]))
+        effects = strict_json_loads(str(row["effects_json"]))
+        if not isinstance(tools, list) or not all(isinstance(item, str) for item in tools):
+            raise InternalError("stored Bridge client tools are not a string list")
+        if not isinstance(effects, list) or not all(
+            isinstance(item, str) for item in effects
+        ):
+            raise InternalError("stored Bridge client effects are not a string list")
+        try:
+            capabilities = ClientCapabilityDescriptor(
+                tools=tuple(tools),
+                effects=tuple(ToolEffect(item) for item in effects),
+                max_argument_bytes=int(row["max_argument_bytes"]),
+                max_output_bytes=int(row["max_output_bytes"]),
+                max_runtime_ms=_optional_int(row["max_runtime_ms"]),
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise InternalError("stored Bridge client capabilities are invalid") from error
+        client = RegisteredBridgeClient(
+            client_id=str(row["client_id"]),
+            principal_id=str(row["principal_id"]),
+            workspace_id=str(row["workspace_id"]),
+            capabilities=capabilities,
+            capability_fingerprint=str(row["capability_fingerprint"]),
+            status=BridgeClientStatus(str(row["status"])),
+            created_at=_require_datetime(row["created_at"]),
+            last_seen_at=_parse_datetime(row["last_seen_at"]),
+            disabled_at=_parse_datetime(row["disabled_at"]),
+        )
+        if client.last_seen_at is not None:
+            self._bridge_heartbeats[client.client_id] = {
+                "principal_id": client.principal_id,
+                "fingerprint": client.capability_fingerprint,
+                "last_seen": client.last_seen_at,
+            }
+        return client
 
     @staticmethod
     def _row_to_session(row: aiosqlite.Row) -> Session:
@@ -3192,7 +3990,7 @@ class SqliteStore:
         return await self.list_runs_with_status([RunStatus.PENDING])
 
     async def list_recoverable_runs(self) -> tuple[Run, ...]:
-        """Read pending runs and runs waiting on a durable approval decision."""
+        """Read pending runs and RUNNING runs not blocked on an in-flight tool."""
         rows = await self._fetch_all(
             """
             SELECT r.*
@@ -3200,10 +3998,10 @@ class SqliteStore:
              WHERE r.status = 'PENDING'
                 OR (
                     r.status = 'RUNNING'
-                    AND EXISTS (
+                    AND NOT EXISTS (
                         SELECT 1 FROM tool_calls AS tc
                          WHERE tc.run_id = r.run_id
-                           AND tc.status = 'AWAITING_APPROVAL'
+                           AND tc.status = 'RUNNING'
                     )
                 )
              ORDER BY r.created_at, r.run_id

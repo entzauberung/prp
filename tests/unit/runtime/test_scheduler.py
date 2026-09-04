@@ -11,10 +11,12 @@ from prp_runtime.domain.models import ErrorCategory, ErrorInfo, WorkUnit
 from prp_runtime.domain.values import ResourceClaim
 from prp_runtime.runtime.conflicts import ConflictFacts
 from prp_runtime.runtime.scheduler import (
+    BridgeClientCandidate,
     Scheduler,
     SlotDispatcher,
     WaveOutcome,
     WaveStatus,
+    select_bridge_client,
     select_non_conflicting_batch,
     select_non_conflicting_batch_with_reasons,
 )
@@ -449,3 +451,177 @@ async def test_wave_result_retains_deferred_reasons() -> None:
     )
 
     assert result.deferred_reasons == (("wu_b", "deferred: max concurrency reached"),)
+
+
+def test_select_bridge_client_is_live_scoped_and_capacity_aware() -> None:
+    live = BridgeClientCandidate(
+        client_id="cli_b",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        liveness="LIVE",
+    )
+    other_ws = BridgeClientCandidate(
+        client_id="cli_a",
+        workspace_id="ws_other",
+        tools=("read_file",),
+        liveness="LIVE",
+    )
+    stale = BridgeClientCandidate(
+        client_id="cli_c",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        liveness="STALE",
+    )
+    full = BridgeClientCandidate(
+        client_id="cli_d",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        liveness="LIVE",
+        active_claims=1,
+        max_active_claims=1,
+    )
+    chosen = select_bridge_client(
+        workspace_id="ws_project",
+        tool_name="read_file",
+        candidates=(other_ws, live, stale, full),
+    )
+    assert chosen.selected is live
+    reasons = dict(chosen.skipped)
+    assert reasons["cli_a"] == "workspace scope mismatch"
+    assert reasons["cli_c"] == "client is not live"
+    assert reasons["cli_d"] == "lease capacity exhausted"
+
+
+def test_select_bridge_client_rejects_duplicate_active_claim() -> None:
+    client = BridgeClientCandidate(
+        client_id="cli_a",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        liveness="LIVE",
+    )
+    chosen = select_bridge_client(
+        workspace_id="ws_project",
+        tool_name="read_file",
+        candidates=(client,),
+        claimed_call_ids=("tc_one",),
+        call_id="tc_one",
+    )
+    assert chosen.selected is None
+    assert chosen.skipped == (("cli_a", "duplicate active claim"),)
+
+
+def test_select_bridge_client_falls_back_without_starving_or_duplicating() -> None:
+    first = BridgeClientCandidate(
+        client_id="cli_a",
+        workspace_id="ws_project",
+        tools=("read_file", "apply_patch"),
+        liveness="STALE",
+    )
+    second = BridgeClientCandidate(
+        client_id="cli_b",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        liveness="LIVE",
+    )
+    third = BridgeClientCandidate(
+        client_id="cli_c",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        liveness="LIVE",
+    )
+    chosen = select_bridge_client(
+        workspace_id="ws_project",
+        tool_name="read_file",
+        candidates=(third, first, second),
+    )
+    assert chosen.selected is second
+    replay = select_bridge_client(
+        workspace_id="ws_project",
+        tool_name="read_file",
+        candidates=(second, third),
+        claimed_call_ids=("tc_shared",),
+        call_id="tc_shared",
+    )
+    assert replay.selected is None
+    assert "duplicate active claim" in {reason for _client, reason in replay.skipped}
+
+
+
+
+def test_select_bridge_client_does_not_union_capabilities() -> None:
+    lister = BridgeClientCandidate(
+        client_id="cli_list",
+        workspace_id="ws_project",
+        tools=("list_files",),
+        effects=("READ",),
+        liveness="LIVE",
+        snapshot_id="snap_ready01",
+    )
+    reader = BridgeClientCandidate(
+        client_id="cli_read",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        effects=("READ",),
+        liveness="LIVE",
+        snapshot_id="snap_ready01",
+    )
+    chosen = select_bridge_client(
+        workspace_id="ws_project",
+        tool_name="read_file",
+        effect="READ",
+        snapshot_id="snap_ready01",
+        candidates=(lister, reader),
+        call_id="tc_read01",
+    )
+    assert chosen.selected is reader
+    assert dict(chosen.skipped)["cli_list"] == "tool capability mismatch"
+
+
+def test_select_bridge_client_skips_disabled_offline_and_stale_snapshot() -> None:
+    disabled = BridgeClientCandidate(
+        client_id="cli_disabled",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        effects=("READ",),
+        liveness="LIVE",
+        status="DISABLED",
+        snapshot_id="snap_ready01",
+    )
+    offline = BridgeClientCandidate(
+        client_id="cli_offline",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        effects=("READ",),
+        liveness="OFFLINE",
+        snapshot_id="snap_ready01",
+    )
+    stale = BridgeClientCandidate(
+        client_id="cli_stale",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        effects=("READ",),
+        liveness="LIVE",
+        snapshot_id="snap_old01",
+    )
+    writer = BridgeClientCandidate(
+        client_id="cli_write",
+        workspace_id="ws_project",
+        tools=("read_file",),
+        effects=("WRITE",),
+        liveness="LIVE",
+        snapshot_id="snap_ready01",
+    )
+    chosen = select_bridge_client(
+        workspace_id="ws_project",
+        tool_name="read_file",
+        effect="READ",
+        snapshot_id="snap_ready01",
+        candidates=(disabled, offline, stale, writer),
+        call_id="tc_read02",
+    )
+    assert chosen.selected is None
+    reasons = dict(chosen.skipped)
+    assert reasons["cli_disabled"] == "client is disabled"
+    assert reasons["cli_offline"] == "client is not live"
+    assert reasons["cli_stale"] == "stale snapshot"
+    assert reasons["cli_write"] == "effect capability mismatch"

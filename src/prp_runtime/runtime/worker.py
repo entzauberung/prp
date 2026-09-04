@@ -11,7 +11,8 @@ from enum import StrEnum, unique
 from pydantic import ValidationError, model_validator
 
 from prp_runtime.domain.enums import AttemptStatus, ModelRole, ToolCallStatus
-from prp_runtime.domain.errors import ErrorCode, ProviderError
+from prp_runtime.control.budget import check_role_dispatch
+from prp_runtime.domain.errors import BudgetError, ErrorCode, ProviderError
 from prp_runtime.domain.events import EventType
 from prp_runtime.domain.models import (
     AgentHistoryItem,
@@ -75,6 +76,7 @@ class WorkerResult(DomainModel):
     artifact: Artifact | None = None
     error: ErrorInfo | None = None
     paused: bool = False
+    awaiting_remote_result: bool = False
     pending_call_ids: tuple[str, ...] = ()
 
     @property
@@ -87,6 +89,7 @@ class ResumeAction(StrEnum):
     """The only actions a persisted resume inspection may authorize."""
 
     WAIT = "WAIT"
+    WAIT_REMOTE = "WAIT_REMOTE"
     REJECT = "REJECT"
     EXECUTE = "EXECUTE"
     CONTINUE = "CONTINUE"
@@ -137,6 +140,23 @@ class ResumeState(DomainModel):
                 raise ValueError(
                     "continue resume state must not contain pending approval facts"
                 )
+            return self
+        if self.action is ResumeAction.WAIT_REMOTE:
+            if self.pending_call is None or self.pending_public_call is None:
+                raise ValueError("remote wait resume state requires a pending call")
+            if (
+                self.approval_request is not None
+                or self.approval_decision is not None
+                or self.lease is not None
+            ):
+                raise ValueError("remote wait must not contain approval facts")
+            if self.pending_call.status is not ToolCallStatus.RUNNING:
+                raise ValueError("remote wait requires a running tool call")
+            if (
+                self.pending_public_call.tool_name != self.pending_call.tool_name
+                or self.pending_public_call.arguments != self.pending_call.arguments
+            ):
+                raise ValueError("resume public call does not match the pending call")
             return self
         if (
             self.pending_call is None
@@ -337,7 +357,17 @@ class Worker:
                 replay_results=tuple(replay_results),
             )
 
-        _, pending_call = pending[0]
+        public_call, pending_call = pending[0]
+        if pending_call.status is ToolCallStatus.RUNNING:
+            return ResumeState(
+                action=ResumeAction.WAIT_REMOTE,
+                attempt=attempt,
+                history=history,
+                pending_call=pending_call,
+                pending_public_call=public_call,
+                replay_results=tuple(replay_results),
+                reason="remote_assignment_pending",
+            )
         if pending_call.status is not ToolCallStatus.AWAITING_APPROVAL:
             return ResumeState.blocked(
                 attempt, history, "pending_tool_call_not_awaiting_approval"
@@ -451,8 +481,38 @@ class Worker:
                 else (state.pending_public_call.call_id,)
             )
             return WorkerResult(attempt=state.attempt, paused=True, pending_call_ids=pending)
+        if state.action is ResumeAction.WAIT_REMOTE:
+            pending = (
+                ()
+                if state.pending_public_call is None
+                else (state.pending_public_call.call_id,)
+            )
+            return WorkerResult(
+                attempt=state.attempt,
+                paused=True,
+                awaiting_remote_result=True,
+                pending_call_ids=pending,
+            )
         if state.action is ResumeAction.BLOCK:
             raise ValueError(f"resume state is blocked: {state.reason or 'unknown'}")
+        if state.action is ResumeAction.CONTINUE:
+            if state.attempt.status is AttemptStatus.SUCCEEDED:
+                artifacts = await self._store.list_artifacts(work_unit.work_unit_id)
+                matching = tuple(
+                    artifact
+                    for artifact in artifacts
+                    if artifact.attempt_id == state.attempt.attempt_id
+                )
+                if matching:
+                    return WorkerResult(attempt=state.attempt, artifact=matching[-1])
+            if state.attempt.status is AttemptStatus.RUNNING:
+                return await self._continue_running_attempt(
+                    run=run,
+                    work_unit=work_unit,
+                    context=context,
+                    state=state,
+                    role=role,
+                )
 
         from prp_runtime.control.reservations import ReservationRequest
 
@@ -481,6 +541,12 @@ class Worker:
                         item=item,
                     )
                 )
+
+        blocked = await self._stop_if_role_budget_exceeded(
+            run, attempt, reservation.reservation_id
+        )
+        if blocked is not None:
+            return blocked
 
         async def write_history(sequence: int, item: AgentHistoryItem) -> None:
             await self._store.append_agent_history(
@@ -522,13 +588,128 @@ class Worker:
             await self._record_unconfirmed(attempt, reservation.reservation_id)
             raise
 
-        if loop_result.status is AgentLoopStatus.PAUSED:
+        if loop_result.status in (
+            AgentLoopStatus.PAUSED,
+            AgentLoopStatus.WAITING_REMOTE,
+        ):
             return await self._record_paused(
                 attempt,
                 reservation.reservation_id,
                 loop_result.usage,
                 loop_result.provider_request_id,
                 loop_result.pending_call_ids,
+                awaiting_remote_result=loop_result.status is AgentLoopStatus.WAITING_REMOTE,
+            )
+        if loop_result.error is not None:
+            return await self._record_failure(
+                attempt,
+                reservation.reservation_id,
+                loop_result.error,
+            )
+        try:
+            artifact = Artifact(
+                artifact_id=new_artifact_id(),
+                run_id=run.run_id,
+                work_unit_id=work_unit.work_unit_id,
+                attempt_id=attempt.attempt_id,
+                name=ANSWER_ARTIFACT_NAME,
+                kind=context.output.kind,
+                content=loop_result.text or "",
+            )
+        except ValidationError:
+            return await self._record_failure(
+                attempt,
+                reservation.reservation_id,
+                ErrorInfo(
+                    category=ErrorCategory.PROVIDER_ERROR,
+                    message=(
+                        f"upstream {self._profile.alias} returned no usable "
+                        f"{context.output.kind.value} result"
+                    ),
+                ),
+            )
+        return await self._record_success(
+            attempt,
+            reservation.reservation_id,
+            artifact,
+            loop_result.usage,
+            loop_result.provider_request_id,
+        )
+
+    async def _continue_running_attempt(
+        self,
+        *,
+        run: Run,
+        work_unit: WorkUnit,
+        context: WorkerContext,
+        state: ResumeState,
+        role: ModelRole,
+    ) -> WorkerResult:
+        """Continue one still-open attempt after an accepted remote result."""
+        from prp_runtime.control.reservations import ReservationRequest
+
+        attempt = state.attempt
+        dispatch_key = f"{work_unit.work_unit_id}:{attempt.attempt_index}:{role.value}:resume"
+        async with self._store.transaction():
+            reservation = await self._store.reserve_reservation(
+                ReservationRequest(
+                    run_id=run.run_id,
+                    work_unit_id=work_unit.work_unit_id,
+                    dispatch_key=dispatch_key,
+                    capacity_key=self._profile.alias,
+                )
+            )
+
+        async def write_history(sequence: int, item: AgentHistoryItem) -> None:
+            await self._store.append_agent_history(
+                AgentHistoryRecord(
+                    run_id=attempt.run_id,
+                    work_unit_id=attempt.work_unit_id,
+                    attempt_id=attempt.attempt_id,
+                    sequence=sequence,
+                    idempotency_key=f"{attempt.attempt_id}:{sequence}",
+                    item=item,
+                )
+            )
+
+        try:
+            loop_result = await self._agent_loop.execute(
+                input=context.render_input(),
+                instructions=context.render_instructions(),
+                json_schema=context.output.json_schema,
+                history=state.history,
+                attempt_id=attempt.attempt_id,
+                run_id=run.run_id,
+                work_unit_id=work_unit.work_unit_id,
+                mode=run.request.agent_options.agent_mode,
+                deadline=run.request.budget.deadline,
+                max_attempts=run.request.budget.max_attempts,
+                history_writer=write_history,
+                replay_results={
+                    result.call_id: result for result in state.replay_results
+                },
+            )
+        except ProviderError as error:
+            return await self._record_failure(
+                attempt,
+                reservation.reservation_id,
+                ErrorInfo(category=_category_for(error.code), message=str(error)),
+            )
+        except BaseException:
+            await self._record_unconfirmed(attempt, reservation.reservation_id)
+            raise
+
+        if loop_result.status in (
+            AgentLoopStatus.PAUSED,
+            AgentLoopStatus.WAITING_REMOTE,
+        ):
+            return await self._record_paused(
+                attempt,
+                reservation.reservation_id,
+                loop_result.usage,
+                loop_result.provider_request_id,
+                loop_result.pending_call_ids,
+                awaiting_remote_result=loop_result.status is AgentLoopStatus.WAITING_REMOTE,
             )
         if loop_result.error is not None:
             return await self._record_failure(
@@ -597,6 +778,12 @@ class Worker:
                 run, work_unit, attempt_index, role
             )
 
+        blocked = await self._stop_if_role_budget_exceeded(
+            run, attempt, reservation.reservation_id
+        )
+        if blocked is not None:
+            return blocked
+
         persisted_history = await self._store.list_agent_history(attempt.attempt_id)
 
         async def write_history(sequence: int, item: AgentHistoryItem) -> None:
@@ -638,13 +825,17 @@ class Worker:
             await self._record_unconfirmed(attempt, reservation.reservation_id)
             raise
 
-        if loop_result.status is AgentLoopStatus.PAUSED:
+        if loop_result.status in (
+            AgentLoopStatus.PAUSED,
+            AgentLoopStatus.WAITING_REMOTE,
+        ):
             return await self._record_paused(
                 attempt,
                 reservation.reservation_id,
                 loop_result.usage,
                 loop_result.provider_request_id,
                 loop_result.pending_call_ids,
+                awaiting_remote_result=loop_result.status is AgentLoopStatus.WAITING_REMOTE,
             )
         if loop_result.error is not None:
             return await self._record_failure(
@@ -690,8 +881,39 @@ class Worker:
         usage: Usage | None,
         provider_request_id: str | None,
         pending_call_ids: tuple[str, ...],
+        *,
+        awaiting_remote_result: bool = False,
     ) -> WorkerResult:
-        """Settle the provider turn while leaving approval to the Controller."""
+        """Settle the provider turn while leaving approval or remote wait pending."""
+        if awaiting_remote_result:
+            updated = attempt
+            changes: dict[str, object] = {}
+            if usage is not None:
+                changes["usage"] = usage
+            if provider_request_id is not None:
+                changes["provider_request_id"] = provider_request_id
+            if changes:
+                updated = attempt.model_copy(update=changes)
+            async with self._store.transaction():
+                if changes:
+                    await self._store.update_attempt(updated)
+                if usage is not None:
+                    total = await self._store.add_run_usage(attempt.run_id, usage)
+                    await self._store.append_event(
+                        attempt.run_id,
+                        EventType.USAGE_UPDATED,
+                        {"usage": total.model_dump(mode="json")},
+                    )
+                await self._store.settle_reservation(
+                    reservation_id,
+                    measured_usage=usage,
+                )
+            return WorkerResult(
+                attempt=updated,
+                paused=True,
+                awaiting_remote_result=True,
+                pending_call_ids=pending_call_ids,
+            )
         completed = self._close_attempt(
             attempt,
             AttemptStatus.SUCCEEDED,
@@ -719,6 +941,7 @@ class Worker:
         return WorkerResult(
             attempt=completed,
             paused=True,
+            awaiting_remote_result=awaiting_remote_result,
             pending_call_ids=pending_call_ids,
         )
 
@@ -796,6 +1019,34 @@ class Worker:
                 measured_usage=usage,
             )
         return WorkerResult(attempt=completed, artifact=artifact)
+
+    async def _stop_if_role_budget_exceeded(
+        self,
+        run: Run,
+        attempt: Attempt,
+        reservation_id: str,
+    ) -> WorkerResult | None:
+        """Refuse provider dispatch when a measured role ceiling is already reached."""
+        decision = check_role_dispatch(
+            run.request.budget,
+            await self._store.get_run_usage(run.run_id),
+            attempt_count=max(0, attempt.attempt_index - 1),
+            now=utc_now(),
+            context_window_tokens=self._profile.context_window_tokens,
+            max_output_tokens=self._profile.max_output_tokens,
+            timeout_seconds=self._profile.timeout_seconds,
+        )
+        if decision.allowed:
+            return None
+        assert isinstance(decision.error, BudgetError)
+        return await self._record_failure(
+            attempt,
+            reservation_id,
+            ErrorInfo(
+                category=ErrorCategory.BUDGET_EXCEEDED,
+                message=decision.error.detail.message,
+            ),
+        )
 
     async def _record_failure(
         self, attempt: Attempt, reservation_id: str, error: ErrorInfo

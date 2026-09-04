@@ -2,7 +2,28 @@
 
 本文件记录 PRP Runtime 的显著变更。
 
-`0.0.3` 是当前包身份。数据库 schema 直接替换，pre-0.1 数据不提供向后兼容或迁移。
+`0.0.4` 是当前包身份。数据库 schema 直接替换，pre-0.1 数据不提供向后兼容或迁移。
+
+## [0.0.4] - 2026-09-04
+
+### Delivered
+
+- 包身份改为 `0.0.4`。BRIDGE 协议版本与包身份对齐。
+- 服务器脑 + 本机手：BRIDGE 不再走服务器工具 handler，也不解析客户端根目录。
+- 持久化 Bridge 客户端身份、能力、心跳和 snapshot；claim 绑定 `client_id`，跨客户端领取被拒绝。
+- Progressive 将具体 ToolCall 派发给服务器选定的 Bridge 客户端，远程等待与审批暂停分离，同一 Run 可恢复。
+- Bridge 结果成为 Artifact/Evidence/ChangeSet；AST/静态事实在服务器侧对有界返回源运行。
+- CLOUD bundle 绑定被请求 Run 的已验证 snapshot，并从 `snapshot_files.content` 读取，不读 live workspace 根。Git merge、fact merge、local snapshot 和 Bridge patch 在创建时写入这份内容。
+- Analyzer/Verifier 角色不再映射到 Worker profile。
+
+### Limits
+
+- Bridge manifest 默认不保存客户端文件字节。CLOUD 导出只使用创建 snapshot 时捕获的内容。
+- 仍是单实例 SQLite 参考实现，无 Docker、分布式队列或生产 SLA。
+
+### Not included
+
+- 完整第三方协议实现、迁移框架、计费、SSO 或 Kubernetes。
 
 ## [0.0.3] - 2026-08-30
 

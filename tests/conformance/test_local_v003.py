@@ -1,4 +1,4 @@
-"""Focused local v0.0.3 conformance: in-process DIRECT, no HTTP, no Docker."""
+"""Focused local DIRECT conformance: in-process run, no HTTP, no Docker."""
 
 from __future__ import annotations
 
@@ -146,9 +146,9 @@ def _settings(tmp_path: Path, name: str) -> Settings:
     return Settings(database_path=tmp_path / name, worker_profile=WORKER_PROFILE)
 
 
-def test_package_identity_is_003() -> None:
-    assert prp_runtime.__version__ == "0.0.3"
-    assert prp_runtime.package_info()["version"] == "0.0.3"
+def test_package_identity_is_current() -> None:
+    assert prp_runtime.__version__ == "0.0.4"
+    assert prp_runtime.package_info()["version"] == "0.0.4"
 
 
 @pytest.mark.asyncio
@@ -265,7 +265,7 @@ def test_local_ready_uses_in_process_client_without_bwrap(tmp_path: Path) -> Non
     assert payload["sandbox_ready"] is False
     assert payload["path_boundary_ready"] is True
     assert health.status_code == 200
-    assert health.json()["version"] == "0.0.3"
+    assert health.json()["version"] == "0.0.4"
     assert "secret" not in response.text
     assert str(tmp_path) not in response.text
     assert str(tmp_path) not in health.text

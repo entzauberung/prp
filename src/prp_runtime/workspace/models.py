@@ -9,7 +9,7 @@ from typing import Annotated
 
 from pydantic import AfterValidator, AliasChoices, Field, StringConstraints, model_validator
 
-from prp_runtime.domain.models import DomainModel
+from prp_runtime.domain.models import ClientId, DomainModel
 from prp_runtime.domain.values import SnapshotId, UtcTimestamp, WorkspaceId
 
 __all__ = [
@@ -25,6 +25,8 @@ __all__ = [
     "WorkspaceSourceType",
     "WorkspaceStatus",
     "canonical_manifest_hash",
+    "BridgeManifestAcceptance",
+    "BridgeManifestPublication",
 ]
 
 MAX_MANIFEST_ENTRIES = 100_000
@@ -225,6 +227,39 @@ class SnapshotManifest(DomainModel):
     @property
     def manifest_hash(self) -> str:
         return canonical_manifest_hash(self.entries)
+
+
+class BridgeManifestPublication(DomainModel):
+    """Client-owned bounded inventory. No root, secret or file content."""
+
+    snapshot_id: SnapshotId
+    client_id: ClientId
+    workspace_id: WorkspaceId
+    entries: tuple[SnapshotEntry, ...] = ()
+    manifest_hash: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")] | None = None
+
+    @model_validator(mode="after")
+    def _identity_is_content_free_and_canonical(self) -> "BridgeManifestPublication":
+        manifest = SnapshotManifest(entries=self.entries)
+        if self.manifest_hash is not None and self.manifest_hash != manifest.manifest_hash:
+            raise ValueError("manifest hash does not match published entries")
+        return self
+
+    @property
+    def manifest(self) -> SnapshotManifest:
+        return SnapshotManifest(entries=self.entries)
+
+
+class BridgeManifestAcceptance(DomainModel):
+    """Server-authorized snapshot identity for one registered client workspace."""
+
+    snapshot_id: SnapshotId
+    client_id: ClientId
+    workspace_id: WorkspaceId
+    manifest_hash: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    file_count: int = Field(ge=0)
+    total_size: int = Field(ge=0)
+    status: SnapshotStatus = SnapshotStatus.READY
 
 
 class WorkspaceSource(DomainModel):

@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum, unique
 
-from prp_runtime.analysis.syntax import SyntaxReport
+from prp_runtime.analysis.syntax import BoundSyntaxReport, SyntaxReport
 from prp_runtime.domain.errors import DomainValidationError, ErrorCode
 from prp_runtime.domain.models import (
     Artifact,
@@ -45,9 +45,17 @@ __all__ = [
     "RuleVerifier",
     "VerificationReport",
     "aggregate",
+    "select_syntax_reports",
     "verify_global",
     "verify_global_round",
 ]
+
+_NON_SOURCE_SYNTAX_ERRORS = frozenset(
+    {
+        "source is absent",
+        "unsupported language is unknown",
+    }
+)
 
 
 def aggregate(results: tuple[VerificationResult, ...]) -> VerificationResult:
@@ -189,6 +197,13 @@ def _global_artifact_check(
     return VerificationResult.PASS, "all final artifacts are persisted and non-empty"
 
 
+def _verdict_from_evidence(row: Evidence) -> VerificationResult:
+    """Model/client observation is never proof of Progressive promotion."""
+    if row.kind is EvidenceKind.MODEL_REVIEW:
+        return VerificationResult.INCONCLUSIVE
+    return row.result
+
+
 def _global_evidence_check(
     artifacts: Sequence[Artifact], evidence: Sequence[Evidence]
 ) -> tuple[VerificationResult, str]:
@@ -219,7 +234,7 @@ def _global_evidence_check(
             VerificationResult.INCONCLUSIVE,
             "final artifacts are missing Evidence: " + ", ".join(missing[:5]),
         )
-    result = aggregate(tuple(row.result for row in evidence))
+    result = aggregate(tuple(_verdict_from_evidence(row) for row in evidence))
     if result is VerificationResult.FAIL:
         return VerificationResult.FAIL, "at least one persisted Evidence check failed"
     if result is VerificationResult.INCONCLUSIVE:
@@ -283,6 +298,47 @@ def _global_change_set_check(
             if conflict.conflict:
                 return VerificationResult.FAIL, conflict.reason
     return VerificationResult.PASS, "ChangeSets share the declared base and have no conflict"
+
+
+def _syntax_report_is_actionable(report: SyntaxReport) -> bool:
+    if report.symbols or report.changes:
+        return True
+    if not report.unknown:
+        return False
+    return (report.parse_error or "") not in _NON_SOURCE_SYNTAX_ERRORS
+
+
+def select_syntax_reports(
+    reports: Sequence[SyntaxReport | BoundSyntaxReport],
+    *,
+    work_unit_ids: Sequence[str] | None = None,
+) -> tuple[SyntaxReport, ...]:
+    """Keep returned source facts; drop absent, non-Python, or unrelated units."""
+    allowed = set(work_unit_ids) if work_unit_ids is not None else None
+    selected: list[SyntaxReport] = []
+    seen: set[tuple[object, ...]] = set()
+    for item in reports:
+        if isinstance(item, BoundSyntaxReport):
+            if allowed is not None and item.work_unit_id not in allowed:
+                continue
+            report = item.report
+        else:
+            report = item
+        if not _syntax_report_is_actionable(report):
+            continue
+        key = (
+            report.parse_ok,
+            report.unknown,
+            report.before_parse_error,
+            report.after_parse_error,
+            tuple(symbol.key for symbol in report.symbols),
+            tuple((change.key, change.action.value) for change in report.changes),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(report)
+    return tuple(selected)
 
 
 def _global_ast_check(
@@ -382,7 +438,7 @@ def verify_global_round(
     final_artifacts: Sequence[Artifact] = (),
     evidence: Sequence[Evidence] = (),
     change_sets: Sequence[ChangeSet] = (),
-    syntax_reports: Sequence[SyntaxReport] = (),
+    syntax_reports: Sequence[SyntaxReport | BoundSyntaxReport] = (),
     command_results: Sequence[CommandResult] = (),
     budget: Budget | None = None,
     usage: Usage | None = None,
@@ -465,6 +521,7 @@ def verify_global_round(
                 fact_ids=change_set_ids,
             )
         )
+    syntax_reports = select_syntax_reports(syntax_reports)
     if syntax_reports or GlobalCheckKind.AST in required:
         result, detail = _global_ast_check(syntax_reports)
         checks.append(

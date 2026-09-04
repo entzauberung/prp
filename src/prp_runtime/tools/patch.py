@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncIterator, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -42,6 +43,8 @@ __all__ = [
     "PatchStaleError",
     "PatchValidationError",
     "build_patch_definition",
+    "LocalPatchStore",
+    "materialize_patched_contents",
 ]
 
 _HUNK_HEADER_RE = re.compile(
@@ -76,6 +79,58 @@ class PatchApplyResult(DomainModel):
     changed_paths: tuple[str, ...]
     manifest_hash: str
     completed_at: UtcTimestamp
+    patch: Patch
+    files: tuple[FileChange, ...]
+
+
+class LocalPatchStore:
+    """Process-local snapshot/ChangeSet memory. No server database."""
+
+    def __init__(self) -> None:
+        self._snapshots: dict[str, Snapshot] = {}
+        self._manifests: dict[str, SnapshotManifest] = {}
+        self._change_sets: list[ChangeSet] = []
+
+    def transaction(self) -> AbstractAsyncContextManager[object]:
+        @asynccontextmanager
+        async def _transaction() -> AsyncIterator[object]:
+            yield self
+
+        return _transaction()
+
+    async def create_snapshot(
+        self,
+        snapshot: Snapshot,
+        manifest: SnapshotManifest,
+        *,
+        owner_id: str,
+        file_contents: Mapping[str, str] | None = None,
+    ) -> Snapshot:
+        del owner_id, file_contents
+        for existing_id, existing_manifest in self._manifests.items():
+            if existing_manifest.manifest_hash == manifest.manifest_hash:
+                return self._snapshots[existing_id]
+        self._snapshots[snapshot.snapshot_id] = snapshot
+        self._manifests[snapshot.snapshot_id] = manifest
+        return snapshot
+
+    async def create_change_set(self, change_set: ChangeSet) -> ChangeSet:
+        existing = [
+            item for item in self._change_sets if item.tool_call_id == change_set.tool_call_id
+        ]
+        if existing:
+            return existing[0]
+        self._change_sets.append(change_set)
+        return change_set
+
+    async def list_change_sets(self, *, tool_call_id: str) -> tuple[ChangeSet, ...]:
+        return tuple(item for item in self._change_sets if item.tool_call_id == tool_call_id)
+
+    async def get_change_set(self, change_set_id: str) -> ChangeSet:
+        for item in self._change_sets:
+            if item.change_set_id == change_set_id:
+                return item
+        raise KeyError(change_set_id)
 
 
 class PatchStore(Protocol):
@@ -85,7 +140,12 @@ class PatchStore(Protocol):
         """Open one transaction that nests Store operations."""
 
     async def create_snapshot(
-        self, snapshot: Snapshot, manifest: SnapshotManifest, *, owner_id: str
+        self,
+        snapshot: Snapshot,
+        manifest: SnapshotManifest,
+        *,
+        owner_id: str,
+        file_contents: Mapping[str, str] | None = None,
     ) -> Snapshot:
         """Create or replay an immutable snapshot."""
 
@@ -167,9 +227,13 @@ class PatchRunner:
                 file_count=len(manifest.entries),
                 total_size=manifest.total_size,
             )
+            _, file_contents = self._backend.capture_snapshot()
             async with self._store.transaction():
                 persisted_snapshot = await self._store.create_snapshot(
-                    requested_snapshot, manifest, owner_id=self._owner_id
+                    requested_snapshot,
+                    manifest,
+                    owner_id=self._owner_id,
+                    file_contents=file_contents,
                 )
                 change_set = ChangeSet(
                     change_set_id=new_change_set_id(),
@@ -195,6 +259,8 @@ class PatchRunner:
             changed_paths=tuple(change.path for change in file_changes),
             manifest_hash=manifest.manifest_hash,
             completed_at=completed_at,
+            patch=persisted_change_set.patch,
+            files=persisted_change_set.files,
         )
 
     async def _existing_change_set(
@@ -228,6 +294,8 @@ class PatchRunner:
             changed_paths=tuple(change.path for change in change_set.files),
             manifest_hash=actual_manifest.manifest_hash,
             completed_at=change_set.created_at,
+            patch=change_set.patch,
+            files=change_set.files,
         )
 
     def _prepare_changes(
@@ -297,6 +365,32 @@ class PatchRunner:
             tuple(file_changes),
             SnapshotManifest(entries=tuple(entries.values())),
         )
+
+
+def materialize_patched_contents(
+    previous: Mapping[str, str],
+    patch: Patch,
+    files: tuple[FileChange, ...],
+) -> dict[str, str]:
+    """Apply one unified diff to stored snapshot bytes without a live root."""
+    parsed = _parse_unified_diff(patch.unified_diff)
+    by_path = {item.path: item for item in parsed}
+    contents = dict(previous)
+    for change in files:
+        if change.action is FileChangeAction.DELETE:
+            contents.pop(change.path, None)
+            continue
+        file_patch = by_path.get(change.path)
+        if file_patch is None:
+            continue
+        source = "" if change.action is FileChangeAction.ADD else previous.get(change.path)
+        if source is None:
+            continue
+        try:
+            contents[change.path] = _apply_hunks(source, file_patch)
+        except (PatchValidationError, PatchStaleError):
+            contents.pop(change.path, None)
+    return contents
 
 
 def build_patch_definition(runner: PatchRunner) -> ToolDefinition:

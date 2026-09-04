@@ -1,4 +1,8 @@
-"""Closed provider-protocol to adapter construction registry."""
+"""Closed provider-protocol to adapter construction registry.
+
+Adapters are selected by protocol, not by role. Analyzer and Verifier profiles
+never silently construct a Worker adapter.
+"""
 
 from __future__ import annotations
 

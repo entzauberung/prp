@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,15 +17,23 @@ from typing import Annotated, BinaryIO, Protocol, Self
 from pydantic import ConfigDict, Field, StringConstraints
 
 from prp_runtime.domain.models import DomainModel
-from prp_runtime.workspace.models import SnapshotEntry, SnapshotEntryType, SnapshotManifest
+from prp_runtime.workspace.models import (
+    MAX_ENTRY_SIZE_BYTES,
+    SnapshotEntry,
+    SnapshotEntryType,
+    SnapshotManifest,
+)
 
 __all__ = [
     "DirectoryEntry",
+    "ExportBundleSelection",
+    "ExportFile",
     "FileReadResult",
     "WorkspaceBackend",
     "WorkspaceBackendError",
     "WorkspaceBackendProtocol",
     "WorkspacePatchTransaction",
+    "select_snapshot_export_files",
 ]
 
 RelativeWorkspacePath = Annotated[
@@ -59,6 +68,27 @@ class FileReadResult(DomainModel):
     limit: int = Field(gt=0)
     bytes_read: int = Field(ge=0)
     truncated: bool = False
+
+
+class ExportFile(DomainModel):
+    """One authorized text file selected for a CLOUD export bundle."""
+
+    path: RelativeWorkspacePath
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(ge=0)
+    content: str
+
+
+class ExportBundleSelection(DomainModel):
+    """Bounded export inventory with no host path or secret payload."""
+
+    files: tuple[ExportFile, ...] = ()
+    excluded_paths: tuple[str, ...] = ()
+    total_bytes: int = Field(ge=0)
+
+    @property
+    def file_count(self) -> int:
+        return len(self.files)
 
 
 class WorkspaceBackendProtocol(Protocol):
@@ -417,14 +447,87 @@ class WorkspaceBackend:
             raise WorkspaceBackendError("patched file exceeds the workspace limit")
         return result.content
 
-    def snapshot_manifest(self) -> SnapshotManifest:
-        """Build a deterministic manifest through the root descriptor only."""
+    def collect_export_files(
+        self,
+        *,
+        max_files: int,
+        max_bytes: int,
+        max_nesting: int,
+        deadline_monotonic: float | None = None,
+        snapshot_manifest: SnapshotManifest | None = None,
+    ) -> ExportBundleSelection:
+        """Select bounded, non-secret regular files without mutating the tree.
+
+        When a snapshot manifest is supplied, declared snapshot files must still
+        match the live digest. Mutated or missing snapshot files fail closed;
+        live files absent from the snapshot are excluded.
+        """
+        if max_files <= 0 or max_bytes <= 0 or max_nesting <= 0:
+            raise WorkspaceBackendError("export limits must be positive")
         self._ensure_open()
-        entries: list[SnapshotEntry] = []
+        files: list[ExportFile] = []
+        excluded: list[str] = []
+        totals = [0]
+        allowed = None
+        if snapshot_manifest is not None:
+            allowed = {
+                entry.path: entry.sha256
+                for entry in snapshot_manifest.entries
+                if entry.entry_type is SnapshotEntryType.FILE
+            }
         root_fd = os.dup(self._root_fd)
         try:
-            self._append_manifest_entries(root_fd, "", entries)
-            return SnapshotManifest(entries=tuple(entries))
+            self._collect_export_entries(
+                root_fd,
+                "",
+                0,
+                files,
+                excluded,
+                totals,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                max_nesting=max_nesting,
+                deadline_monotonic=deadline_monotonic,
+                allowed_digests=allowed,
+            )
+            if allowed is not None:
+                exported = {item.path for item in files}
+                required = {
+                    path for path in allowed if not _export_path_is_excluded(path)
+                }
+                if any(path not in exported for path in required):
+                    raise WorkspaceBackendError("stale workspace snapshot")
+            return ExportBundleSelection(
+                files=tuple(files),
+                excluded_paths=tuple(excluded),
+                total_bytes=totals[0],
+            )
+        except WorkspaceBackendError:
+            raise
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise WorkspaceBackendError("workspace export cannot be created") from error
+        finally:
+            os.close(root_fd)
+
+    def require_base_manifest(self, manifest: SnapshotManifest) -> None:
+        """Reject local mutation when the live tree no longer matches the base."""
+        current = self.snapshot_manifest()
+        if current.manifest_hash != manifest.manifest_hash:
+            raise WorkspaceBackendError("stale workspace manifest")
+
+    def snapshot_manifest(self) -> SnapshotManifest:
+        """Build a deterministic manifest through the root descriptor only."""
+        return self.capture_snapshot()[0]
+
+    def capture_snapshot(self) -> tuple[SnapshotManifest, dict[str, str]]:
+        """Capture the manifest plus UTF-8 contents for exportable files."""
+        self._ensure_open()
+        entries: list[SnapshotEntry] = []
+        contents: dict[str, str] = {}
+        root_fd = os.dup(self._root_fd)
+        try:
+            self._append_manifest_entries(root_fd, "", entries, contents)
+            return SnapshotManifest(entries=tuple(entries)), contents
         except WorkspaceBackendError:
             raise
         except (OSError, ValueError) as error:
@@ -443,8 +546,88 @@ class WorkspaceBackend:
             raise WorkspaceBackendError("patch must change at least one file")
         return WorkspacePatchTransaction(self, changes, expected_digests)
 
+    def _collect_export_entries(
+        self,
+        directory_fd: int,
+        prefix: str,
+        depth: int,
+        files: list[ExportFile],
+        excluded: list[str],
+        totals: list[int],
+        *,
+        max_files: int,
+        max_bytes: int,
+        max_nesting: int,
+        deadline_monotonic: float | None,
+        allowed_digests: dict[str, str] | None = None,
+    ) -> None:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise WorkspaceBackendError("export exceeded the time limit")
+        if depth > max_nesting:
+            raise WorkspaceBackendError("export nesting exceeds the workspace limit")
+        scan_fd = os.open(
+            ".",
+            _OPEN_FLAGS | os.O_DIRECTORY | _NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            with os.scandir(scan_fd) as iterator:
+                children = sorted(iterator, key=lambda entry: entry.name)
+            for child in children:
+                path = child.name if not prefix else f"{prefix}/{child.name}"
+                if _export_path_is_excluded(path):
+                    excluded.append(path)
+                    continue
+                child_stat = child.stat(follow_symlinks=False)
+                entry_type = _entry_type(child_stat)
+                if entry_type is SnapshotEntryType.DIRECTORY:
+                    child_fd = os.open(
+                        child.name,
+                        _OPEN_FLAGS | os.O_DIRECTORY | _NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        self._collect_export_entries(
+                            child_fd,
+                            path,
+                            depth + 1,
+                            files,
+                            excluded,
+                            totals,
+                            max_files=max_files,
+                            max_bytes=max_bytes,
+                            max_nesting=max_nesting,
+                            deadline_monotonic=deadline_monotonic,
+                            allowed_digests=allowed_digests,
+                        )
+                    finally:
+                        os.close(child_fd)
+                    continue
+                if allowed_digests is not None and path not in allowed_digests:
+                    excluded.append(path)
+                    continue
+                if len(files) >= max_files:
+                    raise WorkspaceBackendError("export exceeds the file limit")
+                digest, size, content = _read_export_text(
+                    child.name,
+                    directory_fd,
+                    remaining_bytes=max_bytes - totals[0],
+                )
+                if allowed_digests is not None and digest != allowed_digests[path]:
+                    raise WorkspaceBackendError("stale workspace snapshot")
+                files.append(
+                    ExportFile(path=path, sha256=digest, size=size, content=content)
+                )
+                totals[0] += size
+        finally:
+            os.close(scan_fd)
+
     def _append_manifest_entries(
-        self, directory_fd: int, prefix: str, entries: list[SnapshotEntry]
+        self,
+        directory_fd: int,
+        prefix: str,
+        entries: list[SnapshotEntry],
+        contents: dict[str, str],
     ) -> None:
         scan_fd = os.open(
             ".",
@@ -473,11 +656,22 @@ class WorkspaceBackend:
                         dir_fd=directory_fd,
                     )
                     try:
-                        self._append_manifest_entries(child_fd, path, entries)
+                        self._append_manifest_entries(child_fd, path, entries, contents)
                     finally:
                         os.close(child_fd)
                 else:
-                    digest, size = _hash_regular_file(child.name, directory_fd)
+                    content = None
+                    if _export_path_is_excluded(path):
+                        digest, size = _hash_regular_file(child.name, directory_fd)
+                    else:
+                        try:
+                            digest, size, content = _read_export_text(
+                                child.name,
+                                directory_fd,
+                                remaining_bytes=MAX_ENTRY_SIZE_BYTES,
+                            )
+                        except WorkspaceBackendError:
+                            digest, size = _hash_regular_file(child.name, directory_fd)
                     entries.append(
                         SnapshotEntry(
                             path=path,
@@ -486,6 +680,8 @@ class WorkspaceBackend:
                             entry_type=entry_type,
                         )
                     )
+                    if content is not None:
+                        contents[path] = content
         finally:
             os.close(scan_fd)
 
@@ -586,6 +782,108 @@ def _hash_regular_file(name: str, parent_fd: int) -> tuple[str, int]:
             digest.update(chunk)
             size += len(chunk)
         return digest.hexdigest(), size
+    finally:
+        os.close(fd)
+
+
+_EXCLUDED_EXPORT_NAMES = frozenset(
+    {
+        ".git",
+        ".env",
+        "opencode.json",
+        "opencode.jsonc",
+        "auth.json",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    }
+)
+_EXCLUDED_EXPORT_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+
+
+def _export_path_is_excluded(path: str) -> bool:
+    parts = path.split("/")
+    for part in parts:
+        lowered = part.lower()
+        if part in _EXCLUDED_EXPORT_NAMES or lowered in _EXCLUDED_EXPORT_NAMES:
+            return True
+        if part.startswith(".env."):
+            return True
+        if lowered.endswith(_EXCLUDED_EXPORT_SUFFIXES):
+            return True
+    return False
+
+
+def select_snapshot_export_files(
+    manifest: SnapshotManifest,
+    file_contents: Mapping[str, str],
+    *,
+    max_files: int,
+    max_bytes: int,
+    max_nesting: int,
+) -> ExportBundleSelection:
+    """Assemble a CLOUD export from persisted snapshot bytes, never the live tree."""
+    if max_files <= 0 or max_bytes <= 0 or max_nesting <= 0:
+        raise WorkspaceBackendError("export limits must be positive")
+    files: list[ExportFile] = []
+    excluded: list[str] = []
+    total_bytes = 0
+    for entry in sorted(manifest.entries, key=lambda item: item.path):
+        if entry.entry_type is not SnapshotEntryType.FILE:
+            continue
+        if _export_path_is_excluded(entry.path):
+            excluded.append(entry.path)
+            continue
+        if entry.path.count("/") > max_nesting:
+            raise WorkspaceBackendError("export nesting exceeds the workspace limit")
+        content = file_contents.get(entry.path)
+        if content is None:
+            raise WorkspaceBackendError("stale workspace snapshot")
+        payload = content.encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != entry.sha256 or len(payload) != entry.size:
+            raise WorkspaceBackendError("stale workspace snapshot")
+        if len(files) >= max_files:
+            raise WorkspaceBackendError("export exceeds the file limit")
+        if total_bytes + len(payload) > max_bytes:
+            raise WorkspaceBackendError("export exceeds the byte limit")
+        files.append(
+            ExportFile(path=entry.path, sha256=digest, size=len(payload), content=content)
+        )
+        total_bytes += len(payload)
+    return ExportBundleSelection(
+        files=tuple(files),
+        excluded_paths=tuple(excluded),
+        total_bytes=total_bytes,
+    )
+
+
+def _read_export_text(
+    name: str, parent_fd: int, *, remaining_bytes: int
+) -> tuple[str, int, str]:
+    if remaining_bytes <= 0:
+        raise WorkspaceBackendError("export exceeds the byte limit")
+    fd = os.open(name, _OPEN_FLAGS | _NONBLOCK | _NOFOLLOW, dir_fd=parent_fd)
+    try:
+        _require_supported_entry(os.fstat(fd), allow_directory=False)
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(fd, 65_536):
+            size += len(chunk)
+            if size > remaining_bytes:
+                raise WorkspaceBackendError("export exceeds the byte limit")
+            digest.update(chunk)
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        if b"\x00" in payload:
+            raise WorkspaceBackendError("export contains unknown binary content")
+        try:
+            content = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise WorkspaceBackendError("export contains unknown binary content") from error
+        return digest.hexdigest(), size, content
     finally:
         os.close(fd)
 

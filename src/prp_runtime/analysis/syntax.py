@@ -8,11 +8,14 @@ import hashlib
 from enum import StrEnum, unique
 from typing import Self
 
+from collections.abc import Mapping
+
 from pydantic import Field, model_validator
 
 from prp_runtime.domain.models import DomainModel
 
 __all__ = [
+    "BoundSyntaxReport",
     "MAX_SOURCE_BYTES",
     "NodeSpan",
     "SymbolChange",
@@ -21,7 +24,10 @@ __all__ = [
     "SymbolKind",
     "SyntaxAnalyzer",
     "SyntaxReport",
+    "analyze_bounded_observation",
     "analyze_python",
+    "redact_local_paths",
+    "source_pair_from_observation",
 ]
 
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
@@ -387,3 +393,138 @@ class SyntaxAnalyzer:
 
 
 analyze = analyze_python
+
+
+class BoundSyntaxReport(DomainModel):
+    """AST facts linked to one returned artifact and round identities."""
+
+    report: SyntaxReport
+    artifact_id: str = Field(min_length=1, max_length=128)
+    work_unit_id: str = Field(min_length=1, max_length=128)
+    run_id: str = Field(min_length=1, max_length=128)
+    round_id: str | None = None
+    snapshot_id: str | None = None
+
+    @property
+    def unknown(self) -> bool:
+        return (not self.report.parse_ok) or self.report.unknown
+
+
+def redact_local_paths(text: str, *roots: object) -> str:
+    """Remove host roots from bounded public observations."""
+    redacted = text
+    candidates: list[str] = []
+    for root in roots:
+        if root is None:
+            continue
+        value = str(root)
+        if value:
+            candidates.append(value)
+            candidates.append(value.replace("\\", "/"))
+    for value in sorted(set(candidates), key=len, reverse=True):
+        redacted = redacted.replace(value, "")
+    return redacted
+
+
+def source_pair_from_observation(
+    payload: Mapping[str, object] | str | None,
+) -> tuple[str | None, str | None]:
+    """Extract before/after source from a bounded observation. Never reads a root."""
+    if payload is None:
+        return None, None
+    if isinstance(payload, str):
+        return "", payload
+    before = _optional_source(payload.get("before") or payload.get("before_source"))
+    after = _optional_source(
+        payload.get("after")
+        or payload.get("after_source")
+        or payload.get("source")
+        or payload.get("content")
+        or payload.get("output")
+    )
+    if before is None and after is None:
+        nested = payload.get("result")
+        if isinstance(nested, Mapping):
+            before, after = source_pair_from_observation(nested)
+    if before is None and after is None:
+        patch = payload.get("patch")
+        if isinstance(patch, Mapping):
+            diff = patch.get("unified_diff")
+            if isinstance(diff, str) and diff.strip():
+                before, after = _source_pair_from_unified_diff(diff)
+    return before, after
+
+
+def _source_pair_from_unified_diff(diff: str) -> tuple[str | None, str | None]:
+    """Rebuild hunk text from a bounded unified diff. Never reads a workspace."""
+    before_lines: list[str] = []
+    after_lines: list[str] = []
+    in_hunk = False
+    for raw in diff.splitlines(keepends=True):
+        if raw.startswith("@@"):
+            in_hunk = True
+            continue
+        if raw.startswith(("---", "+++", "diff ", "index ")):
+            in_hunk = False
+            continue
+        if not in_hunk:
+            continue
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            before_lines.append(raw[1:])
+        elif raw.startswith("+"):
+            after_lines.append(raw[1:])
+        elif raw.startswith(" "):
+            before_lines.append(raw[1:])
+            after_lines.append(raw[1:])
+        else:
+            in_hunk = False
+    before = "".join(before_lines) if before_lines else None
+    after = "".join(after_lines) if after_lines else None
+    return before, after
+
+
+def _optional_source(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def analyze_bounded_observation(
+    *,
+    artifact_id: str,
+    work_unit_id: str,
+    run_id: str,
+    before_source: str | None = None,
+    after_source: str | None = None,
+    round_id: str | None = None,
+    snapshot_id: str | None = None,
+    language: str = "python",
+) -> BoundSyntaxReport:
+    """Parse returned text only. Missing or non-Python source stays unknown."""
+    if not artifact_id.strip() or not work_unit_id.strip() or not run_id.strip():
+        raise ValueError("AST analysis requires artifact, work unit and run scope")
+    if language != "python":
+        report = SyntaxReport(
+            language=language,
+            parse_ok=False,
+            unknown=True,
+            before_parse_error="unsupported language is unknown",
+        )
+    elif before_source is None and after_source is None:
+        report = SyntaxReport(
+            parse_ok=False,
+            unknown=True,
+            before_parse_error="source is absent",
+        )
+    else:
+        report = analyze_python(before_source or "", after_source or "")
+    return BoundSyntaxReport(
+        report=report,
+        artifact_id=artifact_id,
+        work_unit_id=work_unit_id,
+        run_id=run_id,
+        round_id=round_id,
+        snapshot_id=snapshot_id,
+    )

@@ -1,11 +1,19 @@
 """Contract tests for Python AST symbol facts."""
 
+import pytest
+
 from prp_runtime.analysis.syntax import (
     SymbolChangeAction,
     SymbolKind,
     SyntaxAnalyzer,
+    analyze_bounded_observation,
     analyze_python,
+    redact_local_paths,
+    source_pair_from_observation,
 )
+from prp_runtime.domain.models import Artifact, ArtifactKind, new_artifact_id
+from prp_runtime.domain.values import new_attempt_id, new_run_id, new_work_unit_id
+from prp_runtime.runtime.bridge import syntax_facts_from_bridge_artifact
 from prp_runtime.runtime.conflicts import ConflictKind, classify_syntax_conflict
 from prp_runtime.workspace.changes import FileChange, FileChangeAction, FileContent
 
@@ -185,4 +193,143 @@ def test_global_or_import_change_is_conservative_and_fallback_is_safe() -> None:
             right_report=non_python,
         ).kind
         is ConflictKind.PATH
+    )
+
+
+def test_bounded_observation_requires_artifact_scope_and_links_identities() -> None:
+    with pytest.raises(ValueError, match="artifact"):
+        analyze_bounded_observation(
+            artifact_id=" ",
+            work_unit_id="wu_scope",
+            run_id="run_scope",
+            after_source="x = 1\n",
+        )
+    bound = analyze_bounded_observation(
+        artifact_id="art_scope",
+        work_unit_id="wu_scope",
+        run_id="run_scope",
+        round_id="round_" + "a" * 32,
+        snapshot_id="snap_" + "a" * 32,
+        after_source="def run():\n    return 1\n",
+    )
+    assert bound.report.parse_ok is True
+    assert bound.unknown is False
+    assert bound.artifact_id == "art_scope"
+    assert bound.work_unit_id == "wu_scope"
+    assert bound.run_id == "run_scope"
+    assert bound.round_id.endswith("a" * 32)
+    assert bound.snapshot_id is not None
+    again = analyze_bounded_observation(
+        artifact_id="art_scope",
+        work_unit_id="wu_scope",
+        run_id="run_scope",
+        after_source="def run():\n    return 1\n",
+    )
+    assert again.report.symbols == bound.report.symbols
+
+
+def test_absent_or_dynamic_observation_is_unknown_not_proof() -> None:
+    absent = analyze_bounded_observation(
+        artifact_id="art_missing",
+        work_unit_id="wu_missing",
+        run_id="run_missing",
+    )
+    assert absent.report.parse_ok is False
+    assert absent.unknown is True
+    dynamic = analyze_bounded_observation(
+        artifact_id="art_dyn",
+        work_unit_id="wu_dyn",
+        run_id="run_dyn",
+        after_source="value = eval('1')\n",
+    )
+    assert dynamic.unknown is True
+    unsupported = analyze_bounded_observation(
+        artifact_id="art_js",
+        work_unit_id="wu_js",
+        run_id="run_js",
+        language="javascript",
+        after_source="const x = 1;",
+    )
+    assert unsupported.unknown is True
+
+
+def test_bridge_artifact_adapter_parses_returned_text_without_a_root() -> None:
+    import json
+
+    snapshot_id = "snap_" + "b" * 32
+    artifact = Artifact(
+        artifact_id=new_artifact_id(),
+        run_id=new_run_id(),
+        work_unit_id=new_work_unit_id(),
+        attempt_id=new_attempt_id(),
+        name="bridge-result",
+        kind=ArtifactKind.JSON,
+        content=json.dumps(
+            {
+                "content": "def run():\n    return 1\n",
+                "snapshot_id": snapshot_id,
+            }
+        ),
+    )
+    bound = syntax_facts_from_bridge_artifact(artifact)
+    assert bound.artifact_id == artifact.artifact_id
+    assert bound.work_unit_id == artifact.work_unit_id
+    assert bound.run_id == artifact.run_id
+    assert bound.snapshot_id == snapshot_id
+    assert bound.report.parse_ok is True
+    assert any(symbol.name == "run" for symbol in bound.report.symbols)
+    before, after = source_pair_from_observation({"content": "x = 1\n"})
+    assert before is None
+    assert after == "x = 1\n"
+    patch_before, patch_after = source_pair_from_observation(
+        {
+            "result": {
+                "patch": {
+                    "base_snapshot_id": snapshot_id,
+                    "unified_diff": (
+                        "--- a/app.py\n"
+                        "+++ b/app.py\n"
+                        "@@ -1,2 +1,2 @@\n"
+                        " def answer() -> int:\n"
+                        "-    return 1\n"
+                        "+    return 2\n"
+                    ),
+                }
+            }
+        }
+    )
+    assert patch_before == "def answer() -> int:\n    return 1\n"
+    assert patch_after == "def answer() -> int:\n    return 2\n"
+    patched = syntax_facts_from_bridge_artifact(
+        Artifact(
+            artifact_id=new_artifact_id(),
+            run_id=new_run_id(),
+            work_unit_id=new_work_unit_id(),
+            attempt_id=new_attempt_id(),
+            name="bridge-result",
+            kind=ArtifactKind.JSON,
+            content=json.dumps(
+                {
+                    "result": {
+                        "patch": {
+                            "base_snapshot_id": snapshot_id,
+                            "unified_diff": (
+                                "--- a/app.py\n"
+                                "+++ b/app.py\n"
+                                "@@ -1,2 +1,2 @@\n"
+                                " def answer() -> int:\n"
+                                "-    return 1\n"
+                                "+    return 2\n"
+                            ),
+                        }
+                    },
+                    "snapshot_id": snapshot_id,
+                }
+            ),
+        )
+    )
+    assert patched.report.parse_ok is True
+    assert any(symbol.name == "answer" for symbol in patched.report.symbols)
+    assert "/tmp/project" not in redact_local_paths(
+        "/tmp/project/src/main.py", "/tmp/project"
     )

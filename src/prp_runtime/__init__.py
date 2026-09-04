@@ -1,12 +1,12 @@
 """PRP runtime package root.
 
 This package hosts the reference runtime for the Progressive Reasoning
-Protocol. At this version only package identity is defined.
+Protocol: local-first controller, policy, tools, evidence and recovery.
 """
 
 __all__ = ["__version__", "PACKAGE_NAME", "LICENSE_EXPRESSION", "package_info"]
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 PACKAGE_NAME = "prp-runtime"
 

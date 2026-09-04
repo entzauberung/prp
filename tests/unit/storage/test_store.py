@@ -1,6 +1,7 @@
 """Targeted tests for the SQLite operation set."""
 
 import asyncio
+import hashlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ from prp_runtime.domain.models import (
     ArtifactKind,
     Attempt,
     Budget,
+    ClientCapabilityDescriptor,
     ErrorCategory,
     ErrorInfo,
     Evidence,
@@ -42,13 +44,16 @@ from prp_runtime.domain.models import (
     ExecutionScope,
     NativeRunRequest,
     OutputRequirement,
+    RegisteredBridgeClient,
     Run,
     Session,
     SessionStatus,
     Usage,
     VerificationResult,
     WorkUnit,
+    fingerprint_client_capabilities,
     new_artifact_id,
+    new_client_id,
     new_evidence_id,
 )
 from prp_runtime.domain.values import (
@@ -89,6 +94,7 @@ from prp_runtime.workspace.changes import (
     Patch,
 )
 from prp_runtime.workspace.models import (
+    BridgeManifestPublication,
     Snapshot,
     SnapshotEntry,
     SnapshotEntryType,
@@ -639,6 +645,50 @@ async def test_snapshot_manifest_round_trips_sorted_and_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_snapshot_file_contents_round_trip_and_reject_digest_mismatch(
+    store: SqliteStore,
+) -> None:
+    workspace = make_workspace()
+    await store.create_workspace(workspace)
+    payload = "frozen\n"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    manifest = SnapshotManifest(
+        entries=(
+            SnapshotEntry(
+                path="kept.txt",
+                sha256=digest,
+                size=len(payload.encode("utf-8")),
+                entry_type=SnapshotEntryType.FILE,
+            ),
+        )
+    )
+    snapshot = make_snapshot(workspace.workspace_id)
+    persisted = await store.create_snapshot(
+        snapshot, manifest, owner_id="owner-1", file_contents={"kept.txt": payload}
+    )
+    contents = await store.get_snapshot_file_contents(
+        persisted.snapshot_id, owner_id="owner-1"
+    )
+    assert contents == {"kept.txt": payload}
+    with pytest.raises(StateError, match="does not match"):
+        await store.create_snapshot(
+            make_snapshot(workspace.workspace_id),
+            SnapshotManifest(
+                entries=(
+                    SnapshotEntry(
+                        path="other.txt",
+                        sha256="c" * 64,
+                        size=1,
+                        entry_type=SnapshotEntryType.FILE,
+                    ),
+                )
+            ),
+            owner_id="owner-1",
+            file_contents={"other.txt": "x"},
+        )
+
+
+@pytest.mark.asyncio
 async def test_snapshot_owner_scope_and_manifest_conflicts_are_rejected(
     store: SqliteStore,
 ) -> None:
@@ -664,6 +714,49 @@ async def test_snapshot_owner_scope_and_manifest_conflicts_are_rejected(
             make_manifest(suffix="-other"),
             owner_id="owner-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_bridge_manifest_publication_is_client_scoped_and_rejects_stale(
+    store: SqliteStore,
+) -> None:
+    workspace = make_workspace(owner_id="prn_bridge")
+    await store.create_workspace(workspace)
+    session = make_session(workspace)
+    await store.create_session(session)
+    client = await register_scoped_client(store, session)
+    manifest = make_manifest(suffix="-published")
+    publication = BridgeManifestPublication(
+        snapshot_id=new_snapshot_id(),
+        client_id=client.client_id,
+        workspace_id=workspace.workspace_id,
+        entries=manifest.entries,
+        manifest_hash=manifest.manifest_hash,
+    )
+    accepted = await store.publish_bridge_manifest(
+        publication, principal_id="prn_bridge", published_at=T0
+    )
+    assert accepted.client_id == client.client_id
+    assert accepted.workspace_id == workspace.workspace_id
+    assert accepted.manifest_hash == manifest.manifest_hash
+    assert accepted.snapshot_id == publication.snapshot_id
+    replay = await store.publish_bridge_manifest(
+        publication, principal_id="prn_bridge", published_at=T0
+    )
+    assert replay.snapshot_id == accepted.snapshot_id
+    stale = BridgeManifestPublication(
+        snapshot_id=publication.snapshot_id,
+        client_id=client.client_id,
+        workspace_id=workspace.workspace_id,
+        entries=make_manifest(suffix="-stale").entries,
+    )
+    with pytest.raises(StateError, match="stale"):
+        await store.publish_bridge_manifest(stale, principal_id="prn_bridge")
+    other = make_workspace(owner_id="prn_bridge", alias="other")
+    await store.create_workspace(other)
+    crossed = publication.model_copy(update={"workspace_id": other.workspace_id, "snapshot_id": new_snapshot_id()})
+    with pytest.raises(StateError, match="workspace"):
+        await store.publish_bridge_manifest(crossed, principal_id="prn_bridge")
 
 
 @pytest.mark.asyncio
@@ -757,7 +850,12 @@ async def test_tool_call_lifecycle_round_trips_and_appends_auditable_events(
     assert snapshot.snapshot_id == call.snapshot_id
 
 
-async def seed_bridge_tool_call(store: SqliteStore) -> tuple[Run, Session, ToolCall]:
+async def seed_bridge_tool_call(
+    store: SqliteStore,
+    *,
+    tool_name: str = "read_file",
+    effect: ToolEffect = ToolEffect.READ,
+) -> tuple[Run, Session, ToolCall]:
     workspace = make_workspace(owner_id="prn_bridge")
     await store.create_workspace(workspace)
     session = make_session(
@@ -783,11 +881,19 @@ async def seed_bridge_tool_call(store: SqliteStore) -> tuple[Run, Session, ToolC
         call_id=new_tool_call_id(),
         run_id=run.run_id,
         work_unit_id=unit.work_unit_id,
-        tool_name="read_file",
-        effect=ToolEffect.READ,
+        tool_name=tool_name,
+        effect=effect,
         arguments={"path": "src/main.py"},
         snapshot_id=scoped_snapshot.snapshot_id,
         requested_at=T0,
+    )
+    await store.create_attempt(
+        make_attempt(
+            run.run_id,
+            unit.work_unit_id,
+            status=AttemptStatus.RUNNING,
+            started_at=T0,
+        )
     )
     await store.create_tool_call(
         scoped_call,
@@ -798,17 +904,40 @@ async def seed_bridge_tool_call(store: SqliteStore) -> tuple[Run, Session, ToolC
     return run, session, scoped_call
 
 
+async def register_scoped_client(
+    store: SqliteStore,
+    session: Session,
+    *,
+    tools: tuple[str, ...] = ("read_file",),
+    effects: tuple[ToolEffect, ...] = (ToolEffect.READ,),
+) -> RegisteredBridgeClient:
+    capabilities = ClientCapabilityDescriptor(tools=tuple(sorted(tools)), effects=effects)
+    client = RegisteredBridgeClient(
+        client_id=new_client_id(),
+        principal_id=session.principal_id,
+        workspace_id=session.workspace_id,
+        capabilities=capabilities,
+        capability_fingerprint=fingerprint_client_capabilities(capabilities),
+        created_at=T0,
+    )
+    return await store.register_bridge_client(client)
+
+
 @pytest.mark.asyncio
 async def test_bridge_claim_is_owner_scoped_idempotent_and_single_active(
     store: SqliteStore,
 ) -> None:
     run, session, call = await seed_bridge_tool_call(store)
+    client_a = await register_scoped_client(store, session)
+    client_b = await register_scoped_client(
+        store, session, tools=("apply_patch",), effects=(ToolEffect.WRITE,)
+    )
     first = await store.claim_tool_call(
         session.session_id,
         run.run_id,
         call.call_id,
         principal_id="prn_bridge",
-        claimant_id="bridge-a",
+        client_id=client_a.client_id,
         idempotency_key="claim-key-1",
         claimed_at=T0,
         expires_at=T0 + timedelta(minutes=1),
@@ -818,12 +947,25 @@ async def test_bridge_claim_is_owner_scoped_idempotent_and_single_active(
         run.run_id,
         call.call_id,
         principal_id="prn_bridge",
-        claimant_id="bridge-a",
+        client_id=client_a.client_id,
         idempotency_key="claim-key-1",
         claimed_at=T0,
         expires_at=T0 + timedelta(minutes=1),
     )
     assert replay == first
+    rebound = await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id="prn_bridge",
+        client_id=client_a.client_id,
+        idempotency_key="claim-key-client",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    assert rebound == first
+    assert first.client_id == client_a.client_id
+    assert first.snapshot_id == call.snapshot_id
     assert await store.get_bridge_claim(first.claim_id, principal_id="prn_bridge") == first
     with pytest.raises(DuplicateEntityError, match="active Bridge claim"):
         await store.claim_tool_call(
@@ -831,12 +973,19 @@ async def test_bridge_claim_is_owner_scoped_idempotent_and_single_active(
             run.run_id,
             call.call_id,
             principal_id="prn_bridge",
-            claimant_id="bridge-b",
+            client_id=client_b.client_id,
             idempotency_key="claim-key-2",
             claimed_at=T0,
         )
     with pytest.raises(MissingEntityError):
         await store.get_bridge_claim(first.claim_id, principal_id="prn_other")
+    created = next(
+        event
+        for event in await store.list_events(run.run_id)
+        if event.event_type is EventType.BRIDGE_CLAIM_CREATED
+    )
+    assert created.payload["client_id"] == client_a.client_id
+    assert "workspace_root" not in created.payload
     assert [event.event_type for event in await store.list_events(run.run_id)] == [
         EventType.TOOL_CALL_REQUESTED,
         EventType.TOOL_CALL_STARTED,
@@ -845,16 +994,60 @@ async def test_bridge_claim_is_owner_scoped_idempotent_and_single_active(
 
 
 @pytest.mark.asyncio
+async def test_recoverable_runs_include_settled_bridge_not_inflight_tools(
+    store: SqliteStore,
+) -> None:
+    run, session, call = await seed_bridge_tool_call(store)
+    started = run.model_copy(update={"status": RunStatus.RUNNING, "started_at": T0})
+    await store.update_run(started)
+    inflight_ids = {item.run_id for item in await store.list_recoverable_runs()}
+    assert run.run_id not in inflight_ids
+    client = await register_scoped_client(store, session)
+    await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        idempotency_key="recover-claim",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    result = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={"content": "ok"},
+        output="ok",
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        result,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        settled_at=T0 + timedelta(seconds=1),
+    )
+    recovered_ids = {item.run_id for item in await store.list_recoverable_runs()}
+    assert run.run_id in recovered_ids
+
+
+@pytest.mark.asyncio
 async def test_bridge_claim_expiry_allows_a_new_key_without_replaying_old_claim(
     store: SqliteStore,
 ) -> None:
     run, session, call = await seed_bridge_tool_call(store)
+    client_a = await register_scoped_client(store, session)
+    client_b = await register_scoped_client(
+        store, session, tools=("apply_patch",), effects=(ToolEffect.WRITE,)
+    )
     first = await store.claim_tool_call(
         session.session_id,
         run.run_id,
         call.call_id,
         principal_id="prn_bridge",
-        claimant_id="bridge-a",
+        client_id=client_a.client_id,
         idempotency_key="claim-key-1",
         claimed_at=T0,
         expires_at=T0 + timedelta(seconds=5),
@@ -864,13 +1057,170 @@ async def test_bridge_claim_expiry_allows_a_new_key_without_replaying_old_claim(
         run.run_id,
         call.call_id,
         principal_id="prn_bridge",
-        claimant_id="bridge-b",
+        client_id=client_b.client_id,
         idempotency_key="claim-key-2",
         claimed_at=T0 + timedelta(seconds=6),
     )
     expired = await store.get_bridge_claim(first.claim_id, principal_id="prn_bridge")
     assert expired.status is BridgeClaimStatus.EXPIRED
     assert second.status is BridgeClaimStatus.ACTIVE
+    assert first.client_id != second.client_id
+    assert first.fingerprint != second.fingerprint
+    assert first.snapshot_id == second.snapshot_id == call.snapshot_id
+
+
+@pytest.mark.asyncio
+async def test_expired_write_claim_cannot_be_reassigned(store: SqliteStore) -> None:
+    run, session, call = await seed_bridge_tool_call(
+        store, tool_name="apply_patch", effect=ToolEffect.WRITE
+    )
+    client_a = await register_scoped_client(
+        store, session, tools=("apply_patch",), effects=(ToolEffect.WRITE,)
+    )
+    client_b = await register_scoped_client(
+        store, session, tools=("apply_patch",), effects=(ToolEffect.WRITE,)
+    )
+    first = await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id="prn_bridge",
+        client_id=client_a.client_id,
+        idempotency_key="write-key-1",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(seconds=5),
+    )
+    with pytest.raises(StateError, match="uncertain write cannot be reassigned"):
+        await store.claim_tool_call(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            principal_id="prn_bridge",
+            client_id=client_b.client_id,
+            idempotency_key="write-key-2",
+            claimed_at=T0 + timedelta(seconds=6),
+        )
+    expired = await store.expire_bridge_claim(
+        first.claim_id, principal_id="prn_bridge", at=T0 + timedelta(seconds=6)
+    )
+    assert expired.status is BridgeClaimStatus.EXPIRED
+    with pytest.raises(StateError, match="uncertain write cannot be reassigned"):
+        await store.claim_tool_call(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            principal_id="prn_bridge",
+            client_id=client_b.client_id,
+            idempotency_key="write-key-3",
+            claimed_at=T0 + timedelta(seconds=7),
+        )
+    still_running = await store.get_tool_call(call.call_id)
+    assert still_running.status is ToolCallStatus.RUNNING
+    with pytest.raises(MissingEntityError):
+        await store.get_tool_result(call.call_id)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_persists_assignment_skip_and_wakes_once(store: SqliteStore) -> None:
+    from prp_runtime.domain.enums import BridgeClientLiveness
+    from prp_runtime.runtime.bridge import BridgeAssignmentCoordinator
+
+    class Live:
+        def __init__(self) -> None:
+            self.wakes: list[str] = []
+
+        def bridge_client_liveness(
+            self,
+            client_id: str,
+            *,
+            fingerprint: str | None = None,
+            now: object | None = None,
+        ) -> BridgeClientLiveness:
+            del client_id, fingerprint, now
+            return BridgeClientLiveness.LIVE
+
+        async def enqueue(self, run_id: str) -> None:
+            self.wakes.append(run_id)
+
+    run, session, call = await seed_bridge_tool_call(store)
+    reader = await register_scoped_client(store, session)
+    lister = await register_scoped_client(
+        store, session, tools=("list_files",), effects=(ToolEffect.READ,)
+    )
+    supervisor = Live()
+    coordinator = BridgeAssignmentCoordinator(store, supervisor)
+    assignment = await coordinator.assign_for_call(
+        call,
+        principal_id=session.principal_id,
+        workspace_id=session.workspace_id,
+        session_id=session.session_id,
+        idempotency_key="coord-assign-1",
+        caller_client_id=reader.client_id,
+        claimed_at=T0,
+    )
+    assert assignment.claim is not None
+    assert assignment.claim.client_id == reader.client_id
+    events = await store.list_events(run.run_id)
+    assert [event.event_type for event in events] == [
+        EventType.TOOL_CALL_REQUESTED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.BRIDGE_CLIENT_SKIPPED,
+        EventType.BRIDGE_CLAIM_CREATED,
+    ]
+    skip = events[2]
+    assert skip.payload["client_id"] == lister.client_id
+    assert skip.payload["reason"] == "tool capability mismatch"
+    replay = await coordinator.assign_for_call(
+        call,
+        principal_id=session.principal_id,
+        workspace_id=session.workspace_id,
+        session_id=session.session_id,
+        idempotency_key="coord-assign-1",
+        caller_client_id=reader.client_id,
+        claimed_at=T0,
+    )
+    assert replay.claim == assignment.claim
+    assert [event.event_type for event in await store.list_events(run.run_id)] == [
+        EventType.TOOL_CALL_REQUESTED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.BRIDGE_CLIENT_SKIPPED,
+        EventType.BRIDGE_CLAIM_CREATED,
+    ]
+    result = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={"content": "ok"},
+        output="ok",
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    completed, replayed = await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        result,
+        principal_id=session.principal_id,
+        client_id=reader.client_id,
+        settled_at=T0 + timedelta(seconds=1),
+    )
+    assert replayed is False
+    await coordinator.wake_after_settlement(run.run_id, replayed=replayed)
+    _, replayed_again = await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        result,
+        principal_id=session.principal_id,
+        client_id=reader.client_id,
+        settled_at=T0 + timedelta(seconds=2),
+    )
+    await coordinator.wake_after_settlement(run.run_id, replayed=replayed_again)
+    assert supervisor.wakes == [run.run_id]
+    assert completed == result
+    assert [
+        event.event_type
+        for event in await store.list_events(run.run_id)
+        if event.event_type is EventType.BRIDGE_RESULT_WAKE
+    ] == [EventType.BRIDGE_RESULT_WAKE]
 
 
 @pytest.mark.asyncio
@@ -878,12 +1228,13 @@ async def test_bridge_result_completes_and_settles_atomically_then_replays(
     store: SqliteStore,
 ) -> None:
     run, session, call = await seed_bridge_tool_call(store)
+    client = await register_scoped_client(store, session)
     claim = await store.claim_tool_call(
         session.session_id,
         run.run_id,
         call.call_id,
         principal_id="prn_bridge",
-        claimant_id="prn_bridge",
+        client_id=client.client_id,
         idempotency_key="claim-result-key",
         claimed_at=T0,
         expires_at=T0 + timedelta(minutes=1),
@@ -901,7 +1252,7 @@ async def test_bridge_result_completes_and_settles_atomically_then_replays(
         call.call_id,
         result,
         principal_id="prn_bridge",
-        claimant_id="prn_bridge",
+        client_id=client.client_id,
         settled_at=T0 + timedelta(seconds=1),
     )
     assert completed == result
@@ -916,7 +1267,7 @@ async def test_bridge_result_completes_and_settles_atomically_then_replays(
         call.call_id,
         result.model_copy(update={"completed_at": T0 + timedelta(seconds=2)}),
         principal_id="prn_bridge",
-        claimant_id="prn_bridge",
+        client_id=client.client_id,
         settled_at=T0 + timedelta(seconds=2),
     )
     assert replay == result
@@ -926,8 +1277,17 @@ async def test_bridge_result_completes_and_settles_atomically_then_replays(
         EventType.TOOL_CALL_STARTED,
         EventType.BRIDGE_CLAIM_CREATED,
         EventType.TOOL_CALL_SUCCEEDED,
+        EventType.ARTIFACT_PRODUCED,
+        EventType.EVIDENCE_RECORDED,
         EventType.BRIDGE_CLAIM_SETTLED,
+        EventType.BRIDGE_RESULT_WAKE,
     ]
+    wake = next(
+        event
+        for event in await store.list_events(run.run_id)
+        if event.event_type is EventType.BRIDGE_RESULT_WAKE
+    )
+    assert wake.payload == {"call_id": call.call_id, "status": ToolCallStatus.SUCCEEDED.value}
     with pytest.raises(StateError, match="conflicting result"):
         await store.submit_bridge_tool_result(
             session.session_id,
@@ -935,7 +1295,7 @@ async def test_bridge_result_completes_and_settles_atomically_then_replays(
             call.call_id,
             result.model_copy(update={"output": "different"}),
             principal_id="prn_bridge",
-            claimant_id="prn_bridge",
+            client_id=client.client_id,
         )
 
 
@@ -944,12 +1304,13 @@ async def test_expired_bridge_claim_cannot_submit_a_result(
     store: SqliteStore,
 ) -> None:
     run, session, call = await seed_bridge_tool_call(store)
+    client = await register_scoped_client(store, session)
     await store.claim_tool_call(
         session.session_id,
         run.run_id,
         call.call_id,
         principal_id="prn_bridge",
-        claimant_id="prn_bridge",
+        client_id=client.client_id,
         idempotency_key="expired-result-key",
         claimed_at=T0,
         expires_at=T0 + timedelta(seconds=1),
@@ -966,12 +1327,330 @@ async def test_expired_bridge_claim_cannot_submit_a_result(
             call.call_id,
             result,
             principal_id="prn_bridge",
-            claimant_id="prn_bridge",
+            client_id=client.client_id,
             settled_at=T0 + timedelta(seconds=2),
         )
     with pytest.raises(MissingEntityError):
         await store.get_tool_result(call.call_id)
     assert (await store.get_tool_call(call.call_id)).status is ToolCallStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_bridge_result_persists_identity_bound_facts_and_replays(
+    store: SqliteStore,
+) -> None:
+    run, session, call = await seed_bridge_tool_call(store)
+    client = await register_scoped_client(store, session)
+    await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        idempotency_key="facts-result-key",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    result = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={"content": "safe"},
+        output="safe",
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    completed, replayed = await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        result,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        snapshot_id=call.snapshot_id,
+        settled_at=T0 + timedelta(seconds=1),
+    )
+    assert completed == result
+    assert replayed is False
+    artifacts = await store.list_artifacts(call.work_unit_id)
+    evidence = await store.list_evidence(call.work_unit_id)
+    assert len(artifacts) == 1
+    assert artifacts[0].name == "bridge-result"
+    assert artifacts[0].kind is ArtifactKind.JSON
+    assert call.snapshot_id in artifacts[0].content
+    assert evidence[0].rule == "bridge.result.observation"
+    assert evidence[0].result is VerificationResult.PASS
+    assert evidence[0].artifact_id == artifacts[0].artifact_id
+    _, replayed_again = await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        result,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        snapshot_id=call.snapshot_id,
+        settled_at=T0 + timedelta(seconds=2),
+    )
+    assert replayed_again is True
+    assert await store.list_artifacts(call.work_unit_id) == artifacts
+    assert await store.list_evidence(call.work_unit_id) == evidence
+
+
+@pytest.mark.asyncio
+async def test_bridge_result_rejects_wrong_client_base_lease_and_round(
+    store: SqliteStore,
+) -> None:
+    run, session, call = await seed_bridge_tool_call(store)
+    assigned = await register_scoped_client(store, session)
+    foreign = await register_scoped_client(store, session)
+    await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id="prn_bridge",
+        client_id=assigned.client_id,
+        idempotency_key="scope-result-key",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    result = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={"content": "safe"},
+        output="safe",
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    with pytest.raises(MissingEntityError, match="authenticated scope"):
+        await store.submit_bridge_tool_result(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            result,
+            principal_id="prn_bridge",
+            client_id=foreign.client_id,
+        )
+    with pytest.raises(StateError, match="base snapshot"):
+        await store.submit_bridge_tool_result(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            result,
+            principal_id="prn_bridge",
+            client_id=assigned.client_id,
+            snapshot_id=new_snapshot_id(),
+        )
+    await store.create_round(
+        ProgressiveRound(
+            round_id="round_" + "c" * 32,
+            run_id=run.run_id,
+            round_index=0,
+            graph_version=1,
+            base_snapshot_id=call.snapshot_id or new_snapshot_id(),
+            status=RoundStatus.PLANNED,
+            created_at=T0,
+        )
+    )
+    with pytest.raises(StateError, match="round"):
+        await store.submit_bridge_tool_result(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            result,
+            principal_id="prn_bridge",
+            client_id=assigned.client_id,
+            snapshot_id=call.snapshot_id,
+            round_id="round_" + "d" * 32,
+        )
+    with pytest.raises(MissingEntityError):
+        await store.get_tool_result(call.call_id)
+
+
+@pytest.mark.asyncio
+async def test_bridge_write_result_creates_changeset_only_from_validated_patch_facts(
+    store: SqliteStore,
+) -> None:
+    run, session, call = await seed_bridge_tool_call(
+        store, tool_name="apply_patch", effect=ToolEffect.WRITE
+    )
+    client = await register_scoped_client(
+        store, session, tools=("apply_patch",), effects=(ToolEffect.WRITE,)
+    )
+    await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        idempotency_key="patch-result-key",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    asserted = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={"accepted": True, "content": "nope"},
+        output="nope",
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    with pytest.raises(StateError, match="self-assertion"):
+        await store.submit_bridge_tool_result(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            asserted,
+            principal_id="prn_bridge",
+            client_id=client.client_id,
+        )
+    mismatched = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={
+            "patch": {
+                "base_snapshot_id": call.snapshot_id,
+                "unified_diff": "--- a/src/main-bridge.py\n+++ b/src/main-bridge.py\n",
+            },
+            "files": [
+                {
+                    "path": "src/main-bridge.py",
+                    "action": "MODIFY",
+                    "before": {"sha256": "c" * 64, "size": 4},
+                    "after": {"sha256": "d" * 64, "size": 5},
+                }
+            ],
+        },
+        output="patched",
+        changed_paths=("src/main-bridge.py",),
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    with pytest.raises(StateError, match="before facts"):
+        await store.submit_bridge_tool_result(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            mismatched,
+            principal_id="prn_bridge",
+            client_id=client.client_id,
+        )
+    valid = ToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={
+            "patch": {
+                "base_snapshot_id": call.snapshot_id,
+                "unified_diff": "--- a/src/main-bridge.py\n+++ b/src/main-bridge.py\n@@ -1 +1 @@\n-old\n+new\n",
+            },
+            "files": [
+                {
+                    "path": "src/main-bridge.py",
+                    "action": "MODIFY",
+                    "before": {"sha256": "a" * 64, "size": 4},
+                    "after": {"sha256": "d" * 64, "size": 5},
+                }
+            ],
+        },
+        output="patched",
+        changed_paths=("src/main-bridge.py",),
+        completed_at=T0 + timedelta(seconds=1),
+    )
+    completed, replayed = await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        valid,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        snapshot_id=call.snapshot_id,
+        settled_at=T0 + timedelta(seconds=1),
+    )
+    assert replayed is False
+    assert completed == valid
+    change_sets = await store.list_change_sets(tool_call_id=call.call_id)
+    assert len(change_sets) == 1
+    assert change_sets[0].base_snapshot_id == call.snapshot_id
+    assert change_sets[0].new_snapshot_id != call.snapshot_id
+    assert change_sets[0].files[0].path == "src/main-bridge.py"
+    evidence = await store.list_evidence(call.work_unit_id)
+    assert evidence[0].result is VerificationResult.PASS
+    _, replayed_again = await store.submit_bridge_tool_result(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        valid,
+        principal_id="prn_bridge",
+        client_id=client.client_id,
+        snapshot_id=call.snapshot_id,
+    )
+    assert replayed_again is True
+    assert await store.list_change_sets(tool_call_id=call.call_id) == change_sets
+    assert len(await store.list_artifacts(call.work_unit_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_bridge_client_capabilities_and_scope_survive_reopen(
+    database_path: Path,
+) -> None:
+    async with SqliteStore(database_path) as store:
+        run, session, call = await seed_bridge_tool_call(store)
+        client = await register_scoped_client(
+            store,
+            session,
+            tools=("read_file", "search_text"),
+            effects=(ToolEffect.READ,),
+        )
+        await store.record_bridge_heartbeat(
+            client.client_id,
+            principal_id=session.principal_id,
+            fingerprint=client.capability_fingerprint,
+            at=T0 + timedelta(seconds=10),
+        )
+        claim = await store.claim_tool_call(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            principal_id=session.principal_id,
+            client_id=client.client_id,
+            idempotency_key="reopen-claim",
+            claimed_at=T0,
+            expires_at=T0 + timedelta(minutes=1),
+        )
+        client_id = client.client_id
+        capabilities = client.capabilities
+        fingerprint = client.capability_fingerprint
+        workspace_id = client.workspace_id
+        claim_id = claim.claim_id
+        claim_fingerprint = claim.fingerprint
+        snapshot_id = claim.snapshot_id
+    async with SqliteStore(database_path) as reopened:
+        restored = await reopened.get_bridge_client(
+            client_id, principal_id=session.principal_id
+        )
+        restored_claim = await reopened.get_bridge_claim(
+            claim_id, principal_id=session.principal_id
+        )
+    assert restored.capabilities == capabilities
+    assert restored.capability_fingerprint == fingerprint
+    assert restored.workspace_id == workspace_id
+    assert restored.last_seen_at == T0 + timedelta(seconds=10)
+    assert restored_claim.client_id == client_id
+    assert restored_claim.fingerprint == claim_fingerprint
+    assert restored_claim.snapshot_id == snapshot_id
+    payload = restored.model_dump(mode="json")
+    assert "token" not in payload
+    assert "workspace_root" not in payload
+    assert "api_key" not in payload
+
+
+@pytest.mark.asyncio
+async def test_unregistered_bridge_client_cannot_claim(store: SqliteStore) -> None:
+    run, session, call = await seed_bridge_tool_call(store)
+    with pytest.raises(MissingEntityError):
+        await store.claim_tool_call(
+            session.session_id,
+            run.run_id,
+            call.call_id,
+            principal_id="prn_bridge",
+            client_id=new_client_id(),
+            idempotency_key="missing-client",
+            claimed_at=T0,
+        )
 
 
 @pytest.mark.asyncio
@@ -2241,3 +2920,35 @@ async def test_store_operations_require_an_open_store(database_path: Path) -> No
         await closed.get_run("run_1")
     with pytest.raises(InternalError, match="not open"):
         await closed.create_run(make_run())
+
+
+
+@pytest.mark.asyncio
+async def test_active_bridge_claim_counts_are_workspace_scoped(store: SqliteStore) -> None:
+    run, session, call = await seed_bridge_tool_call(store)
+    client = await register_scoped_client(store, session)
+    counts = await store.list_active_bridge_claim_counts(
+        principal_id=session.principal_id, workspace_id=session.workspace_id
+    )
+    assert counts == {}
+    await store.claim_tool_call(
+        session.session_id,
+        run.run_id,
+        call.call_id,
+        principal_id=session.principal_id,
+        client_id=client.client_id,
+        idempotency_key="claim-count-1",
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    counts = await store.list_active_bridge_claim_counts(
+        principal_id=session.principal_id, workspace_id=session.workspace_id
+    )
+    assert counts == {client.client_id: 1}
+    assert await store.list_active_bridge_call_ids(
+        principal_id=session.principal_id, workspace_id=session.workspace_id
+    ) == (call.call_id,)
+    other = await store.list_active_bridge_claim_counts(
+        principal_id=session.principal_id, workspace_id="ws_missing"
+    )
+    assert other == {}

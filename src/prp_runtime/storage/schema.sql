@@ -350,7 +350,12 @@ CREATE TABLE IF NOT EXISTS snapshot_files (
                     ),
     size            INTEGER NOT NULL CHECK (size >= 0 AND size <= 1073741824),
     entry_type      TEXT NOT NULL CHECK (entry_type IN ('FILE', 'DIRECTORY')),
-    PRIMARY KEY (snapshot_id, path)
+    content         TEXT,
+    PRIMARY KEY (snapshot_id, path),
+    CHECK (
+        (entry_type = 'DIRECTORY' AND content IS NULL)
+        OR entry_type = 'FILE'
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshot_files_snapshot ON snapshot_files (snapshot_id, path);
@@ -533,6 +538,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     completed_at     TEXT,
     UNIQUE (run_id, idempotency_key),
     UNIQUE (call_id, run_id, workspace_id),
+    UNIQUE (call_id, workspace_id, base_snapshot_id),
     CHECK (
         (status IN ('REQUESTED', 'AWAITING_APPROVAL')
          AND started_at IS NULL AND completed_at IS NULL)
@@ -576,9 +582,44 @@ CREATE TABLE IF NOT EXISTS tool_results (
 CREATE INDEX IF NOT EXISTS idx_tool_results_status
     ON tool_results (status, completed_at);
 
+-- Registered model-free Bridge clients are owner- and workspace-scoped.
+-- Exact capability descriptors, fingerprints and heartbeat times are public
+-- facts; no root or credential is stored.
+CREATE TABLE IF NOT EXISTS bridge_clients (
+    client_id              TEXT PRIMARY KEY CHECK (client_id = TRIM(client_id) AND client_id <> ''),
+    principal_id           TEXT NOT NULL CHECK (TRIM(principal_id) <> ''),
+    workspace_id           TEXT NOT NULL REFERENCES workspaces (workspace_id) ON DELETE RESTRICT,
+    tools_json             TEXT NOT NULL CHECK (length(tools_json) BETWEEN 2 AND 4096),
+    effects_json           TEXT NOT NULL CHECK (length(effects_json) BETWEEN 2 AND 1024),
+    max_argument_bytes     INTEGER NOT NULL CHECK (max_argument_bytes >= 1 AND max_argument_bytes <= 65536),
+    max_output_bytes       INTEGER NOT NULL CHECK (max_output_bytes >= 1 AND max_output_bytes <= 262144),
+    max_runtime_ms         INTEGER CHECK (max_runtime_ms IS NULL OR max_runtime_ms >= 1),
+    capability_fingerprint TEXT NOT NULL CHECK (
+        length(capability_fingerprint) = 64
+        AND capability_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    status                 TEXT NOT NULL CHECK (status IN ('ACTIVE', 'DISABLED')),
+    created_at             TEXT NOT NULL,
+    last_seen_at           TEXT,
+    disabled_at            TEXT,
+    UNIQUE (client_id, principal_id, workspace_id),
+    CHECK (
+        (status = 'ACTIVE' AND disabled_at IS NULL)
+        OR (status = 'DISABLED' AND disabled_at IS NOT NULL)
+    ),
+    CHECK (disabled_at IS NULL OR disabled_at >= created_at),
+    CHECK (last_seen_at IS NULL OR last_seen_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bridge_clients_principal
+    ON bridge_clients (principal_id, status, created_at, client_id);
+CREATE INDEX IF NOT EXISTS idx_bridge_clients_workspace
+    ON bridge_clients (workspace_id, status, client_id);
+
 -- Native Bridge claims are lease-bearing facts, separate from approvals and
--- tool results. Composite foreign keys keep call, run, session, workspace and
--- owner scope aligned even when rows are inserted directly into SQLite.
+-- tool results. Composite foreign keys keep call, run, session, workspace,
+-- snapshot and registered client scope aligned even when rows are inserted
+-- directly into SQLite.
 CREATE TABLE IF NOT EXISTS bridge_claims (
     claim_id         TEXT PRIMARY KEY CHECK (claim_id = TRIM(claim_id)
                                               AND claim_id <> ''),
@@ -586,9 +627,9 @@ CREATE TABLE IF NOT EXISTS bridge_claims (
     run_id           TEXT NOT NULL,
     session_id       TEXT NOT NULL,
     workspace_id     TEXT NOT NULL,
+    snapshot_id      TEXT NOT NULL,
     owner_id         TEXT NOT NULL CHECK (TRIM(owner_id) <> ''),
-    claimant_id      TEXT NOT NULL CHECK (TRIM(claimant_id) <> ''
-                                          AND length(claimant_id) <= 128),
+    client_id        TEXT NOT NULL CHECK (TRIM(client_id) <> ''),
     idempotency_key  TEXT NOT NULL CHECK (idempotency_key = TRIM(idempotency_key)
                                           AND idempotency_key <> ''
                                           AND length(idempotency_key) <= 128),
@@ -601,12 +642,16 @@ CREATE TABLE IF NOT EXISTS bridge_claims (
     UNIQUE (session_id, run_id, idempotency_key),
     FOREIGN KEY (call_id, run_id, workspace_id)
         REFERENCES tool_calls (call_id, run_id, workspace_id) ON DELETE RESTRICT,
+    FOREIGN KEY (call_id, workspace_id, snapshot_id)
+        REFERENCES tool_calls (call_id, workspace_id, base_snapshot_id) ON DELETE RESTRICT,
     FOREIGN KEY (session_id, run_id)
         REFERENCES session_runs (session_id, run_id) ON DELETE RESTRICT,
     FOREIGN KEY (session_id, owner_id, workspace_id)
         REFERENCES sessions (session_id, principal_id, workspace_id) ON DELETE RESTRICT,
     FOREIGN KEY (workspace_id, owner_id)
         REFERENCES workspaces (workspace_id, owner_id) ON DELETE RESTRICT,
+    FOREIGN KEY (client_id, owner_id, workspace_id)
+        REFERENCES bridge_clients (client_id, principal_id, workspace_id) ON DELETE RESTRICT,
     CHECK (expires_at > claimed_at),
     CHECK (claimed_at LIKE '%T%Z' OR claimed_at LIKE '%T%+__:__'
            OR claimed_at LIKE '%T%-__:__'),
@@ -625,6 +670,8 @@ CREATE INDEX IF NOT EXISTS idx_bridge_claims_call
     ON bridge_claims (call_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_bridge_claims_owner
     ON bridge_claims (owner_id, session_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_bridge_claims_client
+    ON bridge_claims (client_id, status, expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_bridge_claims_active_call
     ON bridge_claims (call_id)
     WHERE status = 'ACTIVE';
@@ -632,8 +679,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_bridge_claims_active_call
 -- Identity and lease facts are immutable. The only permitted mutation is one
 -- ACTIVE -> terminal status transition performed by the Store in a transaction.
 CREATE TRIGGER IF NOT EXISTS trg_bridge_claims_identity_immutable
-BEFORE UPDATE OF claim_id, call_id, run_id, session_id, workspace_id, owner_id,
-                 claimant_id, idempotency_key, fingerprint, claimed_at, expires_at
+BEFORE UPDATE OF claim_id, call_id, run_id, session_id, workspace_id, snapshot_id,
+                 owner_id, client_id, idempotency_key, fingerprint, claimed_at, expires_at
 ON bridge_claims
 BEGIN
     SELECT RAISE(ABORT, 'bridge claim identity is immutable');

@@ -30,6 +30,7 @@ __all__ = [
     "BudgetOutcome",
     "check_attempt_budget",
     "check_deadline",
+    "check_role_dispatch",
     "check_token_budget",
     "check_token_budget_postflight",
     "check_token_budget_preflight",
@@ -135,6 +136,72 @@ def check_attempt_budget(budget: Budget, attempt_count: int) -> BudgetDecision:
             f"attempt count {attempt_count} reached the ceiling of {budget.max_attempts}",
         )
     return _allow("attempts")
+
+
+def check_role_dispatch(
+    budget: Budget,
+    usage: Usage,
+    *,
+    attempt_count: int,
+    now: datetime,
+    deterministic: bool = False,
+    context_window_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+    declared_input_tokens: int | None = None,
+    declared_output_tokens: int | None = None,
+    timeout_seconds: float | None = None,
+) -> BudgetDecision:
+    """Stop an over-budget role call before provider dispatch.
+
+    Deterministic Analyzer/Verifier completion does not consume a provider
+    budget and must not fabricate usage. Declared input/output bounds are
+    ceilings, never estimates recorded as measured tokens.
+    """
+    if deterministic:
+        return _allow("deterministic")
+    deadline = check_deadline(budget, now)
+    if not deadline.allowed:
+        return deadline
+    attempts = check_attempt_budget(budget, attempt_count)
+    if not attempts.allowed:
+        return attempts
+    tokens = check_token_budget_preflight(budget, usage)
+    if not tokens.allowed:
+        return tokens
+    if (
+        declared_output_tokens is not None
+        and max_output_tokens is not None
+        and declared_output_tokens > max_output_tokens
+    ):
+        return _stop(
+            "max_output_tokens",
+            ErrorCode.TOKEN_BUDGET_EXCEEDED,
+            f"declared output tokens {declared_output_tokens} exceed the role "
+            f"ceiling of {max_output_tokens}",
+        )
+    planned_tokens = usage.input_tokens
+    if declared_input_tokens is not None:
+        planned_tokens = max(planned_tokens, declared_input_tokens)
+    if declared_output_tokens is not None:
+        planned_tokens += declared_output_tokens
+    if (
+        context_window_tokens is not None
+        and planned_tokens > context_window_tokens
+    ):
+        return _stop(
+            "context_window_tokens",
+            ErrorCode.TOKEN_BUDGET_EXCEEDED,
+            f"declared role context {planned_tokens} exceeds the window of "
+            f"{context_window_tokens}",
+        )
+    if timeout_seconds is not None and usage.elapsed_ms >= int(timeout_seconds * 1000):
+        return _stop(
+            "timeout",
+            ErrorCode.DEADLINE_EXCEEDED,
+            f"measured provider elapsed {usage.elapsed_ms}ms reached the role "
+            f"timeout of {timeout_seconds}s",
+        )
+    return _allow("role_dispatch")
 
 
 def check_deadline(budget: Budget, now: datetime) -> BudgetDecision:

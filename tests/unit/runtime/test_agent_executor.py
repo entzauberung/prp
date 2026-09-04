@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from prp_runtime.domain.enums import (
     AgentMode,
     AttemptStatus,
+    ExecutionLocation,
     ModelRole,
     ResourceAccess,
     ToolCallStatus,
@@ -16,6 +17,7 @@ from prp_runtime.domain.enums import (
 )
 from prp_runtime.domain.models import (
     MAX_AGENT_RESULT_BYTES,
+    AgentRequestOptions,
     AgentToolCall,
     Attempt,
     ExecutionScope,
@@ -28,16 +30,18 @@ from prp_runtime.domain.values import (
     new_run_id,
     new_session_id,
     new_snapshot_id,
+    new_tool_call_id,
     new_work_unit_id,
     new_workspace_id,
 )
+from prp_runtime.runtime.agent_loop import REMOTE_ASSIGNMENT_PENDING
+from prp_runtime.tools.executor import ToolExecutionOutcome
+from prp_runtime.tools.models import ToolCall, ToolResult
+from prp_runtime.tools.registry import ToolDefinition, ToolRegistry
 from prp_runtime.policy.engine import PolicyDecision, PolicyOutcome, PolicyReasonCode
 from prp_runtime.runtime.agent_executor import AgentToolExecutor
 from prp_runtime.runtime.agent_loop import AgentToolContext
 from prp_runtime.runtime.worker import ResumeAction, ResumeState
-from prp_runtime.tools.executor import ToolExecutionOutcome
-from prp_runtime.tools.models import ToolCall, ToolResult
-from prp_runtime.tools.registry import ToolDefinition, ToolRegistry
 
 T0 = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
@@ -101,7 +105,9 @@ class PrivateStoreWorker(FakeWorker):
         self._executor = type("PrivateExecutor", (), {"_store": object()})()
 
 
-def make_scope() -> ExecutionScope:
+def make_scope(
+    *, location: ExecutionLocation = ExecutionLocation.CLOUD
+) -> ExecutionScope:
     principal_id = new_principal_id()
     workspace_id = new_workspace_id()
     return ExecutionScope(
@@ -113,6 +119,7 @@ def make_scope() -> ExecutionScope:
             principal_id=principal_id,
             workspace_id=workspace_id,
         ),
+        agent_options=AgentRequestOptions(execution_location=location),
     )
 
 
@@ -397,3 +404,120 @@ def test_resume_state_requires_a_closed_action_shape() -> None:
         ResumeState(action=ResumeAction.BLOCK, attempt=attempt)
     with pytest.raises(ValueError, match="pending resume action"):
         ResumeState(action=ResumeAction.WAIT, attempt=attempt)
+    with pytest.raises(ValueError, match="pending call"):
+        ResumeState(action=ResumeAction.WAIT_REMOTE, attempt=attempt)
+
+
+@pytest.mark.asyncio
+async def test_bridge_does_not_invoke_worker_and_emits_public_assignment() -> None:
+    scope = make_scope(location=ExecutionLocation.BRIDGE)
+    worker = FakeWorker()
+    adapter = AgentToolExecutor(
+        worker,
+        make_registry(),
+        scope,
+        snapshot_id=new_snapshot_id(),
+    )
+    call = make_call()
+    context = make_context(scope)
+
+    execution = await adapter.execute(call, context=context)
+
+    assert worker.calls == []
+    assert execution.awaiting_remote_result is True
+    assert execution.awaiting_approval is False
+    assert execution.result is None
+    assert execution.reason == REMOTE_ASSIGNMENT_PENDING
+
+
+@pytest.mark.asyncio
+async def test_bridge_write_asks_without_invoking_worker() -> None:
+    class WriteArguments(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        path: str
+
+    async def write_file(arguments: BaseModel) -> dict[str, object]:
+        del arguments
+        raise AssertionError("server handler must not run for BRIDGE")
+
+    scope = make_scope(location=ExecutionLocation.BRIDGE)
+    scope = scope.model_copy(
+        update={
+            "grant": WorkspaceGrant(
+                principal_id=scope.principal_id,
+                workspace_id=scope.workspace_id,
+                access=(ResourceAccess.READ, ResourceAccess.WRITE),
+            )
+        }
+    )
+    worker = FakeWorker()
+    adapter = AgentToolExecutor(
+        worker,
+        ToolRegistry(
+            (
+                ToolDefinition(
+                    name="apply_patch",
+                    effect=ToolEffect.WRITE,
+                    argument_model=WriteArguments,
+                    handler=write_file,
+                ),
+            )
+        ),
+        scope,
+        snapshot_id=new_snapshot_id(),
+    )
+    execution = await adapter.execute(
+        AgentToolCall(
+            call_id="provider-call/write",
+            tool_name="apply_patch",
+            arguments={"path": "src/main.py"},
+        ),
+        context=make_context(scope),
+    )
+    assert worker.calls == []
+    assert execution.awaiting_approval is True
+    assert execution.result is None
+
+
+def test_remote_wait_resume_state_is_not_an_approval_pause() -> None:
+    scope = make_scope(location=ExecutionLocation.BRIDGE)
+    work_unit_id = new_work_unit_id()
+    attempt = Attempt(
+        attempt_id=new_attempt_id(),
+        run_id=scope.run_id,
+        work_unit_id=work_unit_id,
+        role=ModelRole.WORKER,
+        model=ModelRef(provider="fake", model="model"),
+        status=AttemptStatus.SUCCEEDED,
+        created_at=T0,
+        started_at=T0,
+        completed_at=T0,
+    )
+    pending_call = ToolCall(
+        call_id=new_tool_call_id(),
+        run_id=scope.run_id,
+        work_unit_id=work_unit_id,
+        tool_name="read_file",
+        effect=ToolEffect.READ,
+        arguments={"path": "src/main.py"},
+        snapshot_id=new_snapshot_id(),
+        requested_at=T0,
+        status=ToolCallStatus.RUNNING,
+    )
+    public_call = AgentToolCall(
+        call_id="provider-call/1",
+        tool_name="read_file",
+        arguments={"path": "src/main.py"},
+    )
+    state = ResumeState(
+        action=ResumeAction.WAIT_REMOTE,
+        attempt=attempt,
+        pending_call=pending_call,
+        pending_public_call=public_call,
+        reason=REMOTE_ASSIGNMENT_PENDING,
+    )
+    assert state.action is ResumeAction.WAIT_REMOTE
+    assert state.approval_request is None
+    assert state.pending_call is not None
+    assert state.pending_call.status is ToolCallStatus.RUNNING

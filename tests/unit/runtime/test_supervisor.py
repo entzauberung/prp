@@ -215,3 +215,97 @@ async def test_shutdown_rejects_new_work_and_leaves_no_tasks() -> None:
         await supervisor.scan()
     assert supervisor.running is False
     assert supervisor.active_run_ids == frozenset()
+
+
+
+def test_bridge_heartbeat_eligibility_is_finite_and_preserves_runs() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from prp_runtime.domain.enums import BridgeClientLiveness
+
+    current = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+
+    def clock() -> datetime:
+        return current
+
+    run = make_run()
+    store = FakeStore([run])
+    supervisor = RunSupervisor(store, lambda run_id: run_id, heartbeat_ttl=30.0, clock=clock)
+    client_id = "cli_liveclient01"
+    fingerprint = "a" * 64
+    assert supervisor.bridge_client_liveness(client_id) is BridgeClientLiveness.OFFLINE
+    assert supervisor.is_bridge_client_eligible(client_id) is False
+    supervisor.record_bridge_heartbeat(client_id, fingerprint=fingerprint, at=current)
+    assert supervisor.is_bridge_client_eligible(client_id, fingerprint=fingerprint) is True
+    assert supervisor.bridge_client_liveness(client_id) is BridgeClientLiveness.LIVE
+    later = current + timedelta(seconds=31)
+    assert (
+        supervisor.bridge_client_liveness(client_id, now=later)
+        is BridgeClientLiveness.EXPIRED
+    )
+    assert supervisor.is_bridge_client_eligible(client_id, now=later) is False
+    assert supervisor.is_bridge_client_eligible(client_id, fingerprint="b" * 64) is False
+    assert store.runs[run.run_id].status is RunStatus.PENDING
+
+
+
+def test_liveness_matrix_and_reconnect_do_not_mutate_runs() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from prp_runtime.domain.enums import BridgeClientLiveness
+
+    current = datetime(2026, 9, 2, 13, 0, tzinfo=UTC)
+    run = make_run(RunStatus.RUNNING)
+    store = FakeStore([run])
+    supervisor = RunSupervisor(
+        store, lambda run_id: run_id, heartbeat_ttl=10.0, clock=lambda: current
+    )
+    live_id = "cli_live01"
+    stale_id = "cli_stale01"
+    changed_id = "cli_changed01"
+    fp = "a" * 64
+    supervisor.record_bridge_heartbeat(live_id, fingerprint=fp, at=current)
+    supervisor.record_bridge_heartbeat(
+        stale_id, fingerprint=fp, at=current - timedelta(seconds=11)
+    )
+    supervisor.record_bridge_heartbeat(changed_id, fingerprint=fp, at=current)
+    assert supervisor.is_bridge_client_eligible(live_id, fingerprint=fp) is True
+    assert supervisor.bridge_client_liveness(stale_id) is BridgeClientLiveness.EXPIRED
+    assert supervisor.is_bridge_client_eligible(stale_id) is False
+    assert supervisor.is_bridge_client_eligible(changed_id, fingerprint="b" * 64) is False
+    supervisor.record_bridge_heartbeat(stale_id, fingerprint=fp, at=current)
+    assert supervisor.is_bridge_client_eligible(stale_id, fingerprint=fp) is True
+    assert store.runs[run.run_id].status is RunStatus.RUNNING
+
+
+
+def test_heartbeat_ttl_cannot_exceed_server_limit() -> None:
+    from prp_runtime.domain.models import MAX_BRIDGE_HEARTBEAT_TTL_SECONDS
+
+    store = FakeStore()
+    with pytest.raises(ValueError, match="server limit"):
+        RunSupervisor(
+            store,
+            lambda run_id: run_id,
+            heartbeat_ttl=float(MAX_BRIDGE_HEARTBEAT_TTL_SECONDS) + 1,
+        )
+
+
+
+def test_expired_liveness_scan_does_not_change_run_status() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from prp_runtime.domain.enums import BridgeClientLiveness
+
+    current = datetime(2026, 9, 2, 14, 0, tzinfo=UTC)
+    run = make_run(RunStatus.RUNNING)
+    store = FakeStore([run])
+    supervisor = RunSupervisor(
+        store, lambda run_id: run_id, heartbeat_ttl=10.0, clock=lambda: current
+    )
+    supervisor.record_bridge_heartbeat(
+        "cli_expired01", fingerprint="a" * 64, at=current - timedelta(seconds=30)
+    )
+    assert supervisor.bridge_client_liveness("cli_expired01") is BridgeClientLiveness.EXPIRED
+    assert store.runs[run.run_id].status is RunStatus.RUNNING
+    assert supervisor.held_run_ids == frozenset()

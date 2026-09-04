@@ -331,6 +331,8 @@ class CommandRunner:
             await _finish_output_tasks(stdout_task, stderr_task)
         stdout, stdout_truncated = _output_task_result(stdout_task)
         stderr, stderr_truncated = _output_task_result(stderr_task)
+        stdout = _redact_local_paths(stdout, plan.cwd)
+        stderr = _redact_local_paths(stderr, plan.cwd)
         return CommandResult(
             exit_code=process.returncode,
             stdout=stdout,
@@ -686,3 +688,13 @@ DEFAULT_COMMAND_SPECS: tuple[CommandSpec, ...] = (
 )
 
 DEFAULT_COMMAND_REGISTRY = CommandRegistry(DEFAULT_COMMAND_SPECS)
+
+
+def _redact_local_paths(text: str, root: object) -> str:
+    """Strip the authorized workspace cwd from public command observations."""
+    if not text or root is None:
+        return text
+    value = str(root)
+    if not value:
+        return text
+    return text.replace(value, "").replace(value.replace("\\", "/"), "")

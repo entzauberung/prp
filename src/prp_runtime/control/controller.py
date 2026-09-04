@@ -11,17 +11,18 @@ produced artifact and the controller decides acceptance.
 """
 
 import hashlib
+import json
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pydantic import JsonValue
 
 from prp_runtime.control.budget import (
     check_attempt_budget,
-    check_deadline,
+    check_role_dispatch,
     check_token_budget_postflight,
-    check_token_budget_preflight,
 )
 from prp_runtime.control.cascade import (
     CascadeChain,
@@ -46,9 +47,18 @@ from prp_runtime.control.progressive import (
     new_round_id,
 )
 from prp_runtime.control.reservations import ReservationRequest
-from prp_runtime.control.routing import RoutingFacts, StrategyDecision, route
+from prp_runtime.control.routing import (
+    RoleDecision,
+    RoleFacts,
+    RoutingFacts,
+    StrategyDecision,
+    route,
+    route_role,
+)
 from prp_runtime.domain.enums import (
     AttemptStatus,
+    BridgeClientLiveness,
+    ExecutionLocation,
     ExecutionStrategy,
     MergeLedgerStatus,
     ModelRole,
@@ -67,6 +77,7 @@ from prp_runtime.domain.errors import (
 )
 from prp_runtime.domain.events import EventType, payload_from_model
 from prp_runtime.domain.models import (
+    MAX_BRIDGE_HEARTBEAT_TTL_SECONDS,
     Artifact,
     Attempt,
     ControllerAction,
@@ -78,6 +89,7 @@ from prp_runtime.domain.models import (
     GlobalVerificationReport,
     MergeLedger,
     NativeRunRequest,
+    RegisteredBridgeClient,
     Run,
     VerificationResult,
     WorkUnit,
@@ -115,7 +127,12 @@ from prp_runtime.planning.planner import (
 )
 from prp_runtime.providers.base import ModelProfile, ProviderAdapter
 from prp_runtime.runtime.agent_loop import AgentToolExecutor
-from prp_runtime.runtime.context import DependencyArtifact, build_worker_context
+from prp_runtime.runtime.context import (
+    DependencyArtifact,
+    build_worker_context,
+    select_relevant_facts,
+    static_facts_from_syntax_reports,
+)
 from prp_runtime.runtime.coordinator import (
     Coordinator,
     MergeResult,
@@ -132,25 +149,37 @@ from prp_runtime.runtime.scheduler import (
     WaveResult,
     WaveStatus,
 )
+from prp_runtime.runtime.bridge import (
+    BridgeAssignmentCoordinator,
+    syntax_facts_from_bridge_artifact,
+)
 from prp_runtime.runtime.worker import ResumeAction, Worker, WorkerResult
 from prp_runtime.settings import Settings
-from prp_runtime.storage.sqlite import SqliteStore
+from prp_runtime.storage.sqlite import MissingEntityError, SqliteStore
 from prp_runtime.verification.rules import plan_for_output
 from prp_runtime.verification.verifier import (
     GlobalCheckKind,
     RuleVerifier,
     verify_global_round,
 )
-from prp_runtime.workspace.changes import ChangeSet
+from prp_runtime.runtime.conflicts import classify_conflict
+from prp_runtime.workspace.changes import (
+    ChangeSet,
+    apply_patch_facts_to_manifest,
+    overlay_changed_file_contents,
+    validate_patch_facts_against_manifest,
+)
 from prp_runtime.workspace.merge import (
     MergeError,
     MergeStatus,
+    merge_candidate_file_contents,
     merge_candidate_manifest,
     merge_input_digest,
 )
 from prp_runtime.workspace.merge import promote_merge as promote_merge_result
 from prp_runtime.workspace.models import (
     Snapshot,
+    SnapshotEntryType,
     SnapshotStatus,
     Workspace,
     WorkspaceRootMapping,
@@ -194,6 +223,73 @@ _WORK_UNIT_EVENTS: dict[WorkUnitStatus, EventType] = {
     WorkUnitStatus.BLOCKED: EventType.WORK_UNIT_BLOCKED,
     WorkUnitStatus.INVALIDATED: EventType.WORK_UNIT_INVALIDATED,
 }
+
+
+class _DurableBridgeLiveness:
+    """Derive LIVE/OFFLINE/EXPIRED from durable client last-seen facts."""
+
+    def __init__(self, clients: tuple[RegisteredBridgeClient, ...]) -> None:
+        self._clients = {item.client_id: item for item in clients}
+        self._ttl = timedelta(seconds=MAX_BRIDGE_HEARTBEAT_TTL_SECONDS)
+
+    def bridge_client_liveness(
+        self,
+        client_id: str,
+        *,
+        fingerprint: str | None = None,
+        now: object | None = None,
+    ) -> BridgeClientLiveness:
+        client = self._clients.get(client_id)
+        if client is None or client.last_seen_at is None:
+            return BridgeClientLiveness.OFFLINE
+        if fingerprint is not None and fingerprint != client.capability_fingerprint:
+            return BridgeClientLiveness.OFFLINE
+        observed = now if isinstance(now, datetime) else utc_now()
+        if observed - client.last_seen_at > self._ttl:
+            return BridgeClientLiveness.EXPIRED
+        return BridgeClientLiveness.LIVE
+
+    async def enqueue(self, run_id: str) -> None:
+        del run_id
+
+
+
+def _bridge_artifact_matches_round(
+    artifact: Artifact,
+    *,
+    run_id: str,
+    base_snapshot_id: str | None,
+) -> bool:
+    """Accept Bridge observations only when they name this run and base snapshot."""
+    if artifact.run_id != run_id:
+        return False
+    try:
+        payload = json.loads(artifact.content)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    snapshot = payload.get("snapshot_id")
+    if base_snapshot_id is not None and snapshot not in {None, base_snapshot_id}:
+        return False
+    return True
+
+
+def _syntax_reports_from_artifacts(
+    artifacts: Sequence[Artifact],
+    *,
+    round_id: str | None = None,
+    snapshot_id: str | None = None,
+) -> tuple[object, ...]:
+    """Parse only returned artifact text. Never scan a Bridge root."""
+    return tuple(
+        syntax_facts_from_bridge_artifact(
+            artifact,
+            round_id=round_id,
+            snapshot_id=snapshot_id,
+        )
+        for artifact in artifacts
+    )
 
 
 class RunController:
@@ -277,6 +373,17 @@ class RunController:
                 or change_set.base_snapshot_id != progressive_round.base_snapshot_id
             ):
                 raise MergeError("Progressive ChangeSet lineage does not match its round")
+            try:
+                call = await self._store.get_tool_call(change_set.tool_call_id)
+                work_unit = await self._store.get_work_unit(call.work_unit_id)
+            except MissingEntityError as error:
+                raise MergeError("Progressive ChangeSet lineage does not match its round") from error
+            if (
+                call.run_id != progressive_round.run_id
+                or work_unit.run_id != progressive_round.run_id
+                or work_unit.graph_version != progressive_round.graph_version
+            ):
+                raise MergeError("Progressive ChangeSet lineage does not match its round")
             staged.append(StagedChangeSet(change_set=change_set, root=root))
 
         input_digest = merge_input_digest(
@@ -307,6 +414,7 @@ class RunController:
             if result.merged_snapshot_id is None or result.merged_content_hash is None:
                 raise MergeError("merged candidate omitted durable snapshot facts")
             manifest = merge_candidate_manifest(result.staging_root)
+            file_contents = merge_candidate_file_contents(result.staging_root, manifest)
             timestamp = utc_now()
             candidate = Snapshot(
                 snapshot_id=result.merged_snapshot_id,
@@ -319,6 +427,7 @@ class RunController:
                 candidate,
                 manifest,
                 owner_id=self._settings.service_principal,
+                file_contents=file_contents,
             )
             result = result.model_copy(
                 update={"merged_snapshot_id": persisted_snapshot.snapshot_id}
@@ -346,6 +455,124 @@ class RunController:
             )
             await self._store.update_merge_ledger(unresolved)
         return result
+
+    async def _merge_progressive_round_from_facts(
+        self,
+        planned_round: ProgressiveRound,
+        *,
+        owner_id: str,
+    ) -> MergeLedger:
+        """Merge ChangeSet facts into a candidate snapshot without a server root."""
+        if not planned_round.change_set_ids:
+            raise MergeError("Progressive round has no ChangeSets to merge")
+        snapshot = await self._store.get_snapshot(
+            planned_round.base_snapshot_id,
+            owner_id=owner_id,
+        )
+        change_sets: list[ChangeSet] = []
+        for change_set_id in planned_round.change_set_ids:
+            change_set = await self._store.get_change_set(change_set_id)
+            if (
+                change_set.run_id != planned_round.run_id
+                or change_set.workspace_id != snapshot.workspace_id
+                or change_set.base_snapshot_id != planned_round.base_snapshot_id
+            ):
+                raise MergeError("Progressive ChangeSet lineage does not match its round")
+            try:
+                call = await self._store.get_tool_call(change_set.tool_call_id)
+                work_unit = await self._store.get_work_unit(call.work_unit_id)
+            except MissingEntityError as error:
+                raise MergeError(
+                    "Progressive ChangeSet lineage does not match its round"
+                ) from error
+            if (
+                call.run_id != planned_round.run_id
+                or work_unit.run_id != planned_round.run_id
+                or work_unit.graph_version != planned_round.graph_version
+            ):
+                raise MergeError("Progressive ChangeSet lineage does not match its round")
+            change_sets.append(change_set)
+        input_digest = merge_input_digest(
+            planned_round.base_snapshot_id,
+            planned_round.change_set_ids,
+        )
+        planned = MergeLedger(
+            merge_id=new_merge_id(),
+            run_id=planned_round.run_id,
+            workspace_id=snapshot.workspace_id,
+            base_snapshot_id=planned_round.base_snapshot_id,
+            change_set_ids=planned_round.change_set_ids,
+            input_digest=input_digest,
+            status=MergeLedgerStatus.PLANNED,
+        )
+        ledger = await self._store.create_merge_ledger(planned)
+        if ledger.status is not MergeLedgerStatus.PLANNED:
+            raise MergeError("merge input already has a non-replayable lifecycle")
+        running = ledger.model_copy(update={"status": MergeLedgerStatus.RUNNING})
+        await self._store.update_merge_ledger(running)
+        for index, left in enumerate(change_sets):
+            for right in change_sets[index + 1 :]:
+                report = classify_conflict(left, right)
+                if report.conflict:
+                    unresolved = running.model_copy(
+                        update={
+                            "status": MergeLedgerStatus.CONFLICT,
+                            "completed_at": utc_now(),
+                        }
+                    )
+                    return await self._store.update_merge_ledger(unresolved)
+        try:
+            manifest = await self._store.get_snapshot_manifest(
+                planned_round.base_snapshot_id, owner_id=owner_id
+            )
+            applied = manifest
+            for change_set in change_sets:
+                validate_patch_facts_against_manifest(manifest, change_set.files)
+                applied = apply_patch_facts_to_manifest(applied, change_set.files)
+        except ValueError as error:
+            raise MergeError(str(error)) from error
+        timestamp = utc_now()
+        candidate = Snapshot(
+            snapshot_id=new_snapshot_id(),
+            workspace_id=snapshot.workspace_id,
+            status=SnapshotStatus.READY,
+            created_at=timestamp,
+            completed_at=timestamp,
+            file_count=len(applied.entries),
+            total_size=applied.total_size,
+        )
+        previous = await self._store.get_snapshot_file_contents(
+            planned_round.base_snapshot_id, owner_id=owner_id
+        )
+        contents = dict(previous)
+        for change_set in change_sets:
+            updated = await self._store.get_snapshot_file_contents(
+                change_set.new_snapshot_id, owner_id=owner_id
+            )
+            contents = overlay_changed_file_contents(
+                contents, change_set.files, updated
+            )
+        allowed = {
+            entry.path
+            for entry in applied.entries
+            if entry.entry_type is SnapshotEntryType.FILE
+        }
+        contents = {path: text for path, text in contents.items() if path in allowed}
+        persisted_snapshot = await self._store.create_snapshot(
+            candidate,
+            applied,
+            owner_id=owner_id,
+            file_contents=contents,
+        )
+        merged = running.model_copy(
+            update={
+                "status": MergeLedgerStatus.MERGED,
+                "merged_snapshot_id": persisted_snapshot.snapshot_id,
+                "merged_content_hash": applied.manifest_hash,
+                "completed_at": timestamp,
+            }
+        )
+        return await self._store.update_merge_ledger(merged)
 
     def promote_merge(self, result: MergeResult, destination: Path) -> MergeResult:
         """Promote a verified merge through the atomic workspace boundary."""
@@ -644,6 +871,17 @@ class RunController:
                 candidate_dependency_hashes.extend(
                     candidate_artifact_hashes.get(dependency_id, (None,))
                 )
+            attempt_by_id = {attempt.attempt_id: attempt for attempt in attempts}
+            artifact_attempts = {
+                artifact.attempt_id for artifact in artifacts
+            }
+            facts_are_complete = bool(artifacts) and all(
+                attempt_by_id.get(attempt_id) is not None
+                and attempt_by_id[attempt_id].status is AttemptStatus.SUCCEEDED
+                for attempt_id in artifact_attempts
+            ) and bool(evidence) and all(
+                attempt.status is AttemptStatus.SUCCEEDED for attempt in attempts
+            ) and all(row.result is VerificationResult.PASS for row in evidence)
             decision = decide_reuse(
                 source,
                 candidate,
@@ -669,28 +907,8 @@ class RunController:
                 )
                 if latest_merge is not None
                 else None,
+                historical_attempts_proven=facts_are_complete,
             )
-            attempt_by_id = {attempt.attempt_id: attempt for attempt in attempts}
-            artifact_attempts = {
-                artifact.attempt_id for artifact in artifacts
-            }
-            facts_are_complete = bool(artifacts) and all(
-                attempt_by_id.get(attempt_id) is not None
-                and attempt_by_id[attempt_id].status is AttemptStatus.SUCCEEDED
-                for attempt_id in artifact_attempts
-            ) and bool(evidence) and all(
-                attempt.status is AttemptStatus.SUCCEEDED for attempt in attempts
-            ) and all(row.result is VerificationResult.PASS for row in evidence)
-            if decision.disposition is ReuseDisposition.REUSE and not facts_are_complete:
-                decision = ReuseDecision(
-                    disposition=ReuseDisposition.RECOMPUTE,
-                    reason=ReuseReason.ATTEMPT_HISTORY_NOT_PROVEN,
-                    rationale=(
-                        "historical success has incomplete, failed, unknown, or "
-                        "non-passing attempt facts"
-                    ),
-                    lineage_key=candidate.lineage_key,
-                )
             decisions[candidate.work_unit_id] = decision
             if decision.disposition is ReuseDisposition.REUSE:
                 reuse_sources[candidate.work_unit_id] = source
@@ -956,9 +1174,10 @@ class RunController:
                 await self._cancel_planned_unit(unit)
                 return
             stored_unit = await self._store.get_work_unit(unit.work_unit_id)
-            if stored_unit.status is WorkUnitStatus.RUNNING and error.message == (
-                "tool call is awaiting approval"
-            ):
+            if stored_unit.status is WorkUnitStatus.RUNNING and error.message in {
+                "tool call is awaiting approval",
+                "tool call is awaiting bridge result",
+            }:
                 return
             await self._advance_work_unit(unit, WorkUnitStatus.FAILED, error=error)
 
@@ -1203,11 +1422,15 @@ class RunController:
         if strategy is ExecutionStrategy.PLANNED:
             assert planner is not None
             assert planned_worker is not None
-            return await self._execute_planned(run, planner, planned_worker)
+            return await self._execute_planned(
+                run, planner, planned_worker, execution_scope=execution_scope
+            )
         if strategy is ExecutionStrategy.PROGRESSIVE:
             assert planner is not None
             assert planned_worker is not None
-            return await self._execute_progressive(run, planner, planned_worker)
+            return await self._execute_progressive(
+                run, planner, planned_worker, execution_scope=execution_scope
+            )
         return await self._execute_direct(run, execution_scope=execution_scope)
 
     # --- strategy routing -------------------------------------------------------
@@ -1345,34 +1568,133 @@ class RunController:
         *,
         execution_scope: ExecutionScope | None,
     ) -> Run:
-        """Resume one direct work unit from Store-approved Agent facts."""
-        if run.strategy is not ExecutionStrategy.DIRECT:
-            return run
-        units = await self._store.list_work_units(run.run_id, graph_version=run.graph_version)
-        running_units = tuple(
-            unit for unit in units if unit.status is WorkUnitStatus.RUNNING
-        )
-        if len(running_units) != 1:
-            return run
-        work_unit = running_units[0]
-        attempts = await self._store.list_attempts(work_unit.work_unit_id)
-        if not attempts:
-            return run
-        worker = self._worker_for(ModelRole.WORKER, execution_scope=execution_scope)
-        state = await worker.load_resume_state(attempts[-1].attempt_id)
-        if state.action in (ResumeAction.WAIT, ResumeAction.BLOCK):
-            return run
-        context = build_worker_context(work_unit, instructions=run.request.instructions)
-        try:
-            result = await worker.resume(
-                run=run,
-                work_unit=work_unit,
-                context=context,
-                state=state,
+        """Resume one running work unit from Store-approved Agent facts."""
+        if run.strategy is ExecutionStrategy.DIRECT:
+            units = await self._store.list_work_units(
+                run.run_id, graph_version=run.graph_version
             )
-        except AttemptNotAllowedError:
-            return run
-        return await self._settle_direct_worker(run, work_unit, worker, result)
+            running_units = tuple(
+                unit for unit in units if unit.status is WorkUnitStatus.RUNNING
+            )
+            if len(running_units) != 1:
+                return run
+            work_unit = running_units[0]
+            attempts = await self._store.list_attempts(work_unit.work_unit_id)
+            if not attempts:
+                return run
+            worker = self._worker_for(ModelRole.WORKER, execution_scope=execution_scope)
+            state = await worker.load_resume_state(attempts[-1].attempt_id)
+            if state.action in (ResumeAction.WAIT, ResumeAction.WAIT_REMOTE, ResumeAction.BLOCK):
+                return run
+            context = build_worker_context(work_unit, instructions=run.request.instructions)
+            try:
+                result = await worker.resume(
+                    run=run,
+                    work_unit=work_unit,
+                    context=context,
+                    state=state,
+                )
+            except AttemptNotAllowedError:
+                return run
+            return await self._settle_direct_worker(run, work_unit, worker, result)
+        if run.strategy in (ExecutionStrategy.PLANNED, ExecutionStrategy.PROGRESSIVE):
+            return await self._resume_graph_run(run, execution_scope=execution_scope)
+        return run
+
+    async def _resume_graph_run(
+        self,
+        run: Run,
+        *,
+        execution_scope: ExecutionScope | None,
+    ) -> Run:
+        """Resume Planned/Progressive units, then continue the committed graph."""
+        preflight = await self._preflight_budget(run)
+        if preflight is not None:
+            return await self._finish_run(run, RunStatus.FAILED, error=preflight)
+        worker = self._worker_for(ModelRole.WORKER, execution_scope=execution_scope)
+        await self._resume_running_graph_units(
+            run, worker, execution_scope=execution_scope
+        )
+        current = await self._store.get_run(run.run_id)
+        if current.status.is_terminal or current.status is RunStatus.CANCELLING:
+            return current
+        if await self._store.list_tool_calls(
+            current.run_id,
+            statuses=[ToolCallStatus.AWAITING_APPROVAL, ToolCallStatus.RUNNING],
+        ):
+            return current
+        if run.strategy is ExecutionStrategy.PLANNED:
+            return await self._execute_planned(
+                current,
+                self._planner(),
+                worker,
+                execution_scope=execution_scope,
+                resume=True,
+            )
+        return await self._execute_progressive(
+            current,
+            self._planner(),
+            worker,
+            execution_scope=execution_scope,
+            resume=True,
+        )
+
+    async def _resume_running_graph_units(
+        self,
+        run: Run,
+        worker: Worker,
+        *,
+        execution_scope: ExecutionScope | None,
+    ) -> None:
+        """Continue RUNNING graph units that have an accepted remote result."""
+        units = await self._store.list_work_units(
+            run.run_id, graph_version=run.graph_version
+        )
+        for unit in units:
+            if unit.status is not WorkUnitStatus.RUNNING:
+                continue
+            attempts = await self._store.list_attempts(unit.work_unit_id)
+            if not attempts:
+                continue
+            state = await worker.load_resume_state(attempts[-1].attempt_id)
+            if state.action in (
+                ResumeAction.WAIT,
+                ResumeAction.WAIT_REMOTE,
+                ResumeAction.BLOCK,
+            ):
+                continue
+            source_artifacts: list[Artifact] = []
+            for dependency_id in unit.depends_on:
+                source_artifacts.extend(await self._store.list_artifacts(dependency_id))
+            context = build_worker_context(
+                unit,
+                instructions=run.request.instructions,
+                static_facts=self._static_facts_for_work_unit(unit, source_artifacts),
+            )
+            try:
+                result = await worker.resume(
+                    run=run,
+                    work_unit=unit,
+                    context=context,
+                    state=state,
+                )
+            except AttemptNotAllowedError:
+                return
+            outcome = await self._finalize_planned_work_unit(
+                run.run_id,
+                unit,
+                worker,
+                result,
+                execution_scope=execution_scope,
+            )
+            if outcome.succeeded:
+                await self._advance_work_unit(unit, WorkUnitStatus.SUCCEEDED)
+                if outcome.change_set is not None:
+                    await self._store.create_change_set(outcome.change_set)
+                continue
+            if result.paused:
+                continue
+            await self._advance_work_unit(unit, WorkUnitStatus.FAILED, error=outcome.error)
 
     async def _execute_direct(
         self, run: Run, *, execution_scope: ExecutionScope | None = None
@@ -1640,11 +1962,18 @@ class RunController:
         run: Run,
         planner: Planner,
         worker: Worker,
+        *,
+        execution_scope: ExecutionScope | None = None,
+        resume: bool = False,
     ) -> Run:
         """Plan, compile, commit, and execute one bounded graph to a terminal run."""
         preflight = await self._preflight_budget(run)
         if preflight is not None:
             return await self._finish_run(run, RunStatus.FAILED, error=preflight)
+        if resume:
+            return await self._continue_planned_waves(
+                run, worker, execution_scope=execution_scope
+            )
 
         planner_result, postflight = await self._execute_planner_propose(run, planner)
         if postflight is not None:
@@ -1714,6 +2043,7 @@ class RunController:
                 run.run_id,
                 unit,
                 worker,
+                execution_scope=execution_scope,
             )
 
         # Every dispatched wave terminalizes at least one current-graph unit.
@@ -1731,6 +2061,53 @@ class RunController:
             if current.status.is_terminal:
                 return current
 
+        error = ErrorInfo(
+            category=ErrorCategory.UNKNOWN,
+            message="planned graph did not converge within its bounded wave count",
+        )
+        return await self._finish_run(
+            await self._store.get_run(run.run_id),
+            RunStatus.FAILED,
+            error=error,
+        )
+
+    async def _continue_planned_waves(
+        self,
+        run: Run,
+        worker: Worker,
+        *,
+        execution_scope: ExecutionScope | None = None,
+    ) -> Run:
+        """Dispatch remaining committed graph waves without re-planning."""
+        units = await self._store.list_work_units(
+            run.run_id, graph_version=run.graph_version
+        )
+        scheduler = Scheduler()
+
+        async def execute_unit(unit: WorkUnit) -> WaveOutcome:
+            return await self._execute_planned_work_unit(
+                run.run_id,
+                unit,
+                worker,
+                execution_scope=execution_scope,
+            )
+
+        for _ in range(len(units) + 1):
+            await self.dispatch_planned_wave(
+                run.run_id,
+                scheduler=scheduler,
+                execute=execute_unit,
+                graph_version=run.graph_version,
+                reservation_capacity_key=worker.profile.alias,
+            )
+            current = await self._store.get_run(run.run_id)
+            if current.status.is_terminal:
+                return current
+            if await self._store.list_tool_calls(
+                current.run_id,
+                statuses=[ToolCallStatus.AWAITING_APPROVAL, ToolCallStatus.RUNNING],
+            ):
+                return current
         error = ErrorInfo(
             category=ErrorCategory.UNKNOWN,
             message="planned graph did not converge within its bounded wave count",
@@ -1776,6 +2153,8 @@ class RunController:
         run_id: str,
         work_unit: WorkUnit,
         worker: Worker,
+        *,
+        execution_scope: ExecutionScope | None = None,
     ) -> WaveOutcome:
         """Execute and deterministically verify one Controller-started graph unit."""
         run = await self._store.get_run(run_id)
@@ -1791,6 +2170,7 @@ class RunController:
             return WaveOutcome.failure(preflight)
 
         dependencies: list[DependencyArtifact] = []
+        source_artifacts: list[Artifact] = []
         for dependency_id in work_unit.depends_on:
             dependency = await self._store.get_work_unit(dependency_id)
             artifacts = await self._store.list_artifacts(dependency_id)
@@ -1804,6 +2184,7 @@ class RunController:
                         ),
                     )
                 )
+            source_artifacts.extend(artifacts)
             dependencies.extend(
                 DependencyArtifact(
                     work_unit_name=dependency.name,
@@ -1817,6 +2198,10 @@ class RunController:
             work_unit,
             instructions=run.request.instructions,
             dependencies=tuple(dependencies),
+            static_facts=self._static_facts_for_work_unit(
+                work_unit,
+                source_artifacts,
+            ),
         )
         try:
             result = await worker.execute(
@@ -1831,8 +2216,37 @@ class RunController:
                     message="run cancellation prevented planned attempt",
                 )
             )
+        return await self._finalize_planned_work_unit(
+            run_id,
+            work_unit,
+            worker,
+            result,
+            execution_scope=execution_scope,
+        )
+
+    async def _finalize_planned_work_unit(
+        self,
+        run_id: str,
+        work_unit: WorkUnit,
+        worker: Worker,
+        result: WorkerResult,
+        *,
+        execution_scope: ExecutionScope | None = None,
+    ) -> WaveOutcome:
+        """Verify one worker result without starting another provider turn."""
+        run = await self._store.get_run(run_id)
         result = await self._persist_worker_metrics(run.run_id, result, worker.profile)
         if result.paused:
+            if result.awaiting_remote_result:
+                await self._assign_bridge_pending_calls(
+                    run, work_unit, result, execution_scope=execution_scope
+                )
+                return WaveOutcome.failure(
+                    ErrorInfo(
+                        category=ErrorCategory.UNKNOWN,
+                        message="tool call is awaiting bridge result",
+                    )
+                )
             return WaveOutcome.failure(
                 ErrorInfo(
                     category=ErrorCategory.UNKNOWN,
@@ -1942,62 +2356,89 @@ class RunController:
         run: Run,
         planner: Planner,
         worker: Worker,
+        *,
+        execution_scope: ExecutionScope | None = None,
+        resume: bool = False,
     ) -> Run:
         """Execute immutable Progressive rounds until evidence or budget settles."""
         preflight = await self._preflight_budget(run)
         if preflight is not None:
             return await self._finish_run(run, RunStatus.FAILED, error=preflight)
-
-        planner_result, postflight = await self._execute_planner_propose(run, planner)
-        if postflight is not None:
-            return await self._finish_run(
-                await self._store.get_run(run.run_id),
-                RunStatus.FAILED,
-                error=postflight,
-            )
-        current = await self._store.get_run(run.run_id)
-        if current.status is RunStatus.CANCELLING:
-            return await self._finish_run(current, RunStatus.CANCELLED)
-        target_graph_version = run.graph_version + 1
-        proposal: PlanProposal | PlanRejection
-        if planner_result.rejection is not None:
-            proposal = planner_result.rejection
+        if resume:
+            current = await self._store.get_run(run.run_id)
+            if current.status is RunStatus.CANCELLING:
+                return await self._finish_run(current, RunStatus.CANCELLED)
+            target_graph_version = current.graph_version
+            if self._is_bridge_run(run):
+                if execution_scope is None:
+                    raise StateError(
+                        "BRIDGE Progressive requires an authenticated execution scope"
+                    )
+                workspace_id = execution_scope.workspace_id
+                base_snapshot_id = await self._bridge_resume_base_snapshot_id(
+                    execution_scope, run
+                )
+            else:
+                workspace_id, base_snapshot_id = await self._existing_progressive_base(run)
         else:
-            assert isinstance(planner_result.proposal, PlanProposal)
-            proposal = planner_result.proposal
-        compiled = (
-            proposal
-            if isinstance(proposal, PlanRejection)
-            else compile_plan(
-                proposal,
-                run_id=run.run_id,
-                graph_version=target_graph_version,
+            planner_result, postflight = await self._execute_planner_propose(run, planner)
+            if postflight is not None:
+                return await self._finish_run(
+                    await self._store.get_run(run.run_id),
+                    RunStatus.FAILED,
+                    error=postflight,
+                )
+            current = await self._store.get_run(run.run_id)
+            if current.status is RunStatus.CANCELLING:
+                return await self._finish_run(current, RunStatus.CANCELLED)
+            target_graph_version = run.graph_version + 1
+            proposal: PlanProposal | PlanRejection
+            if planner_result.rejection is not None:
+                proposal = planner_result.rejection
+            else:
+                assert isinstance(planner_result.proposal, PlanProposal)
+                proposal = planner_result.proposal
+            compiled = (
+                proposal
+                if isinstance(proposal, PlanRejection)
+                else compile_plan(
+                    proposal,
+                    run_id=run.run_id,
+                    graph_version=target_graph_version,
+                )
             )
-        )
-        committed = await self.commit_plan(
-            run.run_id,
-            compiled,
-            target_graph_version=target_graph_version,
-        )
-        if isinstance(committed, PlanRejection):
-            error = ErrorInfo(
-                category=ErrorCategory.UNKNOWN,
-                message=f"{committed.summary}: " + "; ".join(committed.reasons),
+            committed = await self.commit_plan(
+                run.run_id,
+                compiled,
+                target_graph_version=target_graph_version,
             )
-            return await self._finish_run(
-                await self._store.get_run(run.run_id),
-                RunStatus.FAILED,
-                error=error,
-            )
+            if isinstance(committed, PlanRejection):
+                error = ErrorInfo(
+                    category=ErrorCategory.UNKNOWN,
+                    message=f"{committed.summary}: " + "; ".join(committed.reasons),
+                )
+                return await self._finish_run(
+                    await self._store.get_run(run.run_id),
+                    RunStatus.FAILED,
+                    error=error,
+                )
 
-        workspace_id = await self._create_progressive_workspace(run)
-        base_snapshot_id = await self._create_progressive_snapshot(
-            run,
-            workspace_id=workspace_id,
-            round_index=0,
-            graph_version=target_graph_version,
-            kind="base",
-        )
+            if self._is_bridge_run(run):
+                if execution_scope is None:
+                    raise StateError(
+                        "BRIDGE Progressive requires an authenticated execution scope"
+                    )
+                workspace_id = execution_scope.workspace_id
+                base_snapshot_id = await self._bridge_published_snapshot_id(execution_scope)
+            else:
+                workspace_id = await self._create_progressive_workspace(run)
+                base_snapshot_id = await self._create_progressive_snapshot(
+                    run,
+                    workspace_id=workspace_id,
+                    round_index=0,
+                    graph_version=target_graph_version,
+                    kind="base",
+                )
         scheduler = Scheduler()
         revision_count = 0
         round_index = 0
@@ -2072,7 +2513,7 @@ class RunController:
                     run.run_id,
                     scheduler=scheduler,
                     execute=lambda unit: self._execute_planned_work_unit(
-                        run.run_id, unit, worker
+                        run.run_id, unit, worker, execution_scope=execution_scope
                     ),
                     graph_version=current.graph_version,
                     max_concurrency=wave_capacity,
@@ -2117,6 +2558,11 @@ class RunController:
                     statuses=[ToolCallStatus.AWAITING_APPROVAL],
                 ):
                     return current
+                if self._is_bridge_run(run) and await self._store.list_tool_calls(
+                    run.run_id,
+                    statuses=[ToolCallStatus.RUNNING],
+                ):
+                    return current
                 graph = await self._store.list_work_units(
                     run.run_id, graph_version=current.graph_version
                 )
@@ -2151,6 +2597,12 @@ class RunController:
             graph = await self._store.list_work_units(
                 run.run_id, graph_version=current.graph_version
             )
+            round_change_set_ids = await self._collect_round_change_set_ids(
+                run.run_id,
+                graph,
+                base_snapshot_id=base_snapshot_id,
+                collected_ids=tuple(round_change_set_ids),
+            )
             failure_error: ErrorInfo | None
             planned_round: ProgressiveRound | None = None
             all_units_succeeded = all(
@@ -2174,36 +2626,30 @@ class RunController:
                     predecessor_round_id=predecessor_round_id,
                     revision_reason=revision_reason,
                 )
-                if self._progressive_merge_roots is None:
-                    failure_error = ErrorInfo(
-                        category=ErrorCategory.UNKNOWN,
-                        message="Progressive merge roots are not available",
-                    )
-                    await self._store.update_round(
-                        planned_round.model_copy(
-                            update={
-                                "status": RoundStatus.FAILED,
-                                "failure_reason": failure_error.message,
-                                "completed_at": utc_now(),
-                            }
-                        )
-                    )
-                    return await self._finish_run(
-                        await self._store.get_run(run.run_id),
-                        RunStatus.FAILED,
-                        error=failure_error,
-                    )
+                fact_merge_ledger: MergeLedger | None = None
+                merge_result: MergeResult | None = None
                 try:
-                    base_root, staged_roots, staging_root = (
-                        await self._progressive_merge_roots(planned_round)
-                    )
-                    merge_result = await self.merge_progressive_round(
-                        planned_round.round_id,
-                        base_root=base_root,
-                        staged_roots=staged_roots,
-                        staging_root=staging_root,
-                        verify=None,
-                    )
+                    if self._progressive_merge_roots is None:
+                        owner_id = (
+                            execution_scope.principal_id
+                            if execution_scope is not None
+                            else self._settings.service_principal
+                        )
+                        fact_merge_ledger = await self._merge_progressive_round_from_facts(
+                            planned_round,
+                            owner_id=owner_id,
+                        )
+                    else:
+                        base_root, staged_roots, staging_root = (
+                            await self._progressive_merge_roots(planned_round)
+                        )
+                        merge_result = await self.merge_progressive_round(
+                            planned_round.round_id,
+                            base_root=base_root,
+                            staged_roots=staged_roots,
+                            staging_root=staging_root,
+                            verify=None,
+                        )
                 except Exception:
                     failure_error = ErrorInfo(
                         category=ErrorCategory.UNKNOWN,
@@ -2223,8 +2669,34 @@ class RunController:
                         RunStatus.FAILED,
                         error=failure_error,
                     )
-                if (
-                    merge_result.status is not MergeStatus.MERGED
+                if fact_merge_ledger is not None:
+                    if (
+                        fact_merge_ledger.status is not MergeLedgerStatus.MERGED
+                        or fact_merge_ledger.merged_snapshot_id is None
+                        or fact_merge_ledger.merged_content_hash is None
+                    ):
+                        failure_error = ErrorInfo(
+                            category=ErrorCategory.UNKNOWN,
+                            message="Progressive merge did not produce a merged candidate",
+                        )
+                        await self._store.update_round(
+                            planned_round.model_copy(
+                                update={
+                                    "status": RoundStatus.FAILED,
+                                    "failure_reason": failure_error.message,
+                                    "completed_at": utc_now(),
+                                }
+                            )
+                        )
+                        return await self._finish_run(
+                            await self._store.get_run(run.run_id),
+                            RunStatus.FAILED,
+                            error=failure_error,
+                        )
+                    candidate_snapshot_id = fact_merge_ledger.merged_snapshot_id
+                elif (
+                    merge_result is None
+                    or merge_result.status is not MergeStatus.MERGED
                     or merge_result.merged_snapshot_id is None
                 ):
                     failure_error = ErrorInfo(
@@ -2245,7 +2717,8 @@ class RunController:
                         RunStatus.FAILED,
                         error=failure_error,
                     )
-                candidate_snapshot_id = merge_result.merged_snapshot_id
+                else:
+                    candidate_snapshot_id = merge_result.merged_snapshot_id
                 report = await self._progressive_global_report(
                     run,
                     current,
@@ -2267,36 +2740,30 @@ class RunController:
                 )
                 if report.result is VerificationResult.PASS:
                     try:
-                        promoted = self.promote_merge(
-                            merge_result.model_copy(update={"verified": True}),
-                            merge_result.staging_root.with_name(
-                                f"{merge_result.staging_root.name}.promoted-"
-                                f"{candidate_snapshot_id}"
-                            ),
-                        )
-                    except MergeError:
+                        if fact_merge_ledger is not None:
+                            promoted_ledger = await self._store.mark_merge_promoted(
+                                fact_merge_ledger.merge_id,
+                                fact_merge_ledger.merged_content_hash,
+                            )
+                            promoted_snapshot_id = promoted_ledger.merged_snapshot_id
+                        else:
+                            assert merge_result is not None
+                            promoted = self.promote_merge(
+                                merge_result.model_copy(update={"verified": True}),
+                                merge_result.staging_root.with_name(
+                                    f"{merge_result.staging_root.name}.promoted-"
+                                    f"{candidate_snapshot_id}"
+                                ),
+                            )
+                            if not promoted.promoted:
+                                raise MergeError(
+                                    "Progressive candidate promotion was not confirmed"
+                                )
+                            promoted_snapshot_id = promoted.merged_snapshot_id
+                    except (MergeError, StateError):
                         failure_error = ErrorInfo(
                             category=ErrorCategory.UNKNOWN,
                             message="Progressive candidate promotion failed",
-                        )
-                        await self._store.update_round(
-                            planned_round.model_copy(
-                                update={
-                                    "status": RoundStatus.FAILED,
-                                    "failure_reason": failure_error.message,
-                                    "completed_at": utc_now(),
-                                }
-                            )
-                        )
-                        return await self._finish_run(
-                            await self._store.get_run(run.run_id),
-                            RunStatus.FAILED,
-                            error=failure_error,
-                        )
-                    if not promoted.promoted:
-                        failure_error = ErrorInfo(
-                            category=ErrorCategory.UNKNOWN,
-                            message="Progressive candidate promotion was not confirmed",
                         )
                         await self._store.update_round(
                             planned_round.model_copy(
@@ -2316,7 +2783,7 @@ class RunController:
                         planned_round.model_copy(
                             update={
                                 "status": RoundStatus.VERIFIED,
-                                "merged_snapshot_id": promoted.merged_snapshot_id,
+                                "merged_snapshot_id": promoted_snapshot_id,
                                 "evidence_ids": report.evidence_ids,
                                 "completed_at": utc_now(),
                             }
@@ -2544,6 +3011,97 @@ class RunController:
                 ),
             )
 
+    @staticmethod
+    def _is_bridge_run(run: Run) -> bool:
+        return run.request.agent_options.execution_location is ExecutionLocation.BRIDGE
+
+    async def _existing_progressive_base(self, run: Run) -> tuple[str, str]:
+        """Restore the server-owned Progressive workspace created on first dispatch."""
+        alias = f"progressive-{run.run_id.removeprefix('run_')}"
+        workspaces = await self._store.list_workspaces(
+            owner_id=self._settings.service_principal
+        )
+        matched = tuple(item for item in workspaces if item.alias == alias)
+        if len(matched) != 1:
+            raise StateError("Progressive workspace is not available to resume")
+        snapshots = await self._store.list_snapshots(
+            matched[0].workspace_id, owner_id=self._settings.service_principal
+        )
+        ready = tuple(
+            snapshot for snapshot in snapshots if snapshot.status is SnapshotStatus.READY
+        )
+        if not ready:
+            raise StateError("Progressive base snapshot is not available to resume")
+        return matched[0].workspace_id, ready[0].snapshot_id
+
+    async def _bridge_published_snapshot_id(self, scope: ExecutionScope) -> str:
+        """Use the published client snapshot; never scan a server temporary root."""
+        snapshots = await self._store.list_snapshots(
+            scope.workspace_id, owner_id=scope.principal_id
+        )
+        ready = tuple(
+            snapshot for snapshot in snapshots if snapshot.status is SnapshotStatus.READY
+        )
+        if not ready:
+            raise StateError("BRIDGE Progressive requires a published client snapshot")
+        return ready[-1].snapshot_id
+
+    async def _bridge_resume_base_snapshot_id(
+        self, scope: ExecutionScope, run: Run
+    ) -> str:
+        """Keep the round base; do not follow snapshots created by Bridge results."""
+        rounds = await self._store.list_progressive_rounds(run.run_id)
+        for planned in rounds:
+            if planned.base_snapshot_id:
+                return planned.base_snapshot_id
+        calls = await self._store.list_tool_calls(run.run_id)
+        for call in calls:
+            if call.snapshot_id:
+                return call.snapshot_id
+        snapshots = await self._store.list_snapshots(
+            scope.workspace_id, owner_id=scope.principal_id
+        )
+        ready = tuple(
+            snapshot for snapshot in snapshots if snapshot.status is SnapshotStatus.READY
+        )
+        if not ready:
+            raise StateError("BRIDGE Progressive requires a published client snapshot")
+        return ready[0].snapshot_id
+
+    async def _assign_bridge_pending_calls(
+        self,
+        run: Run,
+        work_unit: WorkUnit,
+        result: WorkerResult,
+        *,
+        execution_scope: ExecutionScope | None,
+    ) -> None:
+        """Persist one server-selected claim for each pending remote call."""
+        if execution_scope is None:
+            raise StateError("BRIDGE assignment requires an authenticated execution scope")
+        pending_calls = await self._store.list_tool_calls(
+            run.run_id,
+            work_unit_id=work_unit.work_unit_id,
+            statuses=[ToolCallStatus.RUNNING],
+        )
+        if result.pending_call_ids and not pending_calls:
+            raise StateError("BRIDGE remote wait has no persisted running tool call")
+        clients = await self._store.list_bridge_clients(
+            principal_id=execution_scope.principal_id,
+            workspace_id=execution_scope.workspace_id,
+        )
+        coordinator = BridgeAssignmentCoordinator(
+            self._store, _DurableBridgeLiveness(clients)
+        )
+        for call in pending_calls:
+            await coordinator.assign_for_call(
+                call,
+                principal_id=execution_scope.principal_id,
+                workspace_id=execution_scope.workspace_id,
+                session_id=execution_scope.session_id,
+                idempotency_key=f"assign:{call.call_id}",
+            )
+
     async def _create_progressive_workspace(self, run: Run) -> str:
         """Create a server-owned ledger workspace for text-only rounds."""
         workspace = Workspace(
@@ -2599,7 +3157,7 @@ class RunController:
                 workspace,
                 owner_id=self._settings.service_principal,
             ) as resolved:
-                manifest = resolved.snapshot_manifest()
+                manifest, file_contents = resolved.backend.capture_snapshot()
         timestamp = utc_now()
         snapshot = Snapshot(
             snapshot_id=new_snapshot_id(),
@@ -2612,6 +3170,7 @@ class RunController:
             snapshot,
             manifest,
             owner_id=self._settings.service_principal,
+            file_contents=file_contents,
         )
         return persisted.snapshot_id
 
@@ -2665,6 +3224,22 @@ class RunController:
                 evidence_ids.append(evidence.evidence_id)
         return tuple(evidence_ids)
 
+    def _static_facts_for_work_unit(
+        self,
+        work_unit: WorkUnit,
+        artifacts: Sequence[Artifact],
+        *,
+        round_id: str | None = None,
+    ) -> tuple[object, ...]:
+        """Select bounded AST facts from declared inputs of one work unit."""
+        reports = _syntax_reports_from_artifacts(artifacts, round_id=round_id)
+        return select_relevant_facts(
+            static_facts_from_syntax_reports(reports),
+            work_unit_id=work_unit.work_unit_id,
+            related_work_unit_ids=tuple(work_unit.depends_on),
+            round_id=round_id,
+        )
+
     async def _progressive_global_report(
         self,
         run: Run,
@@ -2677,20 +3252,39 @@ class RunController:
         change_set_ids: Sequence[str] = (),
     ) -> GlobalVerificationReport:
         """Build a fresh current-round verdict from candidate-bound facts."""
-        final_artifacts: tuple[Artifact, ...] = ()
-        if current.final_work_unit_id is not None:
-            final_artifacts = await self._store.list_artifacts(
-                current.final_work_unit_id
-            )
-
+        artifacts: list[Artifact] = []
         evidence: list[Evidence] = []
-        if current.final_work_unit_id is not None:
-            evidence.extend(
-                await self._store.list_evidence(current.final_work_unit_id)
-            )
+        seen_artifact_ids: set[str] = set()
+        seen_evidence_ids: set[str] = set()
+        for unit in graph:
+            for artifact in await self._store.list_artifacts(unit.work_unit_id):
+                if artifact.artifact_id in seen_artifact_ids:
+                    continue
+                if artifact.name == "bridge-result" and not _bridge_artifact_matches_round(
+                    artifact,
+                    run_id=run.run_id,
+                    base_snapshot_id=base_snapshot_id,
+                ):
+                    continue
+                seen_artifact_ids.add(artifact.artifact_id)
+                artifacts.append(artifact)
+            for row in await self._store.list_evidence(unit.work_unit_id):
+                if row.evidence_id in seen_evidence_ids:
+                    continue
+                if row.artifact_id not in seen_artifact_ids:
+                    continue
+                seen_evidence_ids.add(row.evidence_id)
+                evidence.append(row)
+        final_artifacts = tuple(artifacts)
 
+        collected_ids = await self._collect_round_change_set_ids(
+            run.run_id,
+            graph,
+            base_snapshot_id=base_snapshot_id,
+            collected_ids=tuple(change_set_ids),
+        )
         change_sets: list[ChangeSet] = []
-        for change_set_id in change_set_ids:
+        for change_set_id in collected_ids:
             change_sets.append(await self._store.get_change_set(change_set_id))
         required_checks = [
             GlobalCheckKind.FINAL_ARTIFACT,
@@ -2698,11 +3292,16 @@ class RunController:
         ]
         if candidate_snapshot_id is not None:
             required_checks.append(GlobalCheckKind.CANDIDATE)
-            if change_set_ids:
+            if collected_ids:
                 required_checks.append(GlobalCheckKind.CHANGE_SET)
 
         attempt_count = len(await self._store.list_run_attempts(run.run_id))
         metrics = current.metrics
+        syntax_reports = _syntax_reports_from_artifacts(
+            final_artifacts,
+            round_id=round_id,
+            snapshot_id=base_snapshot_id,
+        )
         return verify_global_round(
             run_id=run.run_id,
             graph_version=current.graph_version,
@@ -2710,6 +3309,7 @@ class RunController:
             final_artifacts=final_artifacts,
             evidence=tuple(evidence),
             change_sets=tuple(change_sets),
+            syntax_reports=syntax_reports,
             budget=current.request.budget,
             usage=metrics.usage,
             metrics=metrics,
@@ -2719,6 +3319,42 @@ class RunController:
             candidate_snapshot_id=candidate_snapshot_id,
             required_checks=tuple(required_checks),
         )
+
+    async def _collect_round_change_set_ids(
+        self,
+        run_id: str,
+        graph: tuple[WorkUnit, ...],
+        *,
+        base_snapshot_id: str | None,
+        collected_ids: Sequence[str] = (),
+    ) -> list[str]:
+        """Keep only ChangeSets bound to this run, graph and base snapshot."""
+        ordered: list[str] = []
+        seen: set[str] = set()
+        unit_ids = {unit.work_unit_id for unit in graph}
+        for change_set_id in collected_ids:
+            if change_set_id in seen:
+                continue
+            ordered.append(change_set_id)
+            seen.add(change_set_id)
+        persisted = await self._store.list_change_sets(run_id=run_id)
+        for change_set in persisted:
+            if change_set.change_set_id in seen:
+                continue
+            if (
+                base_snapshot_id is not None
+                and change_set.base_snapshot_id != base_snapshot_id
+            ):
+                continue
+            try:
+                call = await self._store.get_tool_call(change_set.tool_call_id)
+            except MissingEntityError:
+                continue
+            if call.run_id != run_id or call.work_unit_id not in unit_ids:
+                continue
+            ordered.append(change_set.change_set_id)
+            seen.add(change_set.change_set_id)
+        return ordered
 
     async def _record_progressive_verification(
         self,
@@ -2773,6 +3409,11 @@ class RunController:
             for unit in graph
             if unit.status is WorkUnitStatus.FAILED
         }
+        blocked_ids = {
+            unit.work_unit_id
+            for unit in graph
+            if unit.status is WorkUnitStatus.BLOCKED
+        }
         evidence_results: list[VerificationResult] = []
         for work_unit_id in failed_ids:
             evidence_results.extend(
@@ -2788,8 +3429,8 @@ class RunController:
                 result = VerificationResult.PASS
             error = await self._failure_event_error(run_id, failed_ids)
             return result, error
-        error = await self._failure_event_error(run_id, failed_ids)
-        if error is None and any(unit.status is WorkUnitStatus.BLOCKED for unit in graph):
+        error = await self._failure_event_error(run_id, failed_ids | blocked_ids)
+        if error is None and blocked_ids:
             error = ErrorInfo(
                 category=ErrorCategory.UNKNOWN,
                 message="the current Progressive graph contains blocked work",
@@ -2800,11 +3441,17 @@ class RunController:
         self, run_id: str, work_unit_ids: set[str]
     ) -> ErrorInfo | None:
         for event in reversed(await self._store.list_events(run_id)):
-            if event.event_type is not EventType.WORK_UNIT_FAILED:
+            if event.event_type not in {
+                EventType.WORK_UNIT_FAILED,
+                EventType.WORK_UNIT_BLOCKED,
+            }:
                 continue
             if event.payload.get("work_unit_id") not in work_unit_ids:
                 continue
-            return ErrorInfo.model_validate(event.payload["error"])
+            raw_error = event.payload.get("error")
+            if raw_error is None:
+                continue
+            return ErrorInfo.model_validate(raw_error)
         return None
 
     async def _finish_progressive_stop(
@@ -3214,9 +3861,27 @@ class RunController:
             )
         return Planner(adapter, profile)
 
+    def _role_decision(self, facts: RoleFacts) -> RoleDecision:
+        """Select a server-owned role. Client payloads never choose the model."""
+        return route_role(facts)
+
+    def _profile_for_role_decision(self, decision: RoleDecision) -> ModelProfile | None:
+        """Return a role-specific profile, or None for a deterministic bypass.
+
+        Analyzer/Verifier never fall back to the Worker profile.
+        """
+        if decision.deterministic or decision.role is None:
+            return None
+        return self._settings.require_profile(decision.role)
+
     def _worker_for(
         self, role: ModelRole, *, execution_scope: ExecutionScope | None = None
     ) -> Worker:
+        if role is not ModelRole.WORKER:
+            raise ProviderError(
+                f"{role.value} cannot be dispatched through the Worker contract",
+                code=ErrorCode.PROVIDER_NOT_CONFIGURED,
+            )
         profile = self._settings.require_profile(role)
         return self._worker_for_profile(profile, execution_scope=execution_scope)
 
@@ -3246,29 +3911,39 @@ class RunController:
 
     # --- budget helpers ---------------------------------------------------------
 
-    async def _preflight_budget(self, run: Run) -> ErrorInfo | None:
-        """Check deadline, attempts, and reached tokens before provider dispatch."""
+    async def _preflight_budget(
+        self,
+        run: Run,
+        *,
+        profile: ModelProfile | None = None,
+        deterministic: bool = False,
+        declared_input_tokens: int | None = None,
+        declared_output_tokens: int | None = None,
+    ) -> ErrorInfo | None:
+        """Check role ceilings before provider dispatch.
+
+        Deterministic Analyzer/Verifier work returns immediately without
+        fabricating usage or holding a provider reservation.
+        """
+        if deterministic:
+            return None
         budget = run.request.budget
-        now = utc_now()
-
-        deadline_decision = check_deadline(budget, now)
-        if not deadline_decision.allowed:
-            assert deadline_decision.error is not None
-            return await self._record_budget_stop(run, deadline_decision.error)
-
-        attempts = await self._store.list_run_attempts(run.run_id)
-        attempt_decision = check_attempt_budget(budget, attempt_count=len(attempts))
-        if not attempt_decision.allowed:
-            assert attempt_decision.error is not None
-            return await self._record_budget_stop(run, attempt_decision.error)
-
-        token_decision = check_token_budget_preflight(
-            budget, await self._store.get_run_usage(run.run_id)
+        decision = check_role_dispatch(
+            budget,
+            await self._store.get_run_usage(run.run_id),
+            attempt_count=len(await self._store.list_run_attempts(run.run_id)),
+            now=utc_now(),
+            context_window_tokens=(
+                None if profile is None else profile.context_window_tokens
+            ),
+            max_output_tokens=None if profile is None else profile.max_output_tokens,
+            declared_input_tokens=declared_input_tokens,
+            declared_output_tokens=declared_output_tokens,
+            timeout_seconds=None if profile is None else profile.timeout_seconds,
         )
-        if not token_decision.allowed:
-            assert token_decision.error is not None
-            return await self._record_budget_stop(run, token_decision.error)
-
+        if not decision.allowed:
+            assert decision.error is not None
+            return await self._record_budget_stop(run, decision.error)
         return None
 
     async def _preflight_budget_with_reservations(

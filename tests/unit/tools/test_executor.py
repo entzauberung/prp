@@ -7,7 +7,8 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from prp_runtime.domain.enums import AgentMode, ToolCallStatus, ToolEffect
+from prp_runtime.domain.enums import AgentMode, ExecutionLocation, ToolCallStatus, ToolEffect
+from prp_runtime.domain.events import payload_from_remote_assignment
 from prp_runtime.domain.models import ErrorCategory
 from prp_runtime.domain.values import (
     new_run_id,
@@ -15,21 +16,21 @@ from prp_runtime.domain.values import (
     new_tool_call_id,
     new_work_unit_id,
 )
-from prp_runtime.policy.engine import PolicyOutcome, PolicyReasonCode
-from prp_runtime.policy.models import CommandClass
-from prp_runtime.tools import (
-    ExecutionContext,
-    ToolDefinition,
-    ToolExecutionOutcome,
-    ToolExecutor,
-    ToolRegistry,
-)
 from prp_runtime.tools.command import (
     CommandInvocation,
     CommandResult,
     build_targeted_test_definition,
 )
+from prp_runtime.policy.engine import PolicyOutcome, PolicyReasonCode
+from prp_runtime.policy.models import CommandClass
+from prp_runtime.tools.executor import (
+    ExecutionContext,
+    ToolExecutionOutcome,
+    ToolExecutor,
+    uses_in_process_tool_settlement,
+)
 from prp_runtime.tools.models import ToolCall, ToolResult
+from prp_runtime.tools.registry import ToolDefinition, ToolRegistry
 
 
 class Arguments(BaseModel):
@@ -348,3 +349,63 @@ async def test_plan_denies_targeted_command_before_runner_spawn() -> None:
     assert outcome.result is not None
     assert outcome.result.status is ToolCallStatus.REJECTED
     assert store.transitions == [ToolCallStatus.REQUESTED, ToolCallStatus.REJECTED]
+
+
+@pytest.mark.asyncio
+async def test_cloud_and_local_still_invoke_registered_handler() -> None:
+    for location in (ExecutionLocation.CLOUD, ExecutionLocation.LOCAL):
+        calls = 0
+
+        async def handler(context: ExecutionContext) -> dict[str, object]:
+            del context
+            nonlocal calls
+            calls += 1
+            return {"ok": True}
+
+        outcome = await ToolExecutor(
+            ToolRegistry((definition(handler),)), FakeStore()
+        ).execute(
+            make_call(),
+            AgentMode.AUTO,
+            workspace_id="ws-test",
+            execution_location=location,
+        )
+        assert uses_in_process_tool_settlement(location) is True
+        assert calls == 1
+        assert outcome.result is not None
+        assert outcome.result.status is ToolCallStatus.SUCCEEDED
+        assert outcome.assignment is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_persists_remote_assignment_without_invoking_handler() -> None:
+    calls = 0
+
+    async def sentinel(context: ExecutionContext) -> dict[str, object]:
+        del context
+        nonlocal calls
+        calls += 1
+        raise AssertionError("server handler must not run for BRIDGE")
+
+    store = FakeStore()
+    outcome = await ToolExecutor(ToolRegistry((definition(sentinel),)), store).execute(
+        make_call(),
+        AgentMode.AUTO,
+        workspace_id="ws-test",
+        execution_location=ExecutionLocation.BRIDGE,
+    )
+    assert uses_in_process_tool_settlement(ExecutionLocation.BRIDGE) is False
+    assert calls == 0
+    assert outcome.result is None
+    assert outcome.call.status is ToolCallStatus.RUNNING
+    assert outcome.assignment is not None
+    payload = payload_from_remote_assignment(outcome.assignment)
+    dumped = outcome.assignment.model_dump(mode="json")
+    assert payload["call_id"] == outcome.call.call_id
+    assert payload["workspace_id"] == "ws-test"
+    assert payload["status"] == ToolCallStatus.RUNNING.value
+    assert "root" not in dumped
+    assert "provider" not in dumped
+    assert "workspace_root" not in dumped
+    assert "server_root" not in dumped
+    assert store.transitions == [ToolCallStatus.REQUESTED, ToolCallStatus.RUNNING]

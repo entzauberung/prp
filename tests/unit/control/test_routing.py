@@ -2,15 +2,19 @@
 
 import pytest
 
+from pydantic import ValidationError
+
 from prp_runtime.control.routing import (
+    RoleFacts,
     RouteRejectionCode,
     RoutingFacts,
     StrategyDecision,
     escalate,
     facts_from_request,
     route,
+    route_role,
 )
-from prp_runtime.domain.enums import ExecutionStrategy, RoutingPolicy
+from prp_runtime.domain.enums import ExecutionStrategy, ModelRole, RoutingPolicy
 from prp_runtime.domain.models import Budget, NativeRunRequest, RoutingIntent
 
 
@@ -181,3 +185,35 @@ def test_auto_never_downgrades_a_stronger_current_strategy() -> None:
         strategy=ExecutionStrategy.PROGRESSIVE,
         reason="AUTO retains PROGRESSIVE; no stronger control is required",
     )
+
+
+def test_server_role_routing_selects_first_class_roles_or_deterministic_bypass() -> None:
+    assert route_role(RoleFacts(planning=True)).role is ModelRole.PLANNER
+    assert route_role(RoleFacts(work=True)).role is ModelRole.WORKER
+    analyzer = route_role(RoleFacts(analysis=True))
+    assert analyzer.role is ModelRole.ANALYZER
+    assert analyzer.deterministic is False
+    verifier = route_role(RoleFacts(verification=True))
+    assert verifier.role is ModelRole.VERIFIER
+    bypass = route_role(RoleFacts(analysis=True, deterministic_analysis=True))
+    assert bypass.role is None
+    assert bypass.deterministic is True
+    assert route_role(RoleFacts(verification=True, deterministic_verification=True)).deterministic is True
+
+
+def test_role_facts_reject_client_shaped_or_ambiguous_input() -> None:
+    with pytest.raises(ValidationError):
+        RoleFacts()
+    with pytest.raises(ValidationError):
+        RoleFacts(planning=True, work=True)
+    with pytest.raises(ValidationError):
+        RoleFacts(work=True, deterministic_analysis=True)
+    with pytest.raises(ValidationError):
+        RoutingIntent.model_validate({"requires_plan": True, "role": "VERIFIER"})
+    with pytest.raises(ValidationError):
+        RoutingIntent.model_validate({"provider": "openai", "api_key": "secret"})
+    public = request(routing=RoutingIntent(requires_plan=True))
+    dumped = public.model_dump()
+    assert "api_key" not in dumped
+    assert "base_url" not in dumped
+    assert "role" not in dumped["routing"]

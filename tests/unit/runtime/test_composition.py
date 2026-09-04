@@ -128,3 +128,28 @@ async def test_composition_open_failure_closes_owned_store(
     assert adapter.close_calls == 0
     with pytest.raises(RuntimeError, match="closed"):
         await composition.open()
+
+
+@pytest.mark.asyncio
+async def test_bridge_composition_open_does_not_resolve_server_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("BRIDGE composition must not resolve a server root")
+
+    monkeypatch.setattr(
+        "prp_runtime.runtime.tooling.WorkspaceResolver.resolve", boom
+    )
+    composition = RuntimeComposition(
+        Settings(database_path=tmp_path / "bridge.db"),
+        adapters={"worker": FakeAdapter()},
+        execution_location=ExecutionLocation.BRIDGE,
+    )
+    await composition.open()
+    try:
+        facts = composition.public_facts()
+        assert facts["execution_location"] == ExecutionLocation.BRIDGE.value
+        assert composition.tool_runtime_provider is not None
+        assert composition.tool_runtime_provider._resolver is None
+    finally:
+        await composition.close()

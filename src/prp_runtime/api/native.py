@@ -131,7 +131,7 @@ def _resolve_cursor(last_event_id: str | None, after: int | None) -> int:
         raise DomainValidationError(
             "the event cursor must not be negative",
             code=ErrorCode.INVALID_REQUEST,
-            field="after",
+            field="Last-Event-ID" if last_event_id is not None else "after",
         )
     return resolved
 

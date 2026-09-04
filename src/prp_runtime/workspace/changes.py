@@ -3,22 +3,31 @@
 import hashlib
 import re
 from enum import StrEnum, unique
+from collections.abc import Mapping
 from typing import Annotated
 from uuid import uuid4
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from prp_runtime.domain.models import DomainModel
 from prp_runtime.domain.values import RunId, SnapshotId, ToolCallId, UtcTimestamp, WorkspaceId
+from prp_runtime.workspace.models import SnapshotEntry, SnapshotEntryType, SnapshotManifest
 
 __all__ = [
+    "BRIDGE_RESULT_SELF_ASSERTION_KEYS",
     "ChangeSet",
     "ChangeSetId",
     "FileChange",
     "FileChangeAction",
     "FileContent",
     "Patch",
+    "apply_patch_facts_to_manifest",
+    "assert_bridge_result_is_not_self_asserted",
+    "inherit_unchanged_file_contents",
+    "overlay_changed_file_contents",
     "new_change_set_id",
+    "parse_bridge_patch_facts",
+    "validate_patch_facts_against_manifest",
 ]
 
 MAX_PATCH_BYTES = 262_144
@@ -148,3 +157,140 @@ class ChangeSet(DomainModel):
 def new_change_set_id() -> str:
     """Generate one opaque ChangeSet identity without encoding host details."""
     return f"cs_{uuid4().hex}"
+
+
+BRIDGE_RESULT_SELF_ASSERTION_KEYS = frozenset(
+    {
+        "accepted",
+        "promoted",
+        "candidate_accepted",
+        "merge_status",
+    }
+)
+
+
+def assert_bridge_result_is_not_self_asserted(
+    payload: Mapping[str, object] | None,
+) -> None:
+    """Reject client or model claims that a candidate or ChangeSet is accepted."""
+    if not payload:
+        return
+    claimed = sorted(key for key in BRIDGE_RESULT_SELF_ASSERTION_KEYS if key in payload)
+    if claimed:
+        raise ValueError(
+            "client self-assertion cannot create an accepted candidate or ChangeSet"
+        )
+
+
+def parse_bridge_patch_facts(
+    payload: Mapping[str, object] | None,
+) -> tuple[Patch, tuple[FileChange, ...]] | None:
+    """Return base-bound patch facts, or None when the result has no patch payload."""
+    assert_bridge_result_is_not_self_asserted(payload)
+    if payload is None:
+        return None
+    patch_payload = payload.get("patch")
+    files_payload = payload.get("files")
+    patch_is_object = isinstance(patch_payload, Mapping)
+    files_is_list = isinstance(files_payload, list)
+    if not patch_is_object and not files_is_list:
+        return None
+    if not patch_is_object or not files_is_list:
+        raise ValueError("write result patch facts must include patch and files")
+    try:
+        patch = Patch.model_validate(patch_payload)
+        files = tuple(FileChange.model_validate(item) for item in files_payload)
+    except ValidationError as error:
+        raise ValueError("write result patch facts are invalid") from error
+    if not files:
+        raise ValueError("write result patch facts must include patch and files")
+    return patch, files
+
+
+def validate_patch_facts_against_manifest(
+    manifest: SnapshotManifest,
+    files: tuple[FileChange, ...],
+) -> None:
+    """Require before hashes to match the authorized base snapshot inventory."""
+    by_path = {
+        entry.path: entry
+        for entry in manifest.entries
+        if entry.entry_type is SnapshotEntryType.FILE
+    }
+    for change in files:
+        current = by_path.get(change.path)
+        if change.action is FileChangeAction.ADD:
+            if current is not None:
+                raise ValueError("ADD path already exists in the base snapshot")
+            continue
+        if current is None:
+            raise ValueError("base snapshot does not contain the changed path")
+        if (
+            change.before is None
+            or current.sha256 != change.before.sha256
+            or current.size != change.before.size
+        ):
+            raise ValueError("ChangeSet before facts do not match the base snapshot")
+
+
+def apply_patch_facts_to_manifest(
+    manifest: SnapshotManifest,
+    files: tuple[FileChange, ...],
+) -> SnapshotManifest:
+    """Apply validated file facts to a base manifest without reading a workspace root."""
+    entries = {entry.path: entry for entry in manifest.entries}
+    for change in files:
+        if change.action is FileChangeAction.DELETE:
+            entries.pop(change.path, None)
+            continue
+        if change.after is None:
+            raise ValueError("write result patch facts are invalid")
+        entries[change.path] = SnapshotEntry(
+            path=change.path,
+            sha256=change.after.sha256,
+            size=change.after.size,
+            entry_type=SnapshotEntryType.FILE,
+        )
+    return SnapshotManifest(
+        entries=tuple(sorted(entries.values(), key=lambda entry: entry.path))
+    )
+
+
+def inherit_unchanged_file_contents(
+    previous: Mapping[str, str],
+    old_manifest: SnapshotManifest,
+    new_manifest: SnapshotManifest,
+) -> dict[str, str]:
+    """Keep stored bytes only for files whose digest did not change."""
+    old_digests = {
+        entry.path: entry.sha256
+        for entry in old_manifest.entries
+        if entry.entry_type is SnapshotEntryType.FILE
+    }
+    inherited: dict[str, str] = {}
+    for entry in new_manifest.entries:
+        if entry.entry_type is not SnapshotEntryType.FILE:
+            continue
+        if old_digests.get(entry.path) != entry.sha256:
+            continue
+        text = previous.get(entry.path)
+        if text is not None:
+            inherited[entry.path] = text
+    return inherited
+
+
+def overlay_changed_file_contents(
+    current: Mapping[str, str],
+    files: tuple[FileChange, ...],
+    updated: Mapping[str, str],
+) -> dict[str, str]:
+    """Replace or drop stored bytes for files listed in a ChangeSet."""
+    contents = dict(current)
+    for change in files:
+        if change.action is FileChangeAction.DELETE:
+            contents.pop(change.path, None)
+            continue
+        text = updated.get(change.path)
+        if text is not None:
+            contents[change.path] = text
+    return contents

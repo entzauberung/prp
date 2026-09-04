@@ -8,7 +8,7 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 
-from prp_runtime.analysis.syntax import SyntaxReport
+from prp_runtime.analysis.syntax import BoundSyntaxReport, SyntaxReport
 from prp_runtime.domain.enums import ModelRole
 from prp_runtime.domain.errors import DomainValidationError, ErrorCode
 from prp_runtime.domain.models import (
@@ -45,6 +45,13 @@ from prp_runtime.verification.rules import (
     check_json_schema,
     plan_for_output,
 )
+from prp_runtime.workspace.changes import (
+    ChangeSet,
+    FileChange,
+    FileChangeAction,
+    FileContent,
+    Patch,
+)
 from prp_runtime.verification.verifier import (
     CheckOutcome,
     GlobalCheckKind,
@@ -52,6 +59,7 @@ from prp_runtime.verification.verifier import (
     RuleVerifier,
     VerificationReport,
     aggregate,
+    select_syntax_reports,
     verify_global,
 )
 
@@ -749,6 +757,52 @@ def test_stale_evidence_cannot_pass_candidate_verification() -> None:
     )
 
 
+def test_relevant_ast_fact_changes_verification_while_unrelated_are_excluded() -> None:
+    produced = artifact("answer")
+    evidence = verify(
+        produced, VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT)
+    ).to_evidence()
+    unrelated_absent = SyntaxReport(
+        parse_ok=False,
+        unknown=True,
+        before_parse_error="source is absent",
+    )
+    unrelated_unit = BoundSyntaxReport(
+        report=SyntaxReport(parse_ok=True, unknown=True),
+        artifact_id="art_other",
+        work_unit_id="wu_other",
+        run_id=RUN_ID,
+    )
+    relevant = SyntaxReport(parse_ok=True, unknown=True)
+    baseline = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        syntax_reports=(unrelated_absent,),
+    )
+    assert baseline.result is PASS
+    assert baseline.syntax_report_count == 0
+    assert GlobalCheckKind.AST.value not in {check.kind for check in baseline.checks}
+
+    selected = select_syntax_reports(
+        (unrelated_absent, unrelated_unit, relevant),
+        work_unit_ids=(WORK_UNIT_ID,),
+    )
+    assert selected == (relevant,)
+
+    changed = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        syntax_reports=(unrelated_absent, relevant),
+    )
+    assert changed.result is UNDECIDED
+    assert changed.syntax_report_count == 1
+    assert any(check.kind == GlobalCheckKind.AST.value for check in changed.checks)
+
+
 def test_global_report_does_not_upgrade_unknown_ast_or_command_facts() -> None:
     produced = artifact("answer")
     evidence = verify(
@@ -1061,3 +1115,82 @@ async def test_an_empty_plan_writes_no_evidence(store: SqliteStore) -> None:
     report = await RuleVerifier().verify_and_record(store, produced, ())
     assert report.result is UNDECIDED
     assert await store.list_evidence(WORK_UNIT_ID) == ()
+
+
+def test_model_review_cannot_promote_a_global_candidate() -> None:
+    produced = artifact("answer")
+    evidence = (
+        Evidence(
+            evidence_id=new_evidence_id(),
+            run_id=RUN_ID,
+            work_unit_id=WORK_UNIT_ID,
+            artifact_id=produced.artifact_id,
+            kind=EvidenceKind.MODEL_REVIEW,
+            result=VerificationResult.PASS,
+            detail="a reviewer accepted it",
+        ),
+    )
+    report = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        required_checks=(GlobalCheckKind.FINAL_ARTIFACT, GlobalCheckKind.EVIDENCE),
+    )
+    assert report.result is UNDECIDED
+
+
+def test_pass_without_matching_durable_facts_cannot_promote() -> None:
+    produced = artifact("answer")
+    evidence = verify(
+        produced, VerificationCheck(rule=VerificationRule.NON_EMPTY_OUTPUT)
+    ).to_evidence()
+    missing_facts = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        round_id="round_" + "e" * 32,
+        candidate_snapshot_id=new_snapshot_id(),
+        final_artifacts=(produced,),
+        evidence=evidence,
+        required_checks=(
+            GlobalCheckKind.FINAL_ARTIFACT,
+            GlobalCheckKind.EVIDENCE,
+            GlobalCheckKind.CANDIDATE,
+            GlobalCheckKind.CHANGE_SET,
+        ),
+    )
+    assert missing_facts.result is UNDECIDED
+
+    round_base = new_snapshot_id()
+    foreign_base = new_snapshot_id()
+    foreign = ChangeSet(
+        change_set_id="cs_" + "e" * 32,
+        run_id=RUN_ID,
+        tool_call_id="tc_" + "e" * 32,
+        workspace_id="ws_" + "e" * 32,
+        base_snapshot_id=foreign_base,
+        new_snapshot_id=new_snapshot_id(),
+        patch=Patch(
+            base_snapshot_id=foreign_base,
+            unified_diff="--- a/x\n+++ b/x\n",
+        ),
+        files=(
+            FileChange(
+                path="src/main.py",
+                action=FileChangeAction.MODIFY,
+                before=FileContent(sha256="a" * 64, size=1),
+                after=FileContent(sha256="b" * 64, size=1),
+            ),
+        ),
+        created_at=produced.created_at,
+    )
+    mismatched = verify_global(
+        run_id=RUN_ID,
+        graph_version=2,
+        final_artifacts=(produced,),
+        evidence=evidence,
+        change_sets=(foreign,),
+        base_snapshot_id=round_base,
+        required_checks=(GlobalCheckKind.CHANGE_SET,),
+    )
+    assert mismatched.result is FAIL

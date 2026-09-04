@@ -9,7 +9,7 @@ from typing import Annotated
 from pydantic import Field, JsonValue, StringConstraints, model_validator
 
 from prp_runtime.domain.enums import BridgeClaimStatus, ToolCallStatus, ToolEffect
-from prp_runtime.domain.models import DomainModel, ErrorCategory, ErrorInfo
+from prp_runtime.domain.models import ClientId, DomainModel, ErrorCategory, ErrorInfo
 from prp_runtime.domain.values import (
     BridgeClaimId,
     RunId,
@@ -145,14 +145,12 @@ class BridgeClaim(DomainModel):
     run_id: RunId
     session_id: SessionId
     workspace_id: WorkspaceId
+    snapshot_id: SnapshotId
     owner_id: Annotated[
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
     ]
-    claimant_id: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
-    ]
+    client_id: ClientId
     idempotency_key: Annotated[
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=128),

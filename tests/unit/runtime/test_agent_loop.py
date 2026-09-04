@@ -22,6 +22,7 @@ from prp_runtime.domain.models import (
     Usage,
 )
 from prp_runtime.domain.values import new_principal_id, new_workspace_id
+from prp_runtime.tools.executor import ToolExecutor
 from prp_runtime.policy.models import DevExecutionMode, guard_dev_scope
 from prp_runtime.providers.base import (
     FinishReason,
@@ -31,6 +32,7 @@ from prp_runtime.providers.base import (
 )
 from prp_runtime.providers.openai_compatible import OpenAICompatibleProvider
 from prp_runtime.runtime.agent_loop import (
+    REMOTE_ASSIGNMENT_PENDING,
     AgentLoop,
     AgentLoopStatus,
     AgentToolContext,
@@ -66,10 +68,14 @@ class FakeAdapter:
 
 
 class FakeToolExecutor:
-    def __init__(self, *, pause: bool = False, reject: bool = False) -> None:
+    def __init__(
+        self, *, pause: bool = False, reject: bool = False, remote: bool = False
+    ) -> None:
         self.pause = pause
         self.reject = reject
+        self.remote = remote
         self.calls: list[tuple[AgentToolCall, AgentToolContext]] = []
+        self.results: dict[str, AgentToolResult] = {}
 
     async def execute(
         self,
@@ -78,11 +84,20 @@ class FakeToolExecutor:
         context: AgentToolContext,
     ) -> AgentToolExecution:
         self.calls.append((call, context))
+        stored = self.results.get(call.call_id)
+        if stored is not None:
+            return AgentToolExecution(call=call, result=stored)
         if self.pause:
             return AgentToolExecution(
                 call=call,
                 awaiting_approval=True,
                 reason="approval required",
+            )
+        if self.remote:
+            return AgentToolExecution(
+                call=call,
+                awaiting_remote_result=True,
+                reason=REMOTE_ASSIGNMENT_PENDING,
             )
         status = ToolCallStatus.REJECTED if self.reject else ToolCallStatus.SUCCEEDED
         return AgentToolExecution(
@@ -631,3 +646,137 @@ async def test_agent_loop_exhaustion_is_structured_and_bounded() -> None:
     assert result.error.category.name == "BUDGET_EXCEEDED"
     assert len(adapter.requests) == 2
     assert len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_waits_for_remote_result_without_approval_or_provider() -> None:
+    call = AgentToolCall(call_id="call-1", tool_name="read_file")
+    adapter = FakeAdapter(tool_response(call), text_response("must not run"))
+    executor = FakeToolExecutor(remote=True)
+    loop = AgentLoop(adapter, PROFILE, tool_executor=executor)
+
+    paused = await loop.execute(input="inspect", run_id="run-1", work_unit_id="wu-1")
+    still_waiting = await loop.execute(
+        input="inspect",
+        history=paused.history,
+        resume_pending_call=call,
+        run_id="run-1",
+        work_unit_id="wu-1",
+    )
+
+    assert paused.status is AgentLoopStatus.WAITING_REMOTE
+    assert paused.status is not AgentLoopStatus.PAUSED
+    assert paused.error is None
+    assert paused.pending_call_ids == ("call-1",)
+    assert still_waiting.status is AgentLoopStatus.WAITING_REMOTE
+    assert still_waiting.history == paused.history
+    assert len(adapter.requests) == 1
+    assert len(executor.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_result_replays_once_without_duplicate_history_or_usage() -> None:
+    call = AgentToolCall(call_id="call-1", tool_name="read_file")
+    durable = AgentToolResult(
+        call_id=call.call_id,
+        status=ToolCallStatus.SUCCEEDED,
+        result={"content": "file contents"},
+        output="file contents",
+    )
+    adapter = FakeAdapter(text_response("done"), text_response("must not duplicate"))
+    executor = FakeToolExecutor(remote=True)
+    written: list[object] = []
+
+    async def history_writer(sequence: int, item: object) -> None:
+        written.append((sequence, item))
+
+    loop = AgentLoop(adapter, PROFILE, tool_executor=executor)
+    first = await loop.execute(
+        input="inspect",
+        history=(AgentTurn(tool_calls=(call,)),),
+        resume_pending_call=call,
+        replay_results={call.call_id: durable},
+        history_writer=history_writer,
+        run_id="run-1",
+        work_unit_id="wu-1",
+    )
+    second = await loop.execute(
+        input="inspect",
+        history=(AgentTurn(tool_calls=(call,)), durable),
+        resume_pending_call=call,
+        replay_results={call.call_id: durable},
+        history_writer=history_writer,
+        run_id="run-1",
+        work_unit_id="wu-1",
+    )
+
+    assert first.status is AgentLoopStatus.COMPLETED
+    assert second.status is AgentLoopStatus.COMPLETED
+    assert [item for item in first.history if isinstance(item, AgentToolResult)] == [durable]
+    assert [item for item in second.history if isinstance(item, AgentToolResult)] == [durable]
+    assert sum(isinstance(item, AgentToolResult) for _, item in written) == 1
+    assert executor.calls == []
+    assert first.usage is not None
+    assert second.usage == first.usage
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_injects_bounded_facts_and_redacts_private_context() -> None:
+    adapter = FakeAdapter(text_response("done"))
+    loop = AgentLoop(adapter, PROFILE)
+    result = await loop.execute(
+        input="inspect /tmp/project/src/main.py with api_key=secret-value",
+        static_facts=(
+            {
+                "key": "function:run",
+                "kind": "ast",
+                "summary": "FUNCTION run L1",
+                "work_unit_id": "wu-1",
+            },
+            {
+                "key": "function:other",
+                "kind": "ast",
+                "summary": "FUNCTION other L1",
+                "work_unit_id": "wu-2",
+            },
+            {
+                "key": "function:run",
+                "kind": "ast",
+                "summary": "FUNCTION run duplicate",
+                "work_unit_id": "wu-1",
+            },
+        ),
+        run_id="run-1",
+        work_unit_id="wu-1",
+    )
+
+    assert result.status is AgentLoopStatus.COMPLETED
+    sent = adapter.requests[0].input
+    assert "FUNCTION run L1" in sent
+    assert "FUNCTION other" not in sent
+    assert sent.count("function:run") == 1
+    assert "/tmp/project" not in sent
+    assert "secret-value" not in sent
+    assert "[redacted-root]" in sent
+    assert "api_key=[redacted]" in sent
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_does_not_duplicate_already_rendered_facts() -> None:
+    adapter = FakeAdapter(text_response("done"))
+    rendered = "### Static facts\n- [ast] function:run: FUNCTION run L1"
+    result = await AgentLoop(adapter, PROFILE).execute(
+        input=f"continue\n\n{rendered}",
+        static_facts=(
+            {
+                "key": "function:run",
+                "kind": "ast",
+                "summary": "FUNCTION run L1",
+                "work_unit_id": "wu-1",
+            },
+        ),
+        work_unit_id="wu-1",
+    )
+
+    assert result.status is AgentLoopStatus.COMPLETED
+    assert adapter.requests[0].input.count("function:run") == 1

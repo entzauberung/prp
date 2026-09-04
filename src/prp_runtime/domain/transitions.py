@@ -13,6 +13,7 @@ from types import MappingProxyType
 
 from prp_runtime.domain.enums import (
     AttemptStatus,
+    BridgeClaimStatus,
     ExecutionStrategy,
     MergeLedgerStatus,
     ReservationStatus,
@@ -24,6 +25,7 @@ from prp_runtime.domain.enums import (
 
 __all__ = [
     "ATTEMPT_TRANSITIONS",
+    "BRIDGE_CLAIM_TRANSITIONS",
     "AttemptNotAllowedError",
     "DomainTransitionError",
     "IllegalStatusTransitionError",
@@ -41,6 +43,7 @@ __all__ = [
     "can_escalate_strategy",
     "can_start_attempt",
     "can_transition_attempt",
+    "can_transition_bridge_claim",
     "can_transition_tool_call",
     "can_transition_run",
     "can_transition_reservation",
@@ -57,6 +60,7 @@ __all__ = [
     "recover_attempt_on_restart",
     "resolve_run_outcome",
     "transition_attempt",
+    "transition_bridge_claim",
     "transition_tool_call",
     "transition_run",
     "transition_reservation",
@@ -212,6 +216,23 @@ WORK_UNIT_TRANSITIONS: Mapping[WorkUnitStatus, frozenset[WorkUnitStatus]] = Mapp
     }
 )
 
+BRIDGE_CLAIM_TRANSITIONS: Mapping[
+    BridgeClaimStatus, frozenset[BridgeClaimStatus]
+] = MappingProxyType(
+    {
+        BridgeClaimStatus.ACTIVE: frozenset(
+            {
+                BridgeClaimStatus.EXPIRED,
+                BridgeClaimStatus.SETTLED,
+                BridgeClaimStatus.RELEASED,
+            }
+        ),
+        BridgeClaimStatus.EXPIRED: frozenset(),
+        BridgeClaimStatus.SETTLED: frozenset(),
+        BridgeClaimStatus.RELEASED: frozenset(),
+    }
+)
+
 RESERVATION_TRANSITIONS: Mapping[
     ReservationStatus, frozenset[ReservationStatus]
 ] = MappingProxyType(
@@ -337,6 +358,27 @@ def transition_work_unit(current: WorkUnitStatus, target: WorkUnitStatus) -> Wor
     """Return ``target`` if the work unit transition is legal, otherwise raise."""
     if not can_transition_work_unit(current, target):
         raise IllegalStatusTransitionError("work_unit", current.value, target.value)
+    return target
+
+
+def can_transition_bridge_claim(
+    current: BridgeClaimStatus, target: BridgeClaimStatus
+) -> bool:
+    """Whether a Bridge claim lease may move to a different status."""
+    return target in BRIDGE_CLAIM_TRANSITIONS[current]
+
+
+def transition_bridge_claim(
+    current: BridgeClaimStatus,
+    target: BridgeClaimStatus,
+    *,
+    idempotent_terminal: bool = False,
+) -> BridgeClaimStatus:
+    """Return a legal claim status; terminal replay is explicit."""
+    if idempotent_terminal and current is target and current.is_terminal:
+        return current
+    if not can_transition_bridge_claim(current, target):
+        raise IllegalStatusTransitionError("bridge_claim", current.value, target.value)
     return target
 
 

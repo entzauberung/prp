@@ -19,7 +19,7 @@ from prp_runtime.client.bridge import (
     BridgeToolLoopPhase,
 )
 from prp_runtime.client.executor import BridgeExecutor
-from prp_runtime.tools import build_filesystem_registry
+from prp_runtime.tools.filesystem import build_bridge_registry
 from prp_runtime.workspace import WorkspaceBackend
 
 __all__ = ["build_parser", "main"]
@@ -78,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_connection_options(parser)
     commands = parser.add_subparsers(dest="command", required=True)
+
+    bootstrap = commands.add_parser(
+        "bootstrap",
+        help="register a model-free client and handshake local capabilities",
+    )
+    bootstrap.add_argument("workspace_id")
+    bootstrap.add_argument("--client-id", default=None)
 
     connect = commands.add_parser("connect", help="create an authorized Workspace session")
     connect.add_argument("workspace_id")
@@ -258,15 +265,44 @@ def _bridge(args: argparse.Namespace, token: str) -> Bridge:
 
 def _local_executor(args: argparse.Namespace) -> tuple[BridgeExecutor, WorkspaceBackend]:
     if args.workspace_root is None:
-        raise CliError("watch/resume requires --workspace-root for local tool execution")
+        raise CliError("this command requires --workspace-root for local tool execution")
     root = args.workspace_root.expanduser().resolve()
     backend = WorkspaceBackend(root)
     try:
-        registry = build_filesystem_registry(backend)
+        registry = build_bridge_registry(backend, workspace_root=root)
         return BridgeExecutor(registry, root), backend
     except BaseException:
         backend.close()
         raise
+
+
+async def _bootstrap(args: argparse.Namespace) -> None:
+    token = _read_token(from_stdin=args.token_stdin)
+    executor, backend = _local_executor(args)
+    try:
+        from prp_runtime.domain.models import new_client_id
+
+        client_id = args.client_id or new_client_id()
+        request = executor.handshake_request(client_id, workspace_id=args.workspace_id)
+        payload = request.model_dump(mode="json")
+        async with _bridge(args, token) as bridge:
+            await bridge.register_client(
+                {
+                    "client_id": payload["client_id"],
+                    "workspace_id": payload["workspace_id"],
+                    "fingerprint": payload["fingerprint"],
+                    "capabilities": payload["capabilities"],
+                }
+            )
+            response = await bridge.handshake(payload)
+    finally:
+        backend.close()
+    public = {
+        key: response[key]
+        for key in ("accepted", "client_id", "protocol_version")
+        if key in response
+    }
+    _print_json(public)
 
 
 async def _connect(args: argparse.Namespace) -> None:
@@ -300,6 +336,8 @@ async def _watch(args: argparse.Namespace) -> None:
     token = _read_token(from_stdin=args.token_stdin)
     async with _bridge(args, token) as bridge:
         executor, backend = _local_executor(args)
+        if args.max_reconnects < 0 or args.max_calls <= 0 or args.max_events <= 0 or args.max_seconds <= 0:
+            raise CliError("watch/resume reconnect and loop limits must be finite and non-negative")
         try:
             outcome = await bridge.run_tool_loop(
                 executor,
@@ -315,6 +353,11 @@ async def _watch(args: argparse.Namespace) -> None:
         if outcome.phase is BridgeToolLoopPhase.WAITING_APPROVAL:
             raise CliError(
                 "tool call requires explicit approve/deny; "
+                f"pending={','.join(outcome.pending_call_ids)}"
+            )
+        if outcome.phase is BridgeToolLoopPhase.WAITING:
+            raise CliError(
+                "bridge is waiting on client liveness or lease; "
                 f"pending={','.join(outcome.pending_call_ids)}"
             )
         _print_json(await bridge.get_run())
@@ -338,6 +381,9 @@ async def _decide(args: argparse.Namespace, outcome: str) -> None:
 
 
 async def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "bootstrap":
+        await _bootstrap(args)
+        return 0
     if args.command == "connect":
         await _connect(args)
         return 0

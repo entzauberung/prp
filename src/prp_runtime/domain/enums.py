@@ -10,6 +10,7 @@ __all__ = [
     "AgentMode",
     "AttemptStatus",
     "BridgeClaimStatus",
+    "BridgeClientLiveness",
     "ExecutionLocation",
     "ExecutionStrategy",
     "IsolationMode",
@@ -157,12 +158,14 @@ class BridgeClaimStatus(StrEnum):
 class ModelRole(StrEnum):
     """The role a model plays in one call.
 
-    A planner may only propose. A worker executes one work unit. A verifier
-    judges a produced artifact.
+    A planner may only propose. A worker executes one work unit. Analyzer and
+    verifier are first-class roles: they are never silent Worker aliases.
+    Deterministic analysis or verification may omit a provider entirely.
     """
 
     PLANNER = "PLANNER"
     WORKER = "WORKER"
+    ANALYZER = "ANALYZER"
     VERIFIER = "VERIFIER"
 
 
@@ -248,6 +251,16 @@ class AttemptStatus(StrEnum):
     def is_terminal(self) -> bool:
         return self in _TERMINAL_ATTEMPT_STATUSES
 
+
+
+
+@unique
+class BridgeClientLiveness(StrEnum):
+    """Eligibility of one registered Bridge client for new work."""
+
+    LIVE = "LIVE"
+    OFFLINE = "OFFLINE"
+    EXPIRED = "EXPIRED"
 
 _TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(
     {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}

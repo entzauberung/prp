@@ -5,19 +5,36 @@ from pathlib import Path
 
 import pytest
 
-from prp_runtime.domain.enums import ExecutionLocation, IsolationMode, ResourceAccess
-from prp_runtime.domain.models import AgentRequestOptions, ExecutionScope, WorkspaceGrant
+from prp_runtime.domain.enums import ExecutionLocation, IsolationMode, ResourceAccess, ToolCallStatus, ToolEffect
+from prp_runtime.domain.models import (
+    AgentRequestOptions,
+    AgentToolCall,
+    ClientCapabilityDescriptor,
+    ExecutionScope,
+    RegisteredBridgeClient,
+    WorkspaceGrant,
+    fingerprint_client_capabilities,
+    new_client_id,
+)
 from prp_runtime.domain.values import (
     new_principal_id,
     new_run_id,
     new_session_id,
     new_snapshot_id,
+    new_work_unit_id,
     new_workspace_id,
 )
+from prp_runtime.runtime.agent_loop import AgentToolContext
 from prp_runtime.runtime.tooling import (
+    BridgeRemoteToolExecutor,
+    ScopeToolRuntimeProvider,
     ToolRuntimeError,
     WorkspaceToolRuntimeFactory,
+    catalog_from_bridge_capabilities,
 )
+from prp_runtime.settings import Settings
+from prp_runtime.tools.executor import RemoteToolAssignmentPending
+from prp_runtime.tools.models import ToolCall, ToolResult
 from prp_runtime.tools.registry import ToolRegistry
 from prp_runtime.workspace.backend import WorkspaceBackend
 from prp_runtime.workspace.isolation import LocalIsolationBackend, SlotContext
@@ -306,3 +323,198 @@ def test_sandboxed_without_capability_omits_host_commands(tmp_path: Path) -> Non
     runtime.close()
     assert backend.close_count == 1
 
+
+
+def test_factory_refuses_bridge_execution_location() -> None:
+    scope, resolved, snapshot, backend = make_facts()
+    scope = scope.model_copy(
+        update={
+            "agent_options": AgentRequestOptions(
+                execution_location=ExecutionLocation.BRIDGE
+            )
+        }
+    )
+    with pytest.raises(ToolRuntimeError, match="BRIDGE"):
+        WorkspaceToolRuntimeFactory().build(
+            scope=scope,
+            resolved_workspace=resolved,
+            snapshot=snapshot,
+            registry=ToolRegistry(),
+            executor=FakeExecutor(),  # type: ignore[arg-type]
+        )
+    assert backend.close_count == 0
+
+
+def test_bridge_catalog_comes_from_assigned_client_capabilities() -> None:
+    capabilities = ClientCapabilityDescriptor(
+        tools=("apply_patch", "read_file"),
+        effects=(ToolEffect.READ, ToolEffect.WRITE),
+    )
+    catalog = catalog_from_bridge_capabilities(capabilities)
+    assert tuple(item.name for item in catalog) == ("apply_patch", "read_file")
+    for descriptor in catalog:
+        dumped = descriptor.model_dump(mode="json")
+        assert "root" not in dumped
+        assert "handler" not in dumped
+        assert "provider" not in dumped
+        assert "workspace_root" not in dumped
+
+
+class _SentinelResolver:
+    def resolve(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("BRIDGE must not resolve a server root")
+
+
+class _SentinelFactory:
+    def build(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("BRIDGE must not create WorkspaceToolRuntime")
+
+
+class _BridgeStore:
+    def __init__(self, client: RegisteredBridgeClient, snapshot: Snapshot) -> None:
+        self.client = client
+        self.snapshot = snapshot
+        self.calls: dict[str, ToolCall] = {}
+        self.results: dict[str, ToolResult] = {}
+        self.idempotency: dict[str, str] = {}
+        self.handler_touches = 0
+
+    async def list_bridge_clients(
+        self, *, principal_id: str, workspace_id: str | None = None
+    ) -> tuple[RegisteredBridgeClient, ...]:
+        del principal_id, workspace_id
+        return (self.client,)
+
+    async def list_snapshots(self, workspace_id: str, *, owner_id: str) -> tuple[Snapshot, ...]:
+        del workspace_id, owner_id
+        return (self.snapshot,)
+
+    async def create_tool_call(
+        self, call: ToolCall, *, workspace_id: str, idempotency_key: str
+    ) -> ToolCall:
+        del workspace_id
+        existing = self.idempotency.get(idempotency_key)
+        if existing is not None:
+            return self.calls[existing]
+        self.idempotency[idempotency_key] = call.call_id
+        self.calls[call.call_id] = call
+        return call
+
+    async def start_tool_call(
+        self, call_id: str, *, approved: bool | None = None, started_at: object = None
+    ) -> ToolCall:
+        del started_at
+        updated = self.calls[call_id].transition(ToolCallStatus.RUNNING, approved=approved)
+        self.calls[call_id] = updated
+        return updated
+
+    async def await_tool_call(self, call_id: str, *, reason: str = "", timestamp: object = None) -> ToolCall:
+        del reason, timestamp
+        updated = self.calls[call_id].transition(ToolCallStatus.AWAITING_APPROVAL)
+        self.calls[call_id] = updated
+        return updated
+
+    async def complete_tool_call(self, result: ToolResult) -> ToolResult:
+        self.handler_touches += 1
+        self.results[result.call_id] = result
+        return result
+
+    async def reject_tool_call(
+        self, call_id: str, *, reason: str, completed_at: object = None
+    ) -> ToolResult:
+        current = self.calls[call_id]
+        result = ToolResult.from_rejected_call(
+            current, reason=reason, completed_at=completed_at or T0
+        )
+        self.calls[call_id] = current.transition(ToolCallStatus.REJECTED)
+        self.results[call_id] = result
+        return result
+
+    async def get_tool_result(self, call_id: str) -> ToolResult:
+        return self.results[call_id]
+
+    async def mark_tool_call_unknown(self, call_id: str, **kwargs: object) -> ToolResult:
+        del kwargs
+        raise AssertionError(f"BRIDGE must not mark unknown via server handler {call_id}")
+
+
+def _bridge_scope_and_client() -> tuple[ExecutionScope, RegisteredBridgeClient, Snapshot]:
+    scope, _, snapshot, _ = make_facts()
+    scope = scope.model_copy(
+        update={
+            "agent_options": AgentRequestOptions(
+                execution_location=ExecutionLocation.BRIDGE
+            )
+        }
+    )
+    capabilities = ClientCapabilityDescriptor(
+        tools=("read_file",),
+        effects=(ToolEffect.READ,),
+    )
+    client = RegisteredBridgeClient(
+        client_id=new_client_id(),
+        principal_id=scope.principal_id,
+        workspace_id=scope.workspace_id,
+        capabilities=capabilities,
+        capability_fingerprint=fingerprint_client_capabilities(capabilities),
+        created_at=T0,
+    )
+    return scope, client, snapshot
+
+
+@pytest.mark.asyncio
+async def test_bridge_provider_catalog_does_not_resolve_or_open_server_root() -> None:
+    scope, client, snapshot = _bridge_scope_and_client()
+    store = _BridgeStore(client, snapshot)
+    provider = ScopeToolRuntimeProvider(
+        store,  # type: ignore[arg-type]
+        Settings(),
+        factory=_SentinelFactory(),  # type: ignore[arg-type]
+    )
+    provider._resolver = _SentinelResolver()  # type: ignore[assignment]
+    executor = provider.executor_for(scope)
+    assert isinstance(executor, BridgeRemoteToolExecutor)
+    catalog = await executor.provider_catalog()
+    assert tuple(item.name for item in catalog) == ("read_file",)
+    assert all("root" not in item.model_dump() for item in catalog)
+    with pytest.raises(ToolRuntimeError, match="BRIDGE"):
+        await provider._runtime_for_scope(scope)
+
+
+@pytest.mark.asyncio
+async def test_bridge_execute_persists_assignment_without_handler_or_root() -> None:
+    scope, client, snapshot = _bridge_scope_and_client()
+    store = _BridgeStore(client, snapshot)
+    provider = ScopeToolRuntimeProvider(
+        store,  # type: ignore[arg-type]
+        Settings(),
+        factory=_SentinelFactory(),  # type: ignore[arg-type]
+        enable_server_resolver=False,
+    )
+    provider._resolver = _SentinelResolver()  # type: ignore[assignment]
+    executor = provider.executor_for(scope)
+    call = AgentToolCall(
+        call_id="provider-call/1",
+        tool_name="read_file",
+        arguments={"path": "src/main.py"},
+    )
+    context = AgentToolContext(
+        run_id=scope.run_id,
+        work_unit_id=new_work_unit_id(),
+        mode=scope.agent_options.agent_mode,
+        round_index=1,
+        attempt_index=1,
+    )
+    with pytest.raises(RemoteToolAssignmentPending) as pending:
+        await executor.execute(call, context=context)
+    assignment = pending.value.assignment
+    dumped = assignment.model_dump(mode="json")
+    assert assignment.client_id == client.client_id
+    assert assignment.workspace_id == scope.workspace_id
+    assert assignment.status is ToolCallStatus.RUNNING
+    assert store.handler_touches == 0
+    assert "root" not in dumped
+    assert "provider" not in dumped
+    assert "workspace_root" not in dumped
+    persisted = next(iter(store.calls.values()))
+    assert persisted.status is ToolCallStatus.RUNNING

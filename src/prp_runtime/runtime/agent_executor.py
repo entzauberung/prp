@@ -20,8 +20,15 @@ from prp_runtime.domain.models import (
     ExecutionScope,
 )
 from prp_runtime.domain.values import SnapshotId, utc_now
-from prp_runtime.policy.engine import PolicyOutcome, PolicyReasonCode
 from prp_runtime.domain.errors import StateError
+from prp_runtime.tools.executor import (
+    ToolExecutionOutcome,
+    build_remote_assignment_request,
+    uses_in_process_tool_settlement,
+)
+from prp_runtime.tools.models import MAX_TOOL_OUTPUT_BYTES, ToolCall, ToolResult
+from prp_runtime.tools.registry import ToolRegistry
+from prp_runtime.policy.engine import PolicyOutcome, PolicyReasonCode
 from prp_runtime.policy.models import (
     ApprovalDecision,
     ApprovalIssuer,
@@ -34,15 +41,13 @@ from prp_runtime.policy.models import (
     LeaseStatus,
 )
 from prp_runtime.runtime.agent_loop import (
+    REMOTE_ASSIGNMENT_PENDING,
     AgentToolContext,
     AgentToolExecution,
 )
 from prp_runtime.runtime.tool_worker import ToolWorker
 from prp_runtime.settings import Settings
 from prp_runtime.storage.sqlite import MissingEntityError
-from prp_runtime.tools.executor import ToolExecutionOutcome, uses_in_process_tool_settlement
-from prp_runtime.tools.models import MAX_TOOL_OUTPUT_BYTES, ToolCall, ToolResult
-from prp_runtime.tools.registry import ToolRegistry
 
 __all__ = [
     "AgentToolExecutor",
@@ -451,6 +456,30 @@ class AgentToolExecutor:
         except Exception:
             return self._failed(call)
         if outcome.result is None:
+            if (
+                options.execution_location is ExecutionLocation.BRIDGE
+                and outcome.assignment is not None
+                and outcome.decision.outcome is PolicyOutcome.ALLOW
+            ):
+                store = self._approval_store
+                getter = getattr(store, "get_tool_result", None) if store is not None else None
+                if getter is not None:
+                    try:
+                        existing = await getter(outcome.call.call_id)
+                    except MissingEntityError:
+                        existing = None
+                    except Exception:
+                        existing = None
+                    if existing is not None and existing.status.is_terminal:
+                        return AgentToolExecution(
+                            call=call,
+                            result=self._public_result(call, existing),
+                        )
+                return AgentToolExecution(
+                    call=call,
+                    awaiting_remote_result=True,
+                    reason=REMOTE_ASSIGNMENT_PENDING,
+                )
             if outcome.decision.outcome is PolicyOutcome.ASK:
                 store = self._approval_store
                 if store is None:
@@ -525,10 +554,10 @@ class AgentToolExecutor:
         command_class: CommandClass | None,
         approved: bool | None,
     ) -> ToolExecutionOutcome:
-        """Settle LOCAL in-process through ToolWorker.
+        """Settle LOCAL/CLOUD in-process through ToolWorker.
 
-        BRIDGE keeps the same worker contract so Native Agent claim create,
-        settle and submit stay outside this adapter.
+        BRIDGE never invokes ToolWorker or a registered handler. It only
+        projects a public remote assignment request.
         """
 
         kwargs = {
@@ -550,10 +579,30 @@ class AgentToolExecutor:
             )
         if options.execution_location is not ExecutionLocation.BRIDGE:
             raise ValueError("unsupported execution location for tool settlement")
-        return await self._worker.execute(
+        from prp_runtime.policy.engine import decide_tool_call
+
+        decision = decide_tool_call(
             persisted_call,
             options.agent_mode,
-            **kwargs,
+            known_tools=self._registry.names,
+            workspace_id=self._scope.workspace_id,
+            resolved_paths=resolved_paths,
+            command_class=command_class,
+            isolation_mode=options.isolation_mode,
+            execution_location=options.execution_location,
+            user_explicit_host_yolo=options.user_explicit,
+            settings=self._settings,
+        )
+        assignment = None
+        if decision.outcome is PolicyOutcome.ALLOW:
+            assignment = build_remote_assignment_request(
+                persisted_call,
+                workspace_id=self._scope.workspace_id,
+            )
+        return ToolExecutionOutcome(
+            decision=decision,
+            call=persisted_call,
+            assignment=assignment,
         )
 
     @staticmethod

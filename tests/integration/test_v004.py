@@ -103,3 +103,31 @@ def test_fixture_run_ledger_is_serializable_and_has_stable_terminal_events(
     assert events.status_code == 200
     assert "RUN_SUCCEEDED" in events.text
     assert "CONTROLLER_DECISION" in events.text
+
+def test_declared_protocol_subset_rejects_unsupported_fields_and_keeps_fixture(tmp_path: Path) -> None:
+    payload = json.loads(
+        (FIXTURE_ROOT / "openai_responses_text.json").read_text(encoding="utf-8")
+    )
+    adapter = FakeAdapter()
+    with TestClient(_app(tmp_path, adapter)) as client:
+        streamed = client.post("/v1/responses", json={**payload, "stream": True})
+        assert streamed.status_code == 400
+        assert streamed.json()["error"]["code"] == "unsupported_stream_mode"
+        assert "https://models.invalid" not in streamed.text
+        unknown = client.post("/v1/responses", json={**payload, "temperature_top": 1})
+        assert unknown.status_code == 400
+        assert unknown.json()["error"]["code"] == "unsupported_field"
+        tools = client.post("/v1/responses", json={**payload, "tools": []})
+        assert tools.status_code == 400
+        assert tools.json()["error"]["code"] == "unsupported_tools"
+        accepted = client.post("/v1/responses", json=payload)
+        assert accepted.status_code == 202
+        run_id = accepted.json()["id"]
+        events = client.get(f"/v1/responses/{run_id}/events")
+        assert events.status_code == 200
+        queried = client.get(f"/v1/responses/{run_id}")
+    assert queried.status_code == 200
+    assert queried.json()["status"] == "completed"
+    assert "strategy" not in queried.json()
+    assert "RUN_SUCCEEDED" in events.text
+

@@ -14,14 +14,23 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
 from prp_runtime.domain.enums import BridgeClaimStatus, ToolCallStatus, ToolEffect
-from prp_runtime.domain.models import ErrorCategory, ErrorInfo
+from prp_runtime.domain.models import (
+    BRIDGE_PROTOCOL_VERSION,
+    MAX_BRIDGE_OUTPUT_BYTES,
+    MAX_BRIDGE_LEASE_TOTAL_SECONDS,
+    ClientCapabilityDescriptor,
+    ClientHandshakeRequest,
+    ErrorCategory,
+    ErrorInfo,
+    fingerprint_client_capabilities,
+)
 from prp_runtime.domain.values import new_work_unit_id, utc_now
 from prp_runtime.tools.executor import ExecutionContext
 from prp_runtime.tools.models import MAX_TOOL_OUTPUT_BYTES, ToolCall, ToolResult
@@ -58,6 +67,7 @@ _CLAIM_KEYS = frozenset(
         "workspace_id",
         "snapshot_id",
         "owner_id",
+        "client_id",
         "claimant_id",
         "idempotency_key",
         "fingerprint",
@@ -132,6 +142,52 @@ class BridgeExecutor:
         """Return the configured local root, which never comes from a claim."""
         return self._workspace_root
 
+    def capability_descriptor(self) -> ClientCapabilityDescriptor:
+        """Advertise sorted registry tools and effects without the local root."""
+        tools = tuple(sorted(self._registry.names))
+        effects = tuple(
+            sorted(
+                {definition.effect for definition in self._registry.definitions},
+                key=lambda item: item.value,
+            )
+        )
+        max_output = max(
+            (definition.max_output_bytes for definition in self._registry.definitions),
+            default=MAX_BRIDGE_OUTPUT_BYTES,
+        )
+        return ClientCapabilityDescriptor(
+            tools=tools,
+            effects=effects,
+            max_output_bytes=min(max_output, MAX_BRIDGE_OUTPUT_BYTES),
+            max_runtime_ms=max(1, int(self._timeout_seconds * 1000)),
+        )
+
+    def handshake_request(
+        self,
+        client_id: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> ClientHandshakeRequest:
+        """Build a model-free handshake from the local registry only."""
+        capabilities = self.capability_descriptor()
+        return ClientHandshakeRequest(
+            client_id=client_id,
+            protocol_version=BRIDGE_PROTOCOL_VERSION,
+            capabilities=capabilities,
+            fingerprint=fingerprint_client_capabilities(capabilities),
+            workspace_id=workspace_id,
+        )
+
+    def verify_advertised_capabilities(
+        self, capabilities: ClientCapabilityDescriptor
+    ) -> None:
+        """Reject capability claims that do not match the local registry."""
+        expected = self.capability_descriptor()
+        if capabilities != expected:
+            raise BridgeDispatchError(
+                "advertised capabilities do not match the local registry"
+            )
+
     def plan(
         self,
         claim: Mapping[str, Any],
@@ -141,6 +197,8 @@ class BridgeExecutor:
         """Validate one JSON claim without touching the filesystem or transport."""
         if not isinstance(claim, Mapping):
             raise BridgeDispatchError("Bridge claim must be an object")
+        if any(key in claim for key in ("now", "observed_at", "clock")):
+            raise BridgeDispatchError("Bridge claim contains unsupported fields")
         unknown = set(claim) - _CLAIM_KEYS
         if unknown:
             raise BridgeDispatchError("Bridge claim contains unsupported fields")
@@ -166,10 +224,15 @@ class BridgeExecutor:
             effect = ToolEffect(str(claim.get("effect")))
         except ValueError as error:
             raise BridgeDispatchError("Bridge claim effect is invalid") from error
+        if effect is ToolEffect.NETWORK:
+            raise BridgeDispatchError("Bridge claim names an unsupported network effect")
         claimed_at = _aware_timestamp(claim.get("claimed_at"), "claimed_at")
         expires_at = _aware_timestamp(claim.get("expires_at"), "expires_at")
         if expires_at <= claimed_at:
             raise BridgeDispatchError("Bridge claim lease is invalid")
+        lease_ceiling = claimed_at + timedelta(seconds=MAX_BRIDGE_LEASE_TOTAL_SECONDS)
+        if expires_at > lease_ceiling:
+            expires_at = lease_ceiling
         requested_at = _aware_timestamp(
             claim.get("requested_at", claimed_at.isoformat()), "requested_at"
         )

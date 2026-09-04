@@ -125,7 +125,11 @@ class RuntimeComposition:
                 self.adapters = build_adapters(self.settings)
             else:
                 self.adapters = dict(self._injected_adapters)
-            self.tool_runtime_provider = ScopeToolRuntimeProvider(store, self.settings)
+            self.tool_runtime_provider = ScopeToolRuntimeProvider(
+                store,
+                self.settings,
+                enable_server_resolver=self.execution_location is not ExecutionLocation.BRIDGE,
+            )
             self.controller = RunController(
                 store,
                 self.settings,

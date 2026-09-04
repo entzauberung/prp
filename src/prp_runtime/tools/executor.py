@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
-from prp_runtime.domain.enums import AgentMode, ExecutionLocation, IsolationMode, ToolCallStatus
+from prp_runtime.domain.enums import (
+    AgentMode,
+    ExecutionLocation,
+    IsolationMode,
+    ToolCallStatus,
+    ToolEffect,
+)
 from prp_runtime.domain.models import DomainModel, ErrorCategory, ErrorInfo
 from prp_runtime.domain.values import utc_now
 from prp_runtime.settings import Settings
@@ -27,10 +33,13 @@ else:
 
 __all__ = [
     "ExecutionContext",
+    "RemoteToolAssignmentPending",
+    "RemoteToolAssignmentRequest",
     "ToolExecutionError",
     "ToolExecutionOutcome",
     "ToolExecutor",
     "ToolStore",
+    "build_remote_assignment_request",
     "uses_in_process_tool_settlement",
 ]
 
@@ -110,12 +119,56 @@ class ExecutionContext(BaseModel):
     command_class: CommandClass | None = None
 
 
+class RemoteToolAssignmentRequest(DomainModel):
+    """Public remote assignment facts. No root, credential or provider payload."""
+
+    call_id: str
+    run_id: str
+    work_unit_id: str
+    tool_name: str
+    effect: ToolEffect
+    workspace_id: str
+    status: ToolCallStatus
+    snapshot_id: str | None = None
+    client_id: str | None = None
+
+
+class RemoteToolAssignmentPending(RuntimeError):
+    """BRIDGE persisted a remote assignment and must not settle in-process."""
+
+    def __init__(self, assignment: RemoteToolAssignmentRequest) -> None:
+        super().__init__("remote Bridge assignment is pending")
+        self.assignment = assignment
+
+
+def build_remote_assignment_request(
+    call: ToolCall,
+    *,
+    workspace_id: str,
+    client_id: str | None = None,
+) -> RemoteToolAssignmentRequest:
+    """Project one persisted call into a public remote assignment request."""
+
+    return RemoteToolAssignmentRequest(
+        call_id=call.call_id,
+        run_id=call.run_id,
+        work_unit_id=call.work_unit_id,
+        tool_name=call.tool_name,
+        effect=call.effect,
+        workspace_id=workspace_id,
+        status=call.status,
+        snapshot_id=call.snapshot_id,
+        client_id=client_id,
+    )
+
+
 class ToolExecutionOutcome(DomainModel):
     """The auditable projection of one policy and handler attempt."""
 
     decision: PolicyDecision
     call: ToolCall
     result: ToolResult | None = None
+    assignment: RemoteToolAssignmentRequest | None = None
 
     @property
     def completed(self) -> bool:
@@ -262,16 +315,17 @@ class ToolExecutor:
                 command_class=command_class,
                 decision=decision,
             )
-        # BRIDGE preserves the same registered-handler completion contract.
-        # Claim create/settle/submit stay outside this executor.
-        return await self._invoke_registered_handler(
-            persisted,
-            definition=definition,
-            arguments=arguments,
-            workspace_id=workspace_id,
-            resolved_paths=resolved_paths or (),
-            command_class=command_class,
+        if execution_location is not ExecutionLocation.BRIDGE:
+            raise ToolExecutionError(
+                f"unsupported execution location for tool settlement: {execution_location.value}"
+            )
+        return ToolExecutionOutcome(
             decision=decision,
+            call=persisted,
+            assignment=build_remote_assignment_request(
+                persisted,
+                workspace_id=workspace_id,
+            ),
         )
 
     async def _invoke_registered_handler(

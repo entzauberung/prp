@@ -408,7 +408,7 @@ class LocalRuntime:
                         created_at=created_at,
                     )
                 )
-            manifest = handle.backend.snapshot_manifest()
+            manifest, file_contents = handle.backend.capture_snapshot()
             snapshot = await self.store.create_snapshot(
                 Snapshot(
                     snapshot_id=new_snapshot_id(),
@@ -421,6 +421,7 @@ class LocalRuntime:
                 ),
                 manifest,
                 owner_id=principal_id,
+                file_contents=file_contents,
             )
             self.last_snapshot_id = snapshot.snapshot_id
             session = Session(

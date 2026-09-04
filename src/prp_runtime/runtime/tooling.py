@@ -12,14 +12,18 @@ from prp_runtime.domain.enums import (
     ExecutionStrategy,
     ResourceAccess,
     ToolCallStatus,
+    ToolEffect,
 )
 from prp_runtime.domain.models import (
     AgentToolCall,
     AgentToolResult,
+    BridgeClientStatus,
+    ClientCapabilityDescriptor,
     ExecutionScope,
     ProviderToolDescriptor,
+    RegisteredBridgeClient,
 )
-from prp_runtime.domain.values import SnapshotId
+from prp_runtime.domain.values import SnapshotId, utc_now
 from prp_runtime.policy.models import CommandClass
 from prp_runtime.runtime.agent_executor import AgentToolExecutor
 from prp_runtime.runtime.agent_loop import AgentToolContext, AgentToolExecution
@@ -38,7 +42,8 @@ from prp_runtime.tools.diff import (
     DiffToolRunner,
     build_diff_definitions,
 )
-from prp_runtime.tools.executor import ToolExecutor
+from prp_runtime.policy.engine import PolicyOutcome
+from prp_runtime.tools.executor import RemoteToolAssignmentPending, ToolExecutor
 from prp_runtime.tools.filesystem import build_filesystem_registry
 from prp_runtime.tools.models import ToolCall
 from prp_runtime.tools.patch import (
@@ -71,12 +76,14 @@ from prp_runtime.workspace.resolver import (
 from prp_runtime.workspace.sandbox import SandboxBackend, SandboxUnavailableError
 
 __all__ = [
+    "BridgeRemoteToolExecutor",
     "ToolRuntimeError",
     "ToolRuntimeState",
     "ScopedAgentToolExecutor",
     "ScopeToolRuntimeProvider",
     "WorkspaceToolRuntime",
     "WorkspaceToolRuntimeFactory",
+    "catalog_from_bridge_capabilities",
 ]
 
 
@@ -289,6 +296,8 @@ class WorkspaceToolRuntimeFactory:
         slot_context: SlotContext | None = None,
     ) -> WorkspaceToolRuntime:
         """Compose one runtime or bind all server-owned tool builders."""
+        if scope.agent_options.execution_location is ExecutionLocation.BRIDGE:
+            raise ToolRuntimeError("BRIDGE does not create a server workspace tool runtime")
         if source_type is not WorkspaceSourceType.SERVER_ALIAS:
             raise WorkspaceResolveError("bridge workspace is not available to the cloud")
         if registry is not None or executor is not None:
@@ -549,6 +558,201 @@ class ScopedAgentToolExecutor:
         )
 
 
+_BRIDGE_TOOL_EFFECTS: dict[str, ToolEffect] = {
+    "apply_patch": ToolEffect.WRITE,
+    "get_diff": ToolEffect.READ,
+    "get_status": ToolEffect.READ,
+    "list_files": ToolEffect.READ,
+    "read_file": ToolEffect.READ,
+    "run_targeted_test": ToolEffect.COMMAND,
+    "search_text": ToolEffect.READ,
+}
+
+_BRIDGE_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "apply_patch": "Apply one validated patch to the authorized workspace.",
+    "get_diff": "Inspect the bounded diff for the authorized ChangeSet.",
+    "get_status": "Inspect the current status of the authorized ChangeSet.",
+    "list_files": "List entries below an authorized relative directory.",
+    "read_file": "Read bounded text from one authorized relative file.",
+    "run_targeted_test": "Run one targeted verification command.",
+    "search_text": "Search authorized workspace text with bounded results.",
+}
+
+
+def _bridge_argument_model(name: str) -> type:
+    from prp_runtime.tools.command import CommandInvocation
+    from prp_runtime.tools.diff import DiffRequest
+    from prp_runtime.tools.filesystem import ListFilesArguments, ReadFileArguments
+    from prp_runtime.tools.patch import PatchRequest
+    from prp_runtime.tools.search import SearchRequest
+
+    models = {
+        "apply_patch": PatchRequest,
+        "get_diff": DiffRequest,
+        "get_status": DiffRequest,
+        "list_files": ListFilesArguments,
+        "read_file": ReadFileArguments,
+        "run_targeted_test": CommandInvocation,
+        "search_text": SearchRequest,
+    }
+    return models[name]
+
+
+def catalog_from_bridge_capabilities(
+    capabilities: ClientCapabilityDescriptor,
+) -> tuple[ProviderToolDescriptor, ...]:
+    """Project one durable client's tools into a non-executable provider catalog."""
+
+    descriptors: list[ProviderToolDescriptor] = []
+    for name in capabilities.tools:
+        effect = _BRIDGE_TOOL_EFFECTS[name]
+        if effect not in capabilities.effects:
+            continue
+        descriptors.append(
+            ProviderToolDescriptor(
+                name=name,
+                description=_BRIDGE_TOOL_DESCRIPTIONS[name],
+                input_schema=_bridge_argument_model(name).model_json_schema(mode="validation"),
+            )
+        )
+    return tuple(descriptors)
+
+
+def _bridge_sentinel_registry(capabilities: ClientCapabilityDescriptor) -> ToolRegistry:
+    """Build a catalog registry whose handlers must never run on the server."""
+
+    async def sentinel(context: object) -> None:
+        del context
+        raise RuntimeError("BRIDGE must not invoke a server-local tool handler")
+
+    definitions: list[ToolDefinition] = []
+    for name in capabilities.tools:
+        effect = _BRIDGE_TOOL_EFFECTS[name]
+        if effect not in capabilities.effects:
+            continue
+        definitions.append(
+            ToolDefinition(
+                name=name,
+                description=_BRIDGE_TOOL_DESCRIPTIONS[name],
+                effect=effect,
+                argument_model=_bridge_argument_model(name),
+                handler=sentinel,
+            )
+        )
+    return ToolRegistry(definitions)
+
+
+class BridgeRemoteToolExecutor:
+    """Persist BRIDGE assignments without a server workspace runtime."""
+
+    def __init__(self, scope: ExecutionScope, store: SqliteStore, settings: Settings) -> None:
+        self._scope = scope
+        self._store = store
+        self._settings = settings
+        self._client: RegisteredBridgeClient | None = None
+
+    async def provider_catalog(self) -> tuple[ProviderToolDescriptor, ...]:
+        """Return the assigned client's public catalog without opening a root."""
+
+        client = await self._assigned_client()
+        return catalog_from_bridge_capabilities(client.capabilities)
+
+    async def execute(
+        self,
+        call: AgentToolCall,
+        *,
+        context: AgentToolContext,
+    ) -> AgentToolExecution:
+        """Persist a remote assignment without invoking a server handler."""
+
+        if context.run_id != self._scope.run_id:
+            return ScopedAgentToolExecutor._failed(call, "scope_mismatch")
+        try:
+            client = await self._assigned_client()
+            registry = _bridge_sentinel_registry(client.capabilities)
+            definition = registry.get(call.tool_name)
+            definition.validate_arguments(call.arguments)
+            snapshot_id = await self._ready_snapshot_id()
+            persisted_call = ToolCall(
+                call_id=AgentToolExecutor._internal_call_id(
+                    run_id=self._scope.run_id,
+                    work_unit_id=context.work_unit_id,
+                    snapshot_id=snapshot_id,
+                    provider_call_id=call.call_id,
+                    tool_name=call.tool_name,
+                ),
+                run_id=self._scope.run_id,
+                work_unit_id=context.work_unit_id,
+                tool_name=call.tool_name,
+                effect=definition.effect,
+                arguments=dict(call.arguments),
+                snapshot_id=snapshot_id,
+                requested_at=utc_now(),
+            )
+            outcome = await ToolExecutor(registry, self._store).execute(
+                persisted_call,
+                self._scope.agent_options.agent_mode,
+                workspace_id=self._scope.workspace_id,
+                idempotency_key=persisted_call.call_id,
+                isolation_mode=self._scope.agent_options.isolation_mode,
+                execution_location=ExecutionLocation.BRIDGE,
+                user_explicit_host_yolo=self._scope.agent_options.user_explicit,
+                settings=self._settings,
+            )
+        except Exception:
+            return ScopedAgentToolExecutor._failed(call, "tool_runtime_unavailable")
+        if (
+            outcome.assignment is not None
+            and outcome.result is None
+            and outcome.decision.outcome is PolicyOutcome.ALLOW
+        ):
+            raise RemoteToolAssignmentPending(
+                outcome.assignment.model_copy(update={"client_id": client.client_id})
+            )
+        if outcome.result is None:
+            if outcome.decision.outcome is PolicyOutcome.ASK:
+                return AgentToolExecution(
+                    call=call,
+                    awaiting_approval=True,
+                    reason=outcome.decision.reason_code.value,
+                )
+            return ScopedAgentToolExecutor._failed(call, "policy_denied")
+        return AgentToolExecution(
+            call=call,
+            result=AgentToolExecutor.public_result(call, outcome.result),
+        )
+
+    async def _assigned_client(self) -> RegisteredBridgeClient:
+        if self._client is not None:
+            return self._client
+        clients = await self._store.list_bridge_clients(
+            principal_id=self._scope.principal_id,
+            workspace_id=self._scope.workspace_id,
+        )
+        active = tuple(
+            client
+            for client in clients
+            if client.status is BridgeClientStatus.ACTIVE
+        )
+        if len(active) != 1:
+            raise ToolRuntimeError("BRIDGE requires one assigned durable client")
+        self._client = active[0]
+        return self._client
+
+    async def _ready_snapshot_id(self) -> SnapshotId:
+        snapshots = await self._store.list_snapshots(
+            self._scope.workspace_id, owner_id=self._scope.principal_id
+        )
+        ready = tuple(
+            snapshot
+            for snapshot in snapshots
+            if snapshot.status is SnapshotStatus.READY
+        )
+        if not ready:
+            raise ToolRuntimeError("workspace has no ready snapshot")
+        return ready[-1].snapshot_id
+
+
 class ScopeToolRuntimeProvider:
     """Own lazy, non-shared workspace runtimes for one application lifespan."""
 
@@ -558,10 +762,13 @@ class ScopeToolRuntimeProvider:
         settings: Settings,
         *,
         factory: WorkspaceToolRuntimeFactory | None = None,
+        enable_server_resolver: bool = True,
     ) -> None:
         self._store = store
         self._settings = settings
-        self._resolver = WorkspaceResolver(settings.workspace_roots)
+        self._resolver = (
+            WorkspaceResolver(settings.workspace_roots) if enable_server_resolver else None
+        )
         self._factory = factory or WorkspaceToolRuntimeFactory()
         self._runtimes: dict[str, WorkspaceToolRuntime] = {}
         self._local_roots: dict[str, Path] = {}
@@ -571,11 +778,17 @@ class ScopeToolRuntimeProvider:
         """Bind a process-local directory to a workspace identity."""
         self._local_roots[workspace_id] = canonicalize_local_root(root)
 
-    def executor_for(self, scope: ExecutionScope) -> ScopedAgentToolExecutor:
+    def executor_for(
+        self, scope: ExecutionScope
+    ) -> ScopedAgentToolExecutor | BridgeRemoteToolExecutor:
         """Return a lazy adapter without opening a workspace during construction."""
+        if scope.agent_options.execution_location is ExecutionLocation.BRIDGE:
+            return BridgeRemoteToolExecutor(scope, self._store, self._settings)
         return ScopedAgentToolExecutor(scope, self._runtime_for_scope)
 
     async def _runtime_for_scope(self, scope: ExecutionScope) -> WorkspaceToolRuntime:
+        if scope.agent_options.execution_location is ExecutionLocation.BRIDGE:
+            raise ToolRuntimeError("BRIDGE does not resolve a server workspace root")
         existing = self._runtimes.get(scope.run_id)
         if existing is not None:
             return existing
@@ -629,6 +842,8 @@ class ScopeToolRuntimeProvider:
                     workspace_root=root,
                 )
             else:
+                if self._resolver is None:
+                    raise ToolRuntimeError("server workspace resolver is unavailable")
                 resolved = self._resolver.resolve(workspace, owner_id=scope.principal_id)
             try:
                 runtime = self._factory.build(

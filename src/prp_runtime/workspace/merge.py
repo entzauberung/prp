@@ -31,6 +31,7 @@ __all__ = [
     "merge_change_sets",
     "merge_input_digest",
     "merge_candidate_manifest",
+    "merge_candidate_file_contents",
     "promote_merge",
 ]
 
@@ -170,6 +171,31 @@ def merge_candidate_manifest(root: Path) -> SnapshotManifest:
                 )
             )
     return SnapshotManifest(entries=tuple(entries))
+
+
+def merge_candidate_file_contents(root: Path, manifest: SnapshotManifest) -> dict[str, str]:
+    """Read UTF-8 payload files from a merge staging tree, never a live destination."""
+    _safe_tree(root)
+    resolved_root = root.resolve()
+    contents: dict[str, str] = {}
+    for entry in manifest.entries:
+        if entry.entry_type is not SnapshotEntryType.FILE:
+            continue
+        path = (resolved_root / entry.path).resolve()
+        try:
+            path.relative_to(resolved_root)
+        except ValueError as error:
+            raise MergeError("merged candidate path is outside the staging tree") from error
+        if not path.is_file() or path.is_symlink():
+            raise MergeError("merged candidate file is unavailable")
+        payload = path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != entry.sha256 or len(payload) != entry.size:
+            raise MergeError("merged candidate content does not match the manifest")
+        try:
+            contents[entry.path] = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return contents
 
 
 def _copy_payload(source: Path, destination: Path) -> None:

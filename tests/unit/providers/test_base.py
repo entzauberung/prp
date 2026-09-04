@@ -469,3 +469,54 @@ def test_profile_environment_value_rejects_non_standard_numbers(token: str) -> N
     tampered = payload.replace(target, f'"context_window_tokens": {token}')
     with pytest.raises(ValidationError):
         Settings.from_env({"PRP_WORKER_PROFILE": tampered})
+
+
+def analyzer_profile(**overrides: object) -> ModelProfile:
+    return ModelProfile(
+        **{
+            **WORKER,
+            "alias": "analyzer",
+            "model": "analyzer-model",
+            "role": ModelRole.ANALYZER,
+            **overrides,
+        }
+    )  # type: ignore[arg-type]
+
+
+def verifier_profile(**overrides: object) -> ModelProfile:
+    return ModelProfile(
+        **{
+            **WORKER,
+            "alias": "verifier",
+            "model": "verifier-model",
+            "role": ModelRole.VERIFIER,
+            **overrides,
+        }
+    )  # type: ignore[arg-type]
+
+
+def test_require_profile_does_not_alias_analyzer_or_verifier_to_worker() -> None:
+    settings = Settings(worker_profile=worker_profile())
+    assert settings.profile_for_role(ModelRole.ANALYZER) is None
+    assert settings.profile_for_role(ModelRole.VERIFIER) is None
+    with pytest.raises(ProviderError) as analyzer_error:
+        settings.require_profile(ModelRole.ANALYZER)
+    with pytest.raises(ProviderError) as verifier_error:
+        settings.require_profile(ModelRole.VERIFIER)
+    assert analyzer_error.value.code is ErrorCode.PROVIDER_NOT_CONFIGURED
+    assert verifier_error.value.code is ErrorCode.PROVIDER_NOT_CONFIGURED
+    configured = Settings(
+        worker_profile=worker_profile(),
+        analyzer_profile=analyzer_profile(),
+        verifier_profile=verifier_profile(),
+    )
+    assert configured.require_profile(ModelRole.ANALYZER).alias == "analyzer"
+    assert configured.require_profile(ModelRole.VERIFIER).alias == "verifier"
+    assert configured.require_profile(ModelRole.WORKER).alias == "worker"
+
+
+def test_settings_reject_analyzer_or_verifier_declared_as_worker() -> None:
+    with pytest.raises(ValidationError):
+        Settings(analyzer_profile=worker_profile(alias="analyzer"))
+    with pytest.raises(ValidationError):
+        Settings(verifier_profile=worker_profile(alias="verifier"))

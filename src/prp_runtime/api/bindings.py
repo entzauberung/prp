@@ -14,16 +14,19 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 from prp_runtime.api.errors import binding_error
 from prp_runtime.domain.errors import ErrorCode
 from prp_runtime.domain.models import (
+    BridgeDispatchFacts,
     Budget,
     NativeRunRequest,
     OutputRequirement,
     RoutingIntent,
+    project_public_bridge_dispatch,
 )
 from prp_runtime.domain.values import RunId
 
 __all__ = [
     "BindingNormalizationResult",
     "BindingOperation",
+    "normalize_bridge_dispatch",
     "normalize_cancel",
     "normalize_query",
     "normalize_request",
@@ -229,3 +232,24 @@ def normalize_query(run_id: str) -> BindingNormalizationResult:
 def normalize_cancel(run_id: str) -> BindingNormalizationResult:
     """Validate a cancellation identifier without touching the store."""
     return _normalize_control(BindingOperation.CANCEL, run_id)
+
+
+def normalize_bridge_dispatch(payload: Mapping[str, object]) -> BridgeDispatchFacts:
+    """Normalize one public Bridge dispatch mapping and reject private facts."""
+    if not isinstance(payload, Mapping):
+        raise binding_error(
+            ErrorCode.INVALID_REQUEST,
+            "the bridge dispatch must be an object",
+            field="body",
+        )
+    try:
+        return project_public_bridge_dispatch(payload)
+    except ValueError as error:
+        message = str(error)
+        code = (
+            ErrorCode.UNSUPPORTED_FIELD
+            if "cannot cross the public Bridge boundary" in message
+            or "raw roots cannot cross" in message
+            else ErrorCode.INVALID_REQUEST
+        )
+        raise binding_error(code, message, field="body") from error

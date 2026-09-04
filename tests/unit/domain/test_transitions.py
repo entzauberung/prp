@@ -7,6 +7,7 @@ import pytest
 from prp_runtime.domain.enums import (
     AgentMode,
     AttemptStatus,
+    BridgeClaimStatus,
     ExecutionStrategy,
     ReservationStatus,
     RoutingPolicy,
@@ -16,6 +17,7 @@ from prp_runtime.domain.enums import (
 )
 from prp_runtime.domain.transitions import (
     ATTEMPT_TRANSITIONS,
+    BRIDGE_CLAIM_TRANSITIONS,
     RESERVATION_TRANSITIONS,
     RUN_TRANSITIONS,
     TOOL_CALL_TRANSITIONS,
@@ -30,6 +32,7 @@ from prp_runtime.domain.transitions import (
     can_escalate_strategy,
     can_start_attempt,
     can_transition_attempt,
+    can_transition_bridge_claim,
     can_transition_reservation,
     can_transition_run,
     can_transition_work_unit,
@@ -44,6 +47,7 @@ from prp_runtime.domain.transitions import (
     recover_attempt_on_restart,
     resolve_run_outcome,
     transition_attempt,
+    transition_bridge_claim,
     transition_reservation,
     transition_run,
     transition_work_unit,
@@ -58,6 +62,7 @@ def test_every_status_has_a_transition_entry() -> None:
     assert set(ATTEMPT_TRANSITIONS) == set(AttemptStatus)
     assert set(RESERVATION_TRANSITIONS) == set(ReservationStatus)
     assert set(TOOL_CALL_TRANSITIONS) == set(ToolCallStatus)
+    assert set(BRIDGE_CLAIM_TRANSITIONS) == set(BridgeClaimStatus)
 
 
 def test_terminal_statuses_have_no_outgoing_transition() -> None:
@@ -566,3 +571,21 @@ def test_all_state_machine_errors_share_one_base() -> None:
         assert isinstance(error, DomainTransitionError)
         assert isinstance(error, ValueError)
         assert str(error)
+
+
+
+def test_bridge_claim_transition_table() -> None:
+    assert can_transition_bridge_claim(BridgeClaimStatus.ACTIVE, BridgeClaimStatus.EXPIRED)
+    assert can_transition_bridge_claim(BridgeClaimStatus.ACTIVE, BridgeClaimStatus.SETTLED)
+    assert can_transition_bridge_claim(BridgeClaimStatus.ACTIVE, BridgeClaimStatus.RELEASED)
+    assert transition_bridge_claim(BridgeClaimStatus.ACTIVE, BridgeClaimStatus.RELEASED) is BridgeClaimStatus.RELEASED
+    with pytest.raises(IllegalStatusTransitionError):
+        transition_bridge_claim(BridgeClaimStatus.EXPIRED, BridgeClaimStatus.SETTLED)
+    assert (
+        transition_bridge_claim(
+            BridgeClaimStatus.RELEASED,
+            BridgeClaimStatus.RELEASED,
+            idempotent_terminal=True,
+        )
+        is BridgeClaimStatus.RELEASED
+    )

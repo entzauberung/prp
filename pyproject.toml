@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prp-runtime"
-version = "0.0.3"
+version = "0.0.4"
 description = "Local-first Progressive Reasoning Protocol agent runtime"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/prp-runtime/prp"
+Homepage = "https://github.com/entzauberung/prp"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prp_runtime"]

@@ -13,7 +13,7 @@ from prp_runtime.settings import Settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-EXPECTED_VERSION = "0.0.3"
+EXPECTED_VERSION = "0.0.4"
 EXPECTED_LICENSE = "Apache-2.0"
 
 

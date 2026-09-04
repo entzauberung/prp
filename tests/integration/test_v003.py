@@ -1,4 +1,4 @@
-"""v0.0.3 integration: Native PLANNED requests through persisted results."""
+"""Integration: Native PLANNED requests through persisted results."""
 
 import asyncio
 import json
@@ -85,7 +85,7 @@ class PlanAdapter:
         self.requests.append(request)
         return ProviderResponse(
             text=json.dumps({
-                "summary": "v0.0.3 fixed plan",
+                "summary": "fixed plan",
                 "final_node": self._nodes[-1]["key"],
                 "nodes": self._nodes,
             }),

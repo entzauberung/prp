@@ -25,6 +25,8 @@ from prp_runtime.workspace.merge import (
     MergeError,
     MergeStatus,
     StagedChangeSet,
+    merge_candidate_file_contents,
+    merge_candidate_manifest,
     promote_merge,
 )
 
@@ -79,6 +81,10 @@ def test_temporary_merge_candidate_is_dev_only_and_does_not_expose_or_change_bas
     assert str(staging_root) not in result.model_dump_json()
     assert "staging_root" not in result.model_dump(mode="json")
     assert (base_root / "README.md").read_text(encoding="utf-8") == before
+    manifest = merge_candidate_manifest(result.staging_root)
+    contents = merge_candidate_file_contents(result.staging_root, manifest)
+    assert contents["README.md"] == after
+    assert not any(path == ".git" or path.startswith(".git/") for path in contents)
     with pytest.raises(MergeError, match="verified"):
         promote_merge(result, tmp_path / "unverified")
 

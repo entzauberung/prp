@@ -252,7 +252,7 @@ class Planner:
         """Build the outbound request from a bounded public Native summary."""
         if self._profile.role is not ModelRole.PLANNER:
             raise ProviderError(
-                f"model alias {self._profile.alias!r} is not a PLANNER profile",
+                f"model alias {self._profile.alias!r} is not a PLANNER profile and cannot alias Analyzer, Verifier or Worker",
                 code=ErrorCode.PROVIDER_NOT_CONFIGURED,
             )
         summary = _PlannerInput(
@@ -362,7 +362,7 @@ class Planner:
             raise ValueError("base_graph_version must be at least 1")
         if self._profile.role is not ModelRole.PLANNER:
             raise ProviderError(
-                f"model alias {self._profile.alias!r} is not a PLANNER profile",
+                f"model alias {self._profile.alias!r} is not a PLANNER profile and cannot alias Analyzer, Verifier or Worker",
                 code=ErrorCode.PROVIDER_NOT_CONFIGURED,
             )
         summary = _PlannerRevisionInput(

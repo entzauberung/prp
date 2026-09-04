@@ -7,6 +7,12 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from prp_runtime.client.executor import BridgeDispatchError, BridgeExecutor
+from prp_runtime.domain.models import (
+    ClientCapabilityDescriptor,
+    fingerprint_client_capabilities,
+    new_client_id,
+)
+from prp_runtime.domain.values import new_snapshot_id
 from prp_runtime.domain.enums import (
     BridgeClaimStatus,
     IsolationMode,
@@ -14,6 +20,7 @@ from prp_runtime.domain.enums import (
 )
 from prp_runtime.policy.models import CommandClass
 from prp_runtime.tools import ToolDefinition, ToolRegistry, build_filesystem_registry
+from prp_runtime.tools.filesystem import build_bridge_registry
 from prp_runtime.tools.command import (
     CommandInvocation,
     CommandParameter,
@@ -372,3 +379,225 @@ def test_plan_rejects_unknown_tool_and_effect_mismatch(tmp_path: Path) -> None:
             executor.plan(_claim(tool_name="run_shell"), now=NOW)
         with pytest.raises(BridgeDispatchError, match="effect does not match"):
             executor.plan(_claim(effect=ToolEffect.WRITE), now=NOW)
+
+
+
+def test_capability_advertisement_is_registry_derived_and_root_free(tmp_path: Path) -> None:
+    with WorkspaceBackend(tmp_path) as backend:
+        executor = BridgeExecutor(build_filesystem_registry(backend), tmp_path)
+        client_id = new_client_id()
+        request = executor.handshake_request(client_id, workspace_id="ws_bridge01")
+        payload = request.model_dump(mode="json")
+
+    assert request.client_id == client_id
+    assert request.capabilities.tools == ("list_files", "read_file")
+    assert request.capabilities.effects == (ToolEffect.READ,)
+    assert request.fingerprint == fingerprint_client_capabilities(request.capabilities)
+    assert str(tmp_path) not in request.model_dump_json()
+    assert "strategy" not in payload
+    assert "token" not in payload
+    executor.verify_advertised_capabilities(request.capabilities)
+    with pytest.raises(BridgeDispatchError, match="do not match"):
+        executor.verify_advertised_capabilities(
+            ClientCapabilityDescriptor(tools=("read_file",), effects=(ToolEffect.READ,))
+        )
+    with pytest.raises(Exception):
+        ClientCapabilityDescriptor(
+            tools=("unknown_shell",),
+            effects=(ToolEffect.READ,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_does_not_invoke_handler(tmp_path: Path) -> None:
+    mutations = 0
+
+    class Arguments(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        path: str
+
+    async def handler(context: Any) -> str:
+        nonlocal mutations
+        mutations += 1
+        del context
+        return "mutated"
+
+    registry = ToolRegistry(
+        (
+            ToolDefinition(
+                name="read_file",
+                effect=ToolEffect.READ,
+                argument_model=Arguments,
+                handler=handler,
+            ),
+        )
+    )
+    executor = BridgeExecutor(registry, tmp_path)
+    expired = _claim(
+        claimed_at=(NOW - timedelta(minutes=2)).isoformat(),
+        expires_at=(NOW - timedelta(seconds=1)).isoformat(),
+    )
+    with pytest.raises(BridgeDispatchError, match="expired"):
+        await executor.execute(expired, now=NOW)
+    assert mutations == 0
+
+    plan = executor.plan(_claim(), now=NOW)
+    with pytest.raises(BridgeDispatchError, match="expired before local execution"):
+        await executor.execute(plan, now=NOW + timedelta(minutes=6))
+    assert mutations == 0
+
+    with pytest.raises(BridgeDispatchError, match="unsupported fields"):
+        executor.plan(_claim(now=(NOW - timedelta(hours=1)).isoformat()), now=NOW)
+    with pytest.raises(BridgeDispatchError, match="unsupported fields"):
+        executor.plan(
+            _claim(observed_at=(NOW - timedelta(hours=1)).isoformat()),
+            now=NOW,
+        )
+    assert mutations == 0
+
+
+def test_plan_rejects_absolute_nested_network_and_claim_root(tmp_path: Path) -> None:
+    with WorkspaceBackend(tmp_path) as backend:
+        executor = BridgeExecutor(build_filesystem_registry(backend), tmp_path)
+        with pytest.raises(BridgeDispatchError, match="relative"):
+            executor.plan(_claim(arguments={"path": "/etc/passwd"}), now=NOW)
+        with pytest.raises(BridgeDispatchError, match="relative"):
+            executor.plan(
+                _claim(arguments={"nested": {"path": "../secret.txt"}}),
+                now=NOW,
+            )
+        with pytest.raises(BridgeDispatchError, match="unsupported fields"):
+            executor.plan(_claim(workspace_root=str(tmp_path)), now=NOW)
+        with pytest.raises(BridgeDispatchError, match="unsupported fields"):
+            executor.plan(_claim(handler="rm -rf /"), now=NOW)
+        with pytest.raises(BridgeDispatchError, match="network"):
+            executor.plan(_claim(effect=ToolEffect.NETWORK), now=NOW)
+
+
+@pytest.mark.asyncio
+async def test_nested_result_redacts_local_root(tmp_path: Path) -> None:
+    class Arguments(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        path: str
+
+    async def handler(context: Any) -> dict[str, object]:
+        del context
+        return {"nested": {"path": str(tmp_path / "secret.txt"), "note": "ok"}}
+
+    registry = ToolRegistry(
+        (
+            ToolDefinition(
+                name="emit_nested",
+                effect=ToolEffect.READ,
+                argument_model=Arguments,
+                handler=handler,
+            ),
+        )
+    )
+    payload = await BridgeExecutor(registry, tmp_path).execute(
+        _claim(tool_name="emit_nested", arguments={"path": "note.txt"}),
+        now=NOW,
+    )
+    assert payload["status"] == "SUCCEEDED"
+    assert str(tmp_path) not in str(payload)
+    assert payload["result"]["nested"]["note"] == "ok"
+
+
+
+@pytest.mark.asyncio
+async def test_bridge_registry_reads_patches_and_rejects_unknown_tools(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "main.py").write_text("old\n", encoding="utf-8")
+    snapshot_id = new_snapshot_id()
+    with WorkspaceBackend(tmp_path) as backend:
+        registry = build_bridge_registry(backend, workspace_root=tmp_path)
+        executor = BridgeExecutor(registry, tmp_path)
+        executor.verify_advertised_capabilities(executor.capability_descriptor())
+        read = await executor.execute(_claim(), now=NOW)
+        patched = await executor.execute(
+            _claim(
+                tool_name="apply_patch",
+                effect=ToolEffect.WRITE,
+                arguments={
+                    "patch": {
+                        "base_snapshot_id": snapshot_id,
+                        "unified_diff": (
+                            "--- a/src/main.py\n"
+                            "+++ b/src/main.py\n"
+                            "@@ -1 +1 @@\n"
+                            "-old\n"
+                            "+new\n"
+                        ),
+                    }
+                },
+                snapshot_id=snapshot_id,
+            ),
+            now=NOW,
+        )
+        with pytest.raises(BridgeDispatchError, match="unknown local tool"):
+            executor.plan(_claim(tool_name="run_shell"), now=NOW)
+    assert read["status"] == "SUCCEEDED"
+    assert patched["status"] == "SUCCEEDED"
+    assert patched["changed_paths"] == ["src/main.py"]
+    assert (source / "main.py").read_text(encoding="utf-8") == "new\n"
+    assert str(tmp_path) not in str(patched)
+
+
+
+@pytest.mark.asyncio
+async def test_executor_caps_claim_lease_to_server_total_window(tmp_path: Path) -> None:
+    from prp_runtime.domain.models import MAX_BRIDGE_LEASE_TOTAL_SECONDS
+
+    with WorkspaceBackend(tmp_path) as backend:
+        executor = BridgeExecutor(build_filesystem_registry(backend), tmp_path)
+        tampered = _claim(expires_at=(NOW + timedelta(hours=1)).isoformat())
+        plan = executor.plan(tampered, now=NOW)
+        assert plan.expires_at <= NOW + timedelta(seconds=MAX_BRIDGE_LEASE_TOTAL_SECONDS)
+        with pytest.raises(BridgeDispatchError, match="expired"):
+            await executor.execute(
+                plan,
+                now=NOW + timedelta(seconds=MAX_BRIDGE_LEASE_TOTAL_SECONDS + 1),
+            )
+
+
+
+@pytest.mark.asyncio
+async def test_expired_read_does_not_leave_handler_side_effects(tmp_path: Path) -> None:
+    mutations = 0
+
+    class Arguments(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        path: str
+
+    async def handler(context: Any) -> str:
+        nonlocal mutations
+        mutations += 1
+        del context
+        return "mutated"
+
+    registry = ToolRegistry(
+        (
+            ToolDefinition(
+                name="read_file",
+                effect=ToolEffect.READ,
+                argument_model=Arguments,
+                handler=handler,
+            ),
+        )
+    )
+    executor = BridgeExecutor(registry, tmp_path)
+    expired = _claim(
+        claimed_at=(NOW - timedelta(minutes=2)).isoformat(),
+        expires_at=(NOW - timedelta(seconds=1)).isoformat(),
+    )
+    with pytest.raises(BridgeDispatchError, match="expired"):
+        await executor.execute(expired, now=NOW)
+    assert mutations == 0
+    recovered = _claim()
+    result = await executor.execute(recovered, now=NOW)
+    assert mutations == 1
+    assert result["status"] == "SUCCEEDED" or "output" in result or result

@@ -16,6 +16,7 @@ from prp_runtime.tools import (
     ToolCall,
     build_filesystem_registry,
 )
+from prp_runtime.tools.filesystem import build_bridge_registry
 from prp_runtime.workspace import WorkspaceBackend
 
 
@@ -87,3 +88,21 @@ def test_filesystem_registry_declares_only_read_effects(tmp_path: Path) -> None:
         registry = build_filesystem_registry(backend)
     assert registry.names == ("list_files", "read_file")
     assert all(definition.effect is ToolEffect.READ for definition in registry)
+
+
+def test_bridge_registry_advertises_closed_local_tools(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("ok\n", encoding="utf-8")
+    with WorkspaceBackend(tmp_path) as backend:
+        registry = build_bridge_registry(backend, workspace_root=tmp_path)
+    required = {
+        "list_files",
+        "read_file",
+        "apply_patch",
+        "get_diff",
+        "get_status",
+        "run_targeted_test",
+    }
+    assert required <= set(registry.names)
+    assert "run_shell" not in registry.names
+    assert registry["apply_patch"].effect is ToolEffect.WRITE
+    assert registry["run_targeted_test"].effect is ToolEffect.COMMAND

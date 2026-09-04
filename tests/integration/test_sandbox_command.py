@@ -16,7 +16,11 @@ from prp_runtime.tools.command import (
     CommandRunner,
     CommandSpec,
 )
-from prp_runtime.workspace.sandbox import default_runtime_roots
+from prp_runtime.workspace.sandbox import (
+    SandboxCapabilities,
+    SandboxUnavailableError,
+    default_runtime_roots,
+)
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "command_fixture.py"
 
@@ -120,3 +124,26 @@ async def test_sandbox_runtime_mount_is_read_only(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert result.stdout.strip() == "runtime-read-only"
     assert target.exists() is False
+
+
+def test_sandboxed_without_capability_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "sandbox-workspace"
+    workspace.mkdir()
+
+    class UnreadyBackend:
+        def probe(self) -> SandboxCapabilities:
+            return SandboxCapabilities(
+                backend="unavailable",
+                available=False,
+                reason="missing bubblewrap",
+            )
+
+    with pytest.raises(SandboxUnavailableError):
+        CommandRunner(
+            CommandRegistry(()),
+            workspace_cwd=workspace,
+            test_only=True,
+            isolation_mode=IsolationMode.SANDBOXED,
+            sandbox_backend=UnreadyBackend(),
+        )
+

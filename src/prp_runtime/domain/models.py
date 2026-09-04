@@ -8,10 +8,12 @@ No model carries a private chain of thought. What leaves the runtime is limited
 to plan summaries, work units, artifacts, evidence, decisions and usage.
 """
 
+import hashlib
 import json
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum, unique
 from typing import Annotated, Literal
+from collections.abc import Mapping
 from uuid import uuid4
 
 from pydantic import (
@@ -23,12 +25,14 @@ from pydantic import (
     JsonValue,
     StrictBool,
     StringConstraints,
+    ValidationError,
     model_validator,
 )
 
 from prp_runtime.domain.enums import (
     AgentMode,
     AttemptStatus,
+    BridgeClientLiveness,
     ExecutionLocation,
     ExecutionStrategy,
     IsolationMode,
@@ -38,6 +42,7 @@ from prp_runtime.domain.enums import (
     RoutingPolicy,
     RunStatus,
     ToolCallStatus,
+    ToolEffect,
     WorkUnitStatus,
 )
 from prp_runtime.domain.values import (
@@ -49,6 +54,7 @@ from prp_runtime.domain.values import (
     RunId,
     SessionId,
     SnapshotId,
+    ToolCallId,
     UtcTimestamp,
     WorkspaceId,
     WorkUnitId,
@@ -74,13 +80,27 @@ __all__ = [
     "ArtifactKind",
     "Attempt",
     "AttemptCost",
+    "BRIDGE_PROTOCOL_VERSION",
+    "BridgeClientStatus",
     "Budget",
+    "BridgeDispatchFacts",
+    "BridgeHeartbeatFacts",
+    "BridgeHeartbeatView",
+    "BridgeDispatchLimits",
+    "CLIENT_ID_PREFIX",
+    "ClientId",
+    "ClientCapabilityDescriptor",
+    "ClientHandshakeAcceptance",
+    "ClientHandshakeRequest",
+    "ClientIdentityFacts",
+    "ClientToolFacts",
     "ControllerAction",
     "ControllerDecision",
     "EVIDENCE_ID_PREFIX",
     "ErrorCategory",
     "ErrorInfo",
     "ExecutionScope",
+    "ExecutionTopology",
     "Evidence",
     "EvidenceId",
     "EvidenceKind",
@@ -91,21 +111,31 @@ __all__ = [
     "MAX_PUBLIC_JSON_BYTES",
     "MAX_PUBLIC_TEXT_CHARS",
     "NativeRunRequest",
+    "PRIVATE_BRIDGE_BOUNDARY_FIELDS",
     "Principal",
+    "RemoteWaitFacts",
+    "PublicBridgeScope",
     "Session",
     "SessionCreateRequest",
     "SessionStatus",
     "Money",
     "OutputRequirement",
+    "RegisteredBridgeClient",
     "RoutingIntent",
     "Run",
     "RunMetrics",
+    "ServerBrainFacts",
     "Usage",
     "VerificationResult",
     "WorkspaceGrant",
     "WorkUnit",
     "new_artifact_id",
+    "SUPPORTED_BRIDGE_TOOLS",
+    "fingerprint_client_capabilities",
+    "new_client_id",
     "new_evidence_id",
+    "project_public_bridge_dispatch",
+    "topology_for",
 ]
 
 # Mirrors the identifier tail used by prp_runtime.domain.values.
@@ -113,6 +143,8 @@ _ID_TAIL = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
 
 ARTIFACT_ID_PREFIX = "art_"
 EVIDENCE_ID_PREFIX = "ev_"
+CLIENT_ID_PREFIX = "cli_"
+BRIDGE_PROTOCOL_VERSION = "0.0.4"
 
 # Persisted public facts are intentionally bounded before they reach storage.
 # The model-level JSON cap is a last line of defence; fields with a larger
@@ -123,6 +155,7 @@ MAX_ARTIFACT_CONTENT_BYTES = 256 * 1024
 
 ArtifactId = Annotated[str, StringConstraints(pattern=rf"^{ARTIFACT_ID_PREFIX}{_ID_TAIL}$")]
 EvidenceId = Annotated[str, StringConstraints(pattern=rf"^{EVIDENCE_ID_PREFIX}{_ID_TAIL}$")]
+ClientId = Annotated[str, StringConstraints(pattern=rf"^{CLIENT_ID_PREFIX}{_ID_TAIL}$")]
 
 
 def new_artifact_id() -> str:
@@ -133,6 +166,11 @@ def new_artifact_id() -> str:
 def new_evidence_id() -> str:
     """Generate a fresh evidence id."""
     return f"{EVIDENCE_ID_PREFIX}{uuid4().hex}"
+
+
+def new_client_id() -> str:
+    """Generate a fresh model-free Bridge client id."""
+    return f"{CLIENT_ID_PREFIX}{uuid4().hex}"
 
 
 def _reject_blank(value: str) -> str:
@@ -786,7 +824,11 @@ class OutputRequirement(DomainModel):
 
 
 class RoutingIntent(DomainModel):
-    """Explicit client facts used for deterministic AUTO strategy selection."""
+    """Explicit client facts used for deterministic AUTO strategy selection.
+
+    Clients may not name a model role, provider, profile, URL or credential.
+    Role selection is a server-only control decision.
+    """
 
     requires_cascade: bool = False
     requires_plan: bool = False
@@ -1248,3 +1290,418 @@ class ControllerDecision(DomainModel):
         if len(set(self.evidence_ids)) != len(self.evidence_ids):
             raise ValueError("duplicate evidence reference")
         return self
+
+
+
+PRIVATE_BRIDGE_BOUNDARY_FIELDS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "host_path",
+        "password",
+        "provider",
+        "routing",
+        "routing_policy",
+        "secret",
+        "server_root",
+        "strategy",
+        "token",
+        "workspace_path",
+        "workspace_root",
+    }
+)
+MAX_BRIDGE_ARGUMENT_BYTES = 64 * 1024
+MAX_BRIDGE_OUTPUT_BYTES = 256 * 1024
+MAX_BRIDGE_LEASE_SECONDS = 60
+MAX_BRIDGE_LEASE_TOTAL_SECONDS = 180
+MAX_BRIDGE_LEASE_RENEW_SECONDS = 30
+MAX_BRIDGE_LEASE_RENEWS = 4
+MAX_BRIDGE_HEARTBEAT_TTL_SECONDS = 30
+BRIDGE_HEARTBEAT_CADENCE_SECONDS = 15
+BridgeToolName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    ),
+]
+
+
+def _is_raw_root(value: str) -> bool:
+    if value.startswith(("/", "\\")):
+        return True
+    return (
+        len(value) >= 3
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in {"/", "\\"}
+    )
+
+
+def _reject_private_bridge_fields(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if str(key).lower() in PRIVATE_BRIDGE_BOUNDARY_FIELDS:
+                raise ValueError(f"{key} cannot cross the public Bridge boundary")
+            _reject_private_bridge_fields(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _reject_private_bridge_fields(nested)
+
+
+def _reject_raw_roots(value: object) -> None:
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            _reject_raw_roots(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _reject_raw_roots(nested)
+    elif isinstance(value, str) and _is_raw_root(value):
+        raise ValueError("raw roots cannot cross the public Bridge boundary")
+
+
+class ExecutionTopology(DomainModel):
+    """Server/client ownership split for one execution location."""
+
+    location: ExecutionLocation
+    server_owns_brain: Literal[True] = True
+    client_owns_local_tools: bool
+    client_owns_local_workspace: bool
+
+    @model_validator(mode="after")
+    def _ownership_matches_location(self) -> "ExecutionTopology":
+        remote_client = self.location is ExecutionLocation.BRIDGE
+        if self.client_owns_local_tools is not remote_client:
+            raise ValueError("client tool ownership must match the execution location")
+        if self.client_owns_local_workspace is not remote_client:
+            raise ValueError(
+                "client workspace ownership must match the execution location"
+            )
+        return self
+
+
+def topology_for(location: ExecutionLocation) -> ExecutionTopology:
+    """Return the frozen ownership split for one execution location."""
+    remote_client = location is ExecutionLocation.BRIDGE
+    return ExecutionTopology(
+        location=location,
+        client_owns_local_tools=remote_client,
+        client_owns_local_workspace=remote_client,
+    )
+
+
+class ServerBrainFacts(DomainModel):
+    """Private server authority. This is not a Bridge payload."""
+
+    run_id: RunId
+    strategy: ExecutionStrategy | None = None
+    routing_policy: RoutingPolicy = RoutingPolicy.AUTO
+    budget: Budget = Field(default_factory=Budget)
+    agent_options: AgentRequestOptions = Field(default_factory=AgentRequestOptions)
+
+
+class ClientIdentityFacts(DomainModel):
+    """Versionable model-free Bridge client identity and capabilities."""
+
+    client_id: ClientId
+    protocol_version: Literal["0.0.4"] = BRIDGE_PROTOCOL_VERSION
+    location: ExecutionLocation = ExecutionLocation.BRIDGE
+    tools: tuple[BridgeToolName, ...] = ()
+    effects: tuple[ToolEffect, ...] = ()
+
+    @model_validator(mode="after")
+    def _identity_is_model_free_bridge(self) -> "ClientIdentityFacts":
+        if self.location is not ExecutionLocation.BRIDGE:
+            raise ValueError("client identity is defined only for BRIDGE")
+        if len(set(self.tools)) != len(self.tools):
+            raise ValueError("client tools must be unique")
+        if len(set(self.effects)) != len(self.effects):
+            raise ValueError("client effects must be unique")
+        return self
+
+
+class ClientToolFacts(DomainModel):
+    """Client-owned registered-tool facts. No strategy or credentials."""
+
+    client_id: ClientId
+    tool_name: BridgeToolName
+    effect: ToolEffect
+    location: ExecutionLocation = ExecutionLocation.BRIDGE
+
+    @model_validator(mode="after")
+    def _client_tool_is_bridge_local(self) -> "ClientToolFacts":
+        if self.location is not ExecutionLocation.BRIDGE:
+            raise ValueError("client tool facts are defined only for BRIDGE")
+        return self
+
+
+class RemoteWaitFacts(DomainModel):
+    """Public remote-result wait. Distinct from approval, success and failure."""
+
+    call_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+    tool_call_id: ToolCallId | None = None
+    workspace_id: WorkspaceId | None = None
+    client_id: ClientId | None = None
+    reason: Literal["remote_assignment_pending"] = "remote_assignment_pending"
+
+
+class PublicBridgeScope(DomainModel):
+    """Public identifiers for one Bridge dispatch. No host path."""
+
+    session_id: SessionId
+    run_id: RunId
+    workspace_id: WorkspaceId
+    principal_id: PrincipalId | None = None
+    client_id: ClientId | None = None
+
+
+class BridgeDispatchLimits(DomainModel):
+    """Finite public ceilings for one Bridge tool execution."""
+
+    max_argument_bytes: int = Field(
+        default=MAX_BRIDGE_ARGUMENT_BYTES, ge=1, le=MAX_BRIDGE_ARGUMENT_BYTES
+    )
+    max_output_bytes: int = Field(
+        default=MAX_BRIDGE_OUTPUT_BYTES, ge=1, le=MAX_BRIDGE_OUTPUT_BYTES
+    )
+    max_runtime_ms: int | None = Field(default=None, ge=1)
+
+
+class BridgeDispatchFacts(DomainModel):
+    """Public Bridge dispatch: identifiers, tool/effect, scope and limits."""
+
+    call_id: ToolCallId
+    work_unit_id: WorkUnitId
+    tool_name: BridgeToolName
+    effect: ToolEffect
+    scope: PublicBridgeScope
+    arguments: dict[str, JsonValue] = Field(default_factory=dict)
+    snapshot_id: SnapshotId | None = None
+    limits: BridgeDispatchLimits = Field(default_factory=BridgeDispatchLimits)
+    location: ExecutionLocation = ExecutionLocation.BRIDGE
+    requested_at: UtcTimestamp
+
+    @model_validator(mode="after")
+    def _dispatch_is_public_and_bounded(self) -> "BridgeDispatchFacts":
+        if self.location is not ExecutionLocation.BRIDGE:
+            raise ValueError("public Bridge dispatch is only valid for BRIDGE")
+        _reject_private_bridge_fields(self.arguments)
+        encoded = _strict_json_bytes(
+            self.arguments,
+            field_message="bridge dispatch arguments",
+            max_bytes=self.limits.max_argument_bytes,
+        )
+        del encoded
+        return self
+
+
+def project_public_bridge_dispatch(
+    payload: Mapping[str, object],
+) -> BridgeDispatchFacts:
+    """Validate a public dispatch payload and reject private authority."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("public Bridge dispatch must be an object")
+    _reject_private_bridge_fields(payload)
+    _reject_raw_roots(payload)
+    try:
+        return BridgeDispatchFacts.model_validate(payload)
+    except ValidationError as error:
+        raise ValueError(
+            "public Bridge dispatch does not match the native dispatch contract"
+        ) from error
+
+
+
+SUPPORTED_BRIDGE_TOOLS = frozenset(
+    {
+        "apply_patch",
+        "get_diff",
+        "get_status",
+        "list_files",
+        "read_file",
+        "run_targeted_test",
+        "search_text",
+    }
+)
+
+
+class ClientCapabilityDescriptor(DomainModel):
+    """Sorted local tool advertisement. No model or workspace authority."""
+
+    tools: tuple[BridgeToolName, ...]
+    effects: tuple[ToolEffect, ...]
+    max_argument_bytes: int = Field(
+        default=MAX_BRIDGE_ARGUMENT_BYTES, ge=1, le=MAX_BRIDGE_ARGUMENT_BYTES
+    )
+    max_output_bytes: int = Field(
+        default=MAX_BRIDGE_OUTPUT_BYTES, ge=1, le=MAX_BRIDGE_OUTPUT_BYTES
+    )
+    max_runtime_ms: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _capabilities_are_canonical_and_known(self) -> "ClientCapabilityDescriptor":
+        if not self.tools:
+            raise ValueError("client capabilities must advertise registered tools")
+        if self.tools != tuple(sorted(self.tools)):
+            raise ValueError("client tools must be sorted")
+        if len(set(self.tools)) != len(self.tools):
+            raise ValueError("client tools must be unique")
+        unknown = [name for name in self.tools if name not in SUPPORTED_BRIDGE_TOOLS]
+        if unknown:
+            raise ValueError("unknown Bridge tool capability")
+        if not self.effects:
+            raise ValueError("client capabilities must advertise tool effects")
+        ordered = tuple(sorted(self.effects, key=lambda item: item.value))
+        if self.effects != ordered:
+            raise ValueError("client effects must be sorted")
+        if len(set(self.effects)) != len(self.effects):
+            raise ValueError("client effects must be unique")
+        if ToolEffect.NETWORK in self.effects:
+            raise ValueError("unknown or unauthorized Bridge tool capability")
+        return self
+
+
+def fingerprint_client_capabilities(
+    capabilities: ClientCapabilityDescriptor,
+) -> str:
+    """Return a stable SHA-256 of public capability facts only."""
+    payload = {
+        "effects": [effect.value for effect in capabilities.effects],
+        "max_argument_bytes": capabilities.max_argument_bytes,
+        "max_output_bytes": capabilities.max_output_bytes,
+        "max_runtime_ms": capabilities.max_runtime_ms,
+        "protocol_version": BRIDGE_PROTOCOL_VERSION,
+        "tools": list(capabilities.tools),
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class ClientHandshakeRequest(DomainModel):
+    """Authenticated model-free client advertisement. No credentials or roots."""
+
+    client_id: ClientId
+    protocol_version: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=32),
+    ]
+    capabilities: ClientCapabilityDescriptor
+    fingerprint: Fingerprint
+    workspace_id: WorkspaceId | None = None
+
+    @model_validator(mode="after")
+    def _version_and_fingerprint_are_exact(self) -> "ClientHandshakeRequest":
+        if self.protocol_version != BRIDGE_PROTOCOL_VERSION:
+            raise ValueError("unsupported Bridge protocol version")
+        expected = fingerprint_client_capabilities(self.capabilities)
+        if self.fingerprint != expected:
+            raise ValueError("capability fingerprint does not match advertised tools")
+        return self
+
+
+class ClientHandshakeAcceptance(DomainModel):
+    """Scoped acceptance facts for one compatible Bridge client."""
+
+    accepted: Literal[True] = True
+    client_id: ClientId
+    protocol_version: Literal["0.0.4"] = BRIDGE_PROTOCOL_VERSION
+    fingerprint: Fingerprint
+    principal_id: PrincipalId
+    workspace_id: WorkspaceId | None = None
+
+
+
+@unique
+class BridgeClientStatus(StrEnum):
+    """Lifecycle of one server-registered model-free Bridge client."""
+
+    ACTIVE = "ACTIVE"
+    DISABLED = "DISABLED"
+
+
+class RegisteredBridgeClient(DomainModel):
+    """Durable server-side client scope. No root, credential or model."""
+
+    client_id: ClientId
+    principal_id: PrincipalId
+    workspace_id: WorkspaceId
+    capabilities: ClientCapabilityDescriptor
+    capability_fingerprint: Fingerprint
+    status: BridgeClientStatus = BridgeClientStatus.ACTIVE
+    created_at: UtcTimestamp = Field(default_factory=utc_now)
+    last_seen_at: UtcTimestamp | None = None
+    disabled_at: UtcTimestamp | None = None
+
+    @model_validator(mode="after")
+    def _lifecycle_matches_status(self) -> "RegisteredBridgeClient":
+        expected = fingerprint_client_capabilities(self.capabilities)
+        if self.capability_fingerprint != expected:
+            raise ValueError("capability fingerprint does not match advertised tools")
+        if self.status is BridgeClientStatus.ACTIVE and self.disabled_at is not None:
+            raise ValueError("an active Bridge client must not have disabled_at")
+        if self.status is BridgeClientStatus.DISABLED and self.disabled_at is None:
+            raise ValueError("a disabled Bridge client must have disabled_at")
+        if self.disabled_at is not None and self.disabled_at < self.created_at:
+            raise ValueError("disabled_at cannot precede created_at")
+        if self.last_seen_at is not None and self.last_seen_at < self.created_at:
+            raise ValueError("last_seen_at cannot precede created_at")
+        return self
+
+
+
+class BridgeHeartbeatFacts(DomainModel):
+    """Public liveness refresh. No secret, root or model credential."""
+
+    client_id: ClientId
+    fingerprint: Fingerprint
+    observed_at: UtcTimestamp
+
+
+class BridgeHeartbeatView(DomainModel):
+    """Scoped heartbeat result used by scheduling eligibility."""
+
+    client_id: ClientId
+    liveness: BridgeClientLiveness
+    fingerprint: Fingerprint
+    observed_at: UtcTimestamp
+    ttl_seconds: int = Field(
+        default=MAX_BRIDGE_HEARTBEAT_TTL_SECONDS,
+        ge=1,
+        le=MAX_BRIDGE_HEARTBEAT_TTL_SECONDS,
+    )
+    cadence_seconds: int = Field(
+        default=BRIDGE_HEARTBEAT_CADENCE_SECONDS,
+        ge=1,
+        le=MAX_BRIDGE_HEARTBEAT_TTL_SECONDS,
+    )
+    lease_seconds: int = Field(
+        default=MAX_BRIDGE_LEASE_SECONDS,
+        ge=1,
+        le=MAX_BRIDGE_LEASE_SECONDS,
+    )
+    lease_total_seconds: int = Field(
+        default=MAX_BRIDGE_LEASE_TOTAL_SECONDS,
+        ge=1,
+        le=MAX_BRIDGE_LEASE_TOTAL_SECONDS,
+    )
+    lease_renew_seconds: int = Field(
+        default=MAX_BRIDGE_LEASE_RENEW_SECONDS,
+        ge=1,
+        le=MAX_BRIDGE_LEASE_RENEW_SECONDS,
+    )
+    max_renews: int = Field(
+        default=MAX_BRIDGE_LEASE_RENEWS,
+        ge=0,
+        le=MAX_BRIDGE_LEASE_RENEWS,
+    )

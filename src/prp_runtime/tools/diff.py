@@ -45,6 +45,7 @@ __all__ = [
     "MAX_DIFF_ENTRIES",
     "MAX_DIFF_OUTPUT_BYTES",
     "change_set_diff",
+    "DeferredDiffRunner",
     "build_diff_definitions",
     "parse_git_name_status",
     "parse_git_status",
@@ -222,6 +223,38 @@ class DiffRequest(DomainModel):
 
 class DiffManifestMismatchError(RuntimeError):
     """The current workspace does not match the expected ChangeSet result."""
+
+
+class DeferredDiffRunner:
+    """Keep get_diff/get_status in the catalog until a local patch binds."""
+
+    def __init__(
+        self,
+        base_manifest: SnapshotManifest,
+        manifest_provider: Callable[[], SnapshotManifest],
+    ) -> None:
+        self._base_manifest = base_manifest
+        self._manifest_provider = manifest_provider
+        self._runner: DiffToolRunner | None = None
+
+    def bind(self, change_set: ChangeSet) -> None:
+        if self._runner is not None:
+            return
+        self._runner = DiffToolRunner(
+            change_set,
+            base_manifest=self._base_manifest,
+            manifest_provider=self._manifest_provider,
+        )
+
+    def get_diff(self) -> DiffResult:
+        if self._runner is None:
+            raise DiffManifestMismatchError("diff is unavailable before a successful patch")
+        return self._runner.get_diff()
+
+    def get_status(self) -> DiffResult:
+        if self._runner is None:
+            raise DiffManifestMismatchError("status is unavailable before a successful patch")
+        return self._runner.get_status()
 
 
 class DiffToolRunner:

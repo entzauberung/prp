@@ -187,6 +187,7 @@ def decide_hold(
             "measured usage is required before admitting against a token ceiling",
             projected_attempts,
         )
+    # Zero Usage is an arithmetic identity here, never a measured fact.
     known_usage = Usage() if measured_usage is None else measured_usage
     if budget.max_total_tokens is not None and request_upper is None:
         return _reject_decision(

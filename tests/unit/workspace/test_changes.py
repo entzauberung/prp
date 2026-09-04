@@ -1,5 +1,6 @@
 """Contract tests for bounded snapshot-rooted ChangeSet facts."""
 
+import hashlib
 from datetime import UTC, datetime
 
 import pytest
@@ -11,7 +12,10 @@ from prp_runtime.workspace.changes import (
     FileChangeAction,
     FileContent,
     Patch,
+    inherit_unchanged_file_contents,
+    overlay_changed_file_contents,
 )
+from prp_runtime.workspace.models import SnapshotEntry, SnapshotEntryType, SnapshotManifest
 
 T0 = datetime(2026, 8, 14, tzinfo=UTC)
 BASE = "snap_" + "a" * 32
@@ -74,3 +78,34 @@ def test_change_set_requires_matching_base_and_unique_changed_paths() -> None:
         change_set(changed, changed)
     with pytest.raises(ValidationError, match="new snapshot"):
         change_set(changed, new_snapshot_id=BASE)
+
+
+def _file(path: str, payload: str) -> SnapshotEntry:
+    encoded = payload.encode("utf-8")
+    return SnapshotEntry(
+        path=path,
+        sha256=hashlib.sha256(encoded).hexdigest(),
+        size=len(encoded),
+        entry_type=SnapshotEntryType.FILE,
+    )
+
+
+def test_inherit_and_overlay_file_contents_keep_unchanged_and_replace_changed() -> None:
+    kept = "kept\n"
+    gone = "gone\n"
+    updated = "updated\n"
+    old = SnapshotManifest(entries=(_file("kept.txt", kept), _file("gone.txt", gone)))
+    new = SnapshotManifest(entries=(_file("kept.txt", kept), _file("new.txt", updated)))
+    inherited = inherit_unchanged_file_contents(
+        {"kept.txt": kept, "gone.txt": gone}, old, new
+    )
+    assert inherited == {"kept.txt": kept}
+    overlay = overlay_changed_file_contents(
+        inherited,
+        (
+            FileChange(path="gone.txt", action=FileChangeAction.DELETE, before=content()),
+            FileChange(path="new.txt", action=FileChangeAction.ADD, after=content()),
+        ),
+        {"new.txt": updated},
+    )
+    assert overlay == {"kept.txt": kept, "new.txt": updated}

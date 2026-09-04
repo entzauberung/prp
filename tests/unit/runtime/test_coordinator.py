@@ -19,6 +19,7 @@ from prp_runtime.runtime.coordinator import (
     promote_merge,
     resolve_work_unit_effect,
 )
+from prp_runtime.workspace.merge import MergeError
 from prp_runtime.workspace.changes import (
     ChangeSet,
     FileChange,
@@ -278,3 +279,33 @@ def test_merge_conflict_is_explicit_and_does_not_promote(tmp_path: Path) -> None
     assert result.status is MergeStatus.CONFLICT
     assert result.conflict_report is not None
     assert result.conflict_report.kind is ConflictKind.PATH
+    assert result.verified is False
+    assert result.promoted is False
+    assert (base / "same.txt").read_text() == "base"
+    assert (left_root / "same.txt").read_text() == "left"
+    assert (right_root / "same.txt").read_text() == "right"
+    with pytest.raises(MergeError, match="verified merged result"):
+        promote_merge(result, tmp_path / "promoted")
+    assert not (tmp_path / "promoted").exists()
+
+
+def test_unverified_merged_candidate_cannot_self_promote(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "a.txt").write_text("a0")
+    left_root = _snapshot(tmp_path, "left")
+    (left_root / "a.txt").write_text("a1")
+    result = Coordinator().merge_candidate(
+        base,
+        (StagedChangeSet(_change_set("left", "a.txt", "a0", "a1"), left_root),),
+        staging_root=tmp_path / "staging",
+    )
+
+    assert result.status is MergeStatus.MERGED
+    assert result.verified is False
+    assert result.promoted is False
+    assert (base / "a.txt").read_text() == "a0"
+    with pytest.raises(MergeError, match="verified merged result"):
+        promote_merge(result, tmp_path / "promoted")
+    assert not (tmp_path / "promoted").exists()
+    assert (base / "a.txt").read_text() == "a0"

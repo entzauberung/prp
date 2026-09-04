@@ -11,8 +11,11 @@ import asyncio
 from collections.abc import Awaitable, Callable, Collection
 from typing import Protocol, runtime_checkable
 
-from prp_runtime.domain.enums import RunStatus
-from prp_runtime.domain.models import Run
+from datetime import datetime, timedelta
+
+from prp_runtime.domain.enums import BridgeClientLiveness, RunStatus
+from prp_runtime.domain.models import MAX_BRIDGE_HEARTBEAT_TTL_SECONDS, Run
+from prp_runtime.domain.values import utc_now
 
 __all__ = [
     "PendingRunStore",
@@ -53,15 +56,24 @@ class RunSupervisor:
         *,
         max_concurrency: int = 1,
         scan_interval: float = 1.0,
+        heartbeat_ttl: float = float(MAX_BRIDGE_HEARTBEAT_TTL_SECONDS),
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         if scan_interval <= 0:
             raise ValueError("scan_interval must be positive")
+        if heartbeat_ttl <= 0:
+            raise ValueError("heartbeat_ttl must be positive")
+        if heartbeat_ttl > MAX_BRIDGE_HEARTBEAT_TTL_SECONDS:
+            raise ValueError("heartbeat_ttl cannot exceed the server limit")
         self._store = store
         self._execute = execute
         self._max_concurrency = max_concurrency
         self._scan_interval = scan_interval
+        self._heartbeat_ttl = timedelta(seconds=heartbeat_ttl)
+        self._clock = clock or utc_now
+        self._heartbeats: dict[str, tuple[datetime, str]] = {}
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         self._drain = False
@@ -101,6 +113,48 @@ class RunSupervisor:
     def release_held_run(self, run_id: str) -> None:
         """Allow one previously held run to be queued again."""
         self._held_run_ids.discard(run_id)
+
+    def record_bridge_heartbeat(
+        self, client_id: str, *, fingerprint: str, at: datetime | None = None
+    ) -> None:
+        """Refresh client eligibility without touching Run facts."""
+        if not client_id.strip() or not fingerprint.strip():
+            raise ValueError("heartbeat requires client_id and fingerprint")
+        self._heartbeats[client_id] = (at or self._clock(), fingerprint)
+
+    def bridge_client_liveness(
+        self,
+        client_id: str,
+        *,
+        fingerprint: str | None = None,
+        now: datetime | None = None,
+    ) -> BridgeClientLiveness:
+        """Return LIVE/OFFLINE/EXPIRED without deleting persisted work."""
+        observed = now or self._clock()
+        record = self._heartbeats.get(client_id)
+        if record is None:
+            return BridgeClientLiveness.OFFLINE
+        last_seen, seen_fingerprint = record
+        if fingerprint is not None and seen_fingerprint != fingerprint:
+            return BridgeClientLiveness.OFFLINE
+        if observed - last_seen > self._heartbeat_ttl:
+            return BridgeClientLiveness.EXPIRED
+        return BridgeClientLiveness.LIVE
+
+    def is_bridge_client_eligible(
+        self,
+        client_id: str,
+        *,
+        fingerprint: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Whether the client may receive new Bridge claims."""
+        return (
+            self.bridge_client_liveness(
+                client_id, fingerprint=fingerprint, now=now
+            )
+            is BridgeClientLiveness.LIVE
+        )
 
     def _is_gated(self, run_id: str) -> bool:
         return run_id in self._blocked_run_ids or run_id in self._held_run_ids

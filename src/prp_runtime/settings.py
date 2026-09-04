@@ -53,6 +53,8 @@ _ENV_FIELDS: dict[str, str] = {
     "PRP_LOG_LEVEL": "log_level",
     "PRP_LEADER_PROFILE": "leader_profile",
     "PRP_WORKER_PROFILE": "worker_profile",
+    "PRP_ANALYZER_PROFILE": "analyzer_profile",
+    "PRP_VERIFIER_PROFILE": "verifier_profile",
     "PRP_CASCADE_PROFILES": "cascade_profiles",
     "PRP_ALLOW_HOST_YOLO": "allow_host_yolo",
     "PRP_SERVICE_TOKEN": "service_token",
@@ -63,6 +65,10 @@ _ENV_FIELDS: dict[str, str] = {
     "PRP_PROCESS_MAX_CONCURRENCY": "process_max_concurrency",
     "PRP_PROCESS_MAX_ATTEMPTS": "process_max_attempts",
     "PRP_PROCESS_MAX_TOTAL_TOKENS": "process_max_total_tokens",
+    "PRP_EXPORT_MAX_FILES": "export_max_files",
+    "PRP_EXPORT_MAX_BYTES": "export_max_bytes",
+    "PRP_EXPORT_MAX_NESTING": "export_max_nesting",
+    "PRP_EXPORT_MAX_SECONDS": "export_max_seconds",
 }
 
 DEFAULT_PROCESS_MAX_CONCURRENCY = 1
@@ -73,6 +79,14 @@ DEFAULT_PROCESS_MAX_TOTAL_TOKENS = 250_000
 MAX_PROCESS_MAX_TOTAL_TOKENS = 1_000_000
 DEFAULT_LOCAL_WAIT_SECONDS = 30.0
 MAX_LOCAL_WAIT_SECONDS = 300.0
+DEFAULT_EXPORT_MAX_FILES = 32
+MAX_EXPORT_MAX_FILES = 128
+DEFAULT_EXPORT_MAX_BYTES = 32_768
+MAX_EXPORT_MAX_BYTES = 96_000
+DEFAULT_EXPORT_MAX_NESTING = 6
+MAX_EXPORT_MAX_NESTING = 12
+DEFAULT_EXPORT_MAX_SECONDS = 5.0
+MAX_EXPORT_MAX_SECONDS = 15.0
 
 
 def _profile_from_json(value: object) -> object:
@@ -164,6 +178,8 @@ class Settings(BaseModel):
     )
     leader_profile: ProfileValue | None = None
     worker_profile: ProfileValue | None = None
+    analyzer_profile: ProfileValue | None = None
+    verifier_profile: ProfileValue | None = None
     cascade_profiles: CascadeProfilesValue = Field(default_factory=tuple)
     isolation_max_slots: int = Field(
         default=DEFAULT_ISOLATION_MAX_SLOTS,
@@ -195,6 +211,26 @@ class Settings(BaseModel):
         gt=0,
         le=MAX_LOCAL_WAIT_SECONDS,
     )
+    export_max_files: int = Field(
+        default=DEFAULT_EXPORT_MAX_FILES,
+        ge=1,
+        le=MAX_EXPORT_MAX_FILES,
+    )
+    export_max_bytes: int = Field(
+        default=DEFAULT_EXPORT_MAX_BYTES,
+        ge=1,
+        le=MAX_EXPORT_MAX_BYTES,
+    )
+    export_max_nesting: int = Field(
+        default=DEFAULT_EXPORT_MAX_NESTING,
+        ge=1,
+        le=MAX_EXPORT_MAX_NESTING,
+    )
+    export_max_seconds: float = Field(
+        default=DEFAULT_EXPORT_MAX_SECONDS,
+        gt=0,
+        le=MAX_EXPORT_MAX_SECONDS,
+    )
 
     @model_validator(mode="after")
     def _profiles_are_consistent(self) -> "Settings":
@@ -204,6 +240,10 @@ class Settings(BaseModel):
             raise ValueError("the leader profile must declare the PLANNER role")
         if self.worker_profile is not None and self.worker_profile.role is not ModelRole.WORKER:
             raise ValueError("the worker profile must declare the WORKER role")
+        if self.analyzer_profile is not None and self.analyzer_profile.role is not ModelRole.ANALYZER:
+            raise ValueError("the analyzer profile must declare the ANALYZER role")
+        if self.verifier_profile is not None and self.verifier_profile.role is not ModelRole.VERIFIER:
+            raise ValueError("the verifier profile must declare the VERIFIER role")
         if any(profile.role is not ModelRole.WORKER for profile in self.cascade_profiles):
             raise ValueError("cascade profiles must declare the WORKER role")
 
@@ -227,7 +267,14 @@ class Settings(BaseModel):
     def profiles(self) -> tuple[ModelProfile, ...]:
         """Every configured model profile."""
         primary_profiles = tuple(
-            profile for profile in (self.leader_profile, self.worker_profile) if profile is not None
+            profile
+            for profile in (
+                self.leader_profile,
+                self.worker_profile,
+                self.analyzer_profile,
+                self.verifier_profile,
+            )
+            if profile is not None
         )
         return primary_profiles + self.cascade_profiles
 
@@ -241,11 +288,29 @@ class Settings(BaseModel):
             code=ErrorCode.PROVIDER_NOT_CONFIGURED,
         )
 
+    def profile_for_role(self, role: ModelRole) -> ModelProfile | None:
+        """Return the profile configured for a role, or None when unused.
+
+        Analyzer and Verifier may be omitted: deterministic implementations do
+        not require a provider. Missing profiles are never silently replaced by
+        the Worker profile.
+        """
+        mapping = {
+            ModelRole.PLANNER: self.leader_profile,
+            ModelRole.WORKER: self.worker_profile,
+            ModelRole.ANALYZER: self.analyzer_profile,
+            ModelRole.VERIFIER: self.verifier_profile,
+        }
+        if role not in mapping:
+            raise ProviderError(
+                f"no model profile mapping exists for the {role.value} role",
+                code=ErrorCode.PROVIDER_NOT_CONFIGURED,
+            )
+        return mapping[role]
+
     def require_profile(self, role: ModelRole) -> ModelProfile:
         """Return the profile configured for a role, or fail with a structured error."""
-        profile = (
-            self.leader_profile if role is ModelRole.PLANNER else self.worker_profile
-        )
+        profile = self.profile_for_role(role)
         if profile is None:
             raise ProviderError(
                 f"no model profile is configured for the {role.value} role",

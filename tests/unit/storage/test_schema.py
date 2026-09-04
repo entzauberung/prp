@@ -32,6 +32,7 @@ EXPECTED_TABLES = {
     "change_set_files",
     "tool_calls",
     "tool_results",
+    "bridge_clients",
     "bridge_claims",
     "approvals",
     "leases",
@@ -66,8 +67,11 @@ EXPECTED_INDEXES = {
     "idx_tool_calls_work_unit",
     "idx_tool_calls_workspace",
     "idx_tool_results_status",
+    "idx_bridge_clients_principal",
+    "idx_bridge_clients_workspace",
     "idx_bridge_claims_call",
     "idx_bridge_claims_owner",
+    "idx_bridge_claims_client",
     "uq_bridge_claims_active_call",
     "idx_approvals_owner",
     "idx_approvals_run",
@@ -217,6 +221,42 @@ async def _insert_bridge_session(
     )
 
 
+async def _insert_bridge_client(
+    store: SqliteStore,
+    client_id: str = "cli_bridgeclient1",
+    principal_id: str = "owner_1",
+    workspace_id: str = "ws_1",
+    tools_json: str = '["read_file"]',
+    effects_json: str = '["READ"]',
+    fingerprint: str = "a" * 64,
+    status: str = "ACTIVE",
+    created_at: str = "2026-08-10T12:00:00+00:00",
+    last_seen_at: str | None = None,
+    disabled_at: str | None = None,
+) -> None:
+    await store.connection.execute(
+        """
+        INSERT INTO bridge_clients (
+            client_id, principal_id, workspace_id, tools_json, effects_json,
+            max_argument_bytes, max_output_bytes, max_runtime_ms,
+            capability_fingerprint, status, created_at, last_seen_at, disabled_at
+        ) VALUES (?, ?, ?, ?, ?, 65536, 262144, NULL, ?, ?, ?, ?, ?)
+        """,
+        (
+            client_id,
+            principal_id,
+            workspace_id,
+            tools_json,
+            effects_json,
+            fingerprint,
+            status,
+            created_at,
+            last_seen_at,
+            disabled_at,
+        ),
+    )
+
+
 async def _insert_bridge_claim(
     store: SqliteStore,
     claim_id: str = "claim_1",
@@ -224,8 +264,9 @@ async def _insert_bridge_claim(
     run_id: str = "run_1",
     session_id: str = "ses_1",
     workspace_id: str = "ws_1",
+    snapshot_id: str = "snap_1",
     owner_id: str = "owner_1",
-    claimant_id: str = "bridge-client-1",
+    client_id: str = "cli_bridgeclient1",
     idempotency_key: str = "claim-request-1",
     status: str = "ACTIVE",
     claimed_at: str = "2026-08-10T12:00:00+00:00",
@@ -235,10 +276,10 @@ async def _insert_bridge_claim(
     await store.connection.execute(
         """
         INSERT INTO bridge_claims (
-            claim_id, call_id, run_id, session_id, workspace_id, owner_id,
-            claimant_id, idempotency_key, fingerprint, status, claimed_at,
+            claim_id, call_id, run_id, session_id, workspace_id, snapshot_id,
+            owner_id, client_id, idempotency_key, fingerprint, status, claimed_at,
             expires_at, closed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             claim_id,
@@ -246,8 +287,9 @@ async def _insert_bridge_claim(
             run_id,
             session_id,
             workspace_id,
+            snapshot_id,
             owner_id,
-            claimant_id,
+            client_id,
             idempotency_key,
             "a" * 64,
             status,
@@ -452,14 +494,30 @@ async def test_tool_tables_have_the_closed_call_and_result_contract(
             "error_message",
             "completed_at",
         }
+        assert await _columns(store, "bridge_clients") == {
+            "client_id",
+            "principal_id",
+            "workspace_id",
+            "tools_json",
+            "effects_json",
+            "max_argument_bytes",
+            "max_output_bytes",
+            "max_runtime_ms",
+            "capability_fingerprint",
+            "status",
+            "created_at",
+            "last_seen_at",
+            "disabled_at",
+        }
         assert await _columns(store, "bridge_claims") == {
             "claim_id",
             "call_id",
             "run_id",
             "session_id",
             "workspace_id",
+            "snapshot_id",
             "owner_id",
-            "claimant_id",
+            "client_id",
             "idempotency_key",
             "fingerprint",
             "status",
@@ -467,6 +525,7 @@ async def test_tool_tables_have_the_closed_call_and_result_contract(
             "expires_at",
             "closed_at",
         }
+        assert "claimant_id" not in await _columns(store, "bridge_claims")
 
 
 @pytest.mark.asyncio
@@ -480,6 +539,7 @@ async def test_bridge_claim_scope_lease_and_terminal_constraints_are_enforced(
         await _insert_snapshot(store)
         await _insert_tool_call(store)
         await _insert_bridge_session(store)
+        await _insert_bridge_client(store)
         await store.connection.commit()
 
         await _insert_bridge_claim(store)
@@ -506,6 +566,20 @@ async def test_bridge_claim_scope_lease_and_terminal_constraints_are_enforced(
                 claim_id="claim_4",
                 call_id="tc_missing",
                 idempotency_key="claim-4",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_bridge_claim(
+                store,
+                claim_id="claim_5",
+                client_id="cli_missing",
+                idempotency_key="claim-5",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            await _insert_bridge_client(
+                store,
+                client_id="cli_emptytools",
+                tools_json="",
+                fingerprint="b" * 64,
             )
 
 
@@ -1041,3 +1115,4 @@ async def test_schema_file_is_idempotent_and_has_no_migration_code() -> None:
     lowered = text.lower()
     assert "alter table" not in lowered
     assert "migration" not in lowered.replace("migration framework", "")
+    assert "claimant_id" not in text

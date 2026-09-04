@@ -449,12 +449,13 @@ def decide_reuse(
     candidate_change_set_ids: Sequence[str] | None = None,
     historical_evidence_ids: Sequence[str] | None = None,
     candidate_evidence_ids: Sequence[str] | None = None,
+    historical_attempts_proven: bool | None = None,
 ) -> ReuseDecision:
     """Decide reuse from persisted public facts only.
 
     The two hash sequences must be ordered by the candidate's declared
     dependency order. Missing or malformed hashes conservatively force a
-    recomputation.
+    recomputation. Attempt history must be proven before reuse.
     """
     lineage_key = candidate.lineage_key
     if historical.status is not WorkUnitStatus.SUCCEEDED:
@@ -580,6 +581,12 @@ def decide_reuse(
                 "the persisted Evidence facts are missing or changed",
                 lineage_key,
             )
+    if historical_attempts_proven is False:
+        return _reuse_recompute(
+            ReuseReason.ATTEMPT_HISTORY_NOT_PROVEN,
+            "historical success has incomplete, failed, unknown, or non-passing attempt facts",
+            lineage_key,
+        )
     return ReuseDecision(
         disposition=ReuseDisposition.REUSE,
         reason=ReuseReason.ALL_FACTS_MATCH,

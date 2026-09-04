@@ -138,3 +138,54 @@ def test_settings_expose_bounded_process_resource_envelope() -> None:
         Settings(process_max_attempts=MAX_PROCESS_MAX_ATTEMPTS + 1)
     with pytest.raises(ValidationError):
         Settings(process_max_total_tokens=MAX_PROCESS_MAX_TOTAL_TOKENS + 1)
+
+
+def _role_profile(role: str, alias: str) -> dict[str, object]:
+    return {
+        "alias": alias,
+        "provider": "test-provider",
+        "model": f"{alias}-model",
+        "role": role,
+        "base_url": "https://models.example/v1",
+        "context_window_tokens": 1_024,
+        "max_output_tokens": 128,
+    }
+
+
+def test_analyzer_and_verifier_profiles_are_not_worker_aliases() -> None:
+    settings = Settings.from_env(
+        {
+            "PRP_WORKER_PROFILE": json.dumps(_profile()),
+            "PRP_ANALYZER_PROFILE": json.dumps(_role_profile("ANALYZER", "analyzer")),
+            "PRP_VERIFIER_PROFILE": json.dumps(_role_profile("VERIFIER", "verifier")),
+        }
+    )
+    assert settings.profile_for_role(ModelRole.ANALYZER) is not settings.worker_profile
+    assert settings.require_profile(ModelRole.ANALYZER).role is ModelRole.ANALYZER
+    assert settings.require_profile(ModelRole.VERIFIER).role is ModelRole.VERIFIER
+    assert settings.require_profile(ModelRole.WORKER).role is ModelRole.WORKER
+
+
+def test_missing_analyzer_or_verifier_is_not_mapped_to_worker() -> None:
+    settings = Settings.from_env({"PRP_WORKER_PROFILE": json.dumps(_profile())})
+    assert settings.profile_for_role(ModelRole.ANALYZER) is None
+    assert settings.profile_for_role(ModelRole.VERIFIER) is None
+    with pytest.raises(Exception, match="ANALYZER"):
+        settings.require_profile(ModelRole.ANALYZER)
+    with pytest.raises(Exception, match="VERIFIER"):
+        settings.require_profile(ModelRole.VERIFIER)
+
+
+def test_settings_reject_analyzer_or_verifier_role_mismatch() -> None:
+    with pytest.raises(ValidationError):
+        Settings.from_env(
+            {"PRP_ANALYZER_PROFILE": json.dumps(_profile(alias="analyzer"))}
+        )
+    with pytest.raises(ValidationError):
+        Settings.from_env(
+            {
+                "PRP_VERIFIER_PROFILE": json.dumps(
+                    _role_profile("WORKER", "verifier")
+                )
+            }
+        )

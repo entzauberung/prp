@@ -1,4 +1,4 @@
-"""v0.0.3 conformance invariants for planned scheduling and recovery."""
+"""Conformance invariants for planned scheduling and recovery."""
 
 import asyncio
 import json

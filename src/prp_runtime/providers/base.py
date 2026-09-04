@@ -85,7 +85,8 @@ class ModelProfile(DomainModel):
     """A server-side model configuration referenced by alias.
 
     The API key is held as a secret: it never appears in ``repr`` or in JSON
-    output.
+    output. Analyzer and Verifier profiles are first-class roles and must not
+    be substituted with a Worker profile.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)

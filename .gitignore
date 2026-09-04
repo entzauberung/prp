@@ -43,6 +43,14 @@ coverage/
 .DS_Store
 Thumbs.db
 
+# Claude Code local settings
+.claude/
+
+# OpenCode local agent config and skills
+.opencode/
+opencode.json
+opencode.jsonc
+
 # IDE（可选：团队共享可保留 .vscode 部分配置）
 .idea/
 *.swp

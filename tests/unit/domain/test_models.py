@@ -19,8 +19,11 @@ from prp_runtime.domain.enums import (
     RoutingPolicy,
     RunStatus,
     ToolCallStatus,
+    ToolEffect,
     WorkUnitStatus,
 )
+from prp_runtime.api.bindings import normalize_bridge_dispatch
+from prp_runtime.domain.errors import ErrorCode, PrpError
 from prp_runtime.domain.models import (
     MAX_AGENT_HISTORY_ITEMS,
     MAX_ARTIFACT_CONTENT_BYTES,
@@ -34,7 +37,13 @@ from prp_runtime.domain.models import (
     ArtifactKind,
     Attempt,
     AttemptCost,
+    BridgeClientStatus,
+    BridgeDispatchFacts,
+    BridgeDispatchLimits,
     Budget,
+    ClientCapabilityDescriptor,
+    ClientIdentityFacts,
+    ClientToolFacts,
     ControllerAction,
     ControllerDecision,
     ErrorCategory,
@@ -42,12 +51,16 @@ from prp_runtime.domain.models import (
     Evidence,
     EvidenceKind,
     ExecutionScope,
+    ExecutionTopology,
     NativeRunRequest,
     OutputRequirement,
     Principal,
+    PublicBridgeScope,
     RoutingIntent,
     Run,
     RunMetrics,
+    RegisteredBridgeClient,
+    ServerBrainFacts,
     Session,
     SessionCreateRequest,
     SessionStatus,
@@ -55,8 +68,12 @@ from prp_runtime.domain.models import (
     VerificationResult,
     WorkspaceGrant,
     WorkUnit,
+    fingerprint_client_capabilities,
     new_artifact_id,
+    new_client_id,
     new_evidence_id,
+    project_public_bridge_dispatch,
+    topology_for,
 )
 from prp_runtime.domain.values import (
     ModelRef,
@@ -66,6 +83,7 @@ from prp_runtime.domain.values import (
     new_reservation_id,
     new_run_id,
     new_session_id,
+    new_tool_call_id,
     new_work_unit_id,
     new_workspace_id,
 )
@@ -105,13 +123,20 @@ ALL_CONTRACTS: tuple[type[BaseModel], ...] = (
     Principal,
     Artifact,
     Attempt,
+    BridgeDispatchFacts,
+    BridgeDispatchLimits,
     Budget,
+    ClientIdentityFacts,
+    ClientToolFacts,
     ControllerDecision,
     ErrorInfo,
     Evidence,
+    ExecutionTopology,
     NativeRunRequest,
     OutputRequirement,
+    PublicBridgeScope,
     RoutingIntent,
+    ServerBrainFacts,
     Session,
     SessionCreateRequest,
     WorkspaceGrant,
@@ -278,6 +303,178 @@ def test_execution_scope_is_owner_scoped_and_contains_no_host_root() -> None:
     assert "root" not in scope.model_fields
     with pytest.raises(ValidationError):
         scope.workspace_id = new_workspace_id()  # type: ignore[misc]
+
+
+def make_public_scope(**overrides: object) -> PublicBridgeScope:
+    data: dict[str, object] = {
+        "session_id": new_session_id(),
+        "run_id": new_run_id(),
+        "workspace_id": new_workspace_id(),
+        "principal_id": new_principal_id(),
+        "client_id": new_client_id(),
+    }
+    data.update(overrides)
+    return PublicBridgeScope(**data)  # type: ignore[arg-type]
+
+
+def make_dispatch_facts(**overrides: object) -> BridgeDispatchFacts:
+    data: dict[str, object] = {
+        "call_id": new_tool_call_id(),
+        "work_unit_id": new_work_unit_id(),
+        "tool_name": "read_file",
+        "effect": ToolEffect.READ,
+        "scope": make_public_scope(),
+        "arguments": {"path": "src/app.py"},
+        "requested_at": T0,
+    }
+    data.update(overrides)
+    return BridgeDispatchFacts(**data)  # type: ignore[arg-type]
+
+
+def test_execution_topology_keeps_locations_and_ownership_distinct() -> None:
+    cloud = topology_for(ExecutionLocation.CLOUD)
+    bridge = topology_for(ExecutionLocation.BRIDGE)
+    local = topology_for(ExecutionLocation.LOCAL)
+    assert cloud.server_owns_brain is True
+    assert local.server_owns_brain is True
+    assert bridge.client_owns_local_tools is True
+    assert bridge.client_owns_local_workspace is True
+    assert cloud.client_owns_local_tools is False
+    assert local.client_owns_local_workspace is False
+    assert ExecutionTopology.model_validate_json(bridge.model_dump_json()) == bridge
+    with pytest.raises(ValidationError):
+        ExecutionTopology(
+            location=ExecutionLocation.CLOUD,
+            client_owns_local_tools=True,
+            client_owns_local_workspace=True,
+        )
+    with pytest.raises(ValidationError):
+        ExecutionTopology(
+            location=ExecutionLocation.BRIDGE,
+            client_owns_local_tools=False,
+            client_owns_local_workspace=False,
+        )
+    with pytest.raises(ValidationError):
+        ExecutionTopology(
+            location=ExecutionLocation.LOCAL,
+            server_owns_brain=False,  # type: ignore[arg-type]
+            client_owns_local_tools=False,
+            client_owns_local_workspace=False,
+        )
+
+
+def test_registered_bridge_client_persists_exact_capabilities_and_rejects_mismatch() -> None:
+    capabilities = ClientCapabilityDescriptor(
+        tools=("read_file", "search_text"),
+        effects=(ToolEffect.READ,),
+    )
+    client = RegisteredBridgeClient(
+        client_id=new_client_id(),
+        principal_id=new_principal_id(),
+        workspace_id=new_workspace_id(),
+        capabilities=capabilities,
+        capability_fingerprint=fingerprint_client_capabilities(capabilities),
+        created_at=T0,
+        last_seen_at=T0 + timedelta(seconds=5),
+    )
+    restored = RegisteredBridgeClient.model_validate_json(client.model_dump_json())
+    assert restored == client
+    assert restored.capabilities.tools == ("read_file", "search_text")
+    payload = client.model_dump(mode="json")
+    assert "token" not in payload
+    assert "workspace_root" not in payload
+    other = ClientCapabilityDescriptor(tools=("apply_patch",), effects=(ToolEffect.WRITE,))
+    with pytest.raises(ValidationError):
+        RegisteredBridgeClient(
+            client_id=new_client_id(),
+            principal_id=new_principal_id(),
+            workspace_id=new_workspace_id(),
+            capabilities=capabilities,
+            capability_fingerprint=fingerprint_client_capabilities(other),
+        )
+    disabled = client.model_copy(
+        update={
+            "status": BridgeClientStatus.DISABLED,
+            "disabled_at": T0 + timedelta(minutes=1),
+        }
+    )
+    assert disabled.status is BridgeClientStatus.DISABLED
+
+
+def test_client_identity_is_versionable_strict_and_model_free() -> None:
+    identity = ClientIdentityFacts(
+        client_id=new_client_id(),
+        tools=("read_file", "apply_patch"),
+        effects=(ToolEffect.READ, ToolEffect.WRITE),
+    )
+    assert identity.protocol_version == "0.0.4"
+    assert identity.location is ExecutionLocation.BRIDGE
+    restored = ClientIdentityFacts.model_validate_json(identity.model_dump_json())
+    assert restored == identity
+    with pytest.raises(ValidationError):
+        ClientIdentityFacts(client_id=new_client_id(), location=ExecutionLocation.CLOUD)
+    with pytest.raises(ValidationError):
+        ClientIdentityFacts(client_id=new_client_id(), api_key="sk-secret")
+    with pytest.raises(ValidationError):
+        ClientIdentityFacts(
+            client_id=new_client_id(),
+            tools=("read_file", "read_file"),
+        )
+
+
+def test_public_dispatch_facts_are_json_stable_and_reject_private_authority() -> None:
+    facts = make_dispatch_facts()
+    payload = facts.model_dump(mode="json")
+    assert project_public_bridge_dispatch(payload) == facts
+    assert BridgeDispatchFacts.model_validate_json(facts.model_dump_json()) == facts
+    assert "strategy" not in payload
+    assert "workspace_root" not in payload
+    with pytest.raises(ValueError, match="cannot cross"):
+        project_public_bridge_dispatch({**payload, "strategy": "PROGRESSIVE"})
+    with pytest.raises(ValueError, match="raw roots"):
+        project_public_bridge_dispatch(
+            {**payload, "arguments": {"path": "/srv/company/repo/file.py"}}
+        )
+    with pytest.raises(ValueError, match="cannot cross"):
+        project_public_bridge_dispatch({**payload, "api_key": "sk-secret"})
+    with pytest.raises(ValidationError):
+        make_dispatch_facts(location=ExecutionLocation.LOCAL)
+    with pytest.raises(ValidationError):
+        make_dispatch_facts(unknown_field=True)
+
+
+def test_server_brain_facts_cannot_project_through_public_bridge_boundary() -> None:
+    brain = ServerBrainFacts(
+        run_id=new_run_id(),
+        strategy=ExecutionStrategy.PROGRESSIVE,
+        routing_policy=RoutingPolicy.MANUAL,
+    )
+    with pytest.raises(ValueError, match="cannot cross"):
+        project_public_bridge_dispatch(brain.model_dump(mode="json"))
+    tool = ClientToolFacts(
+        client_id=new_client_id(),
+        tool_name="read_file",
+        effect=ToolEffect.READ,
+    )
+    assert tool.location is ExecutionLocation.BRIDGE
+    with pytest.raises(ValidationError):
+        ClientToolFacts(
+            client_id=new_client_id(),
+            tool_name="read_file",
+            effect=ToolEffect.READ,
+            location=ExecutionLocation.CLOUD,
+        )
+
+
+def test_bindings_normalize_public_dispatch_and_reject_private_fields() -> None:
+    facts = make_dispatch_facts()
+    normalized = normalize_bridge_dispatch(facts.model_dump(mode="json"))
+    assert normalized == facts
+    with pytest.raises(PrpError) as excinfo:
+        normalize_bridge_dispatch(
+            {**facts.model_dump(mode="json"), "workspace_root": "/opt/prp"}
+        )
+    assert excinfo.value.code is ErrorCode.UNSUPPORTED_FIELD
 
 
 def make_attempt(**overrides: object) -> Attempt:

@@ -1,21 +1,24 @@
 """Targeted tests for the protocol-independent tool contracts."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
-from prp_runtime.domain.enums import ToolCallStatus, ToolEffect
-from prp_runtime.domain.models import ErrorCategory, ErrorInfo
+from prp_runtime.domain.enums import BridgeClaimStatus, ToolCallStatus, ToolEffect
+from prp_runtime.domain.models import ErrorCategory, ErrorInfo, new_client_id
 from prp_runtime.domain.values import (
     new_run_id,
+    new_session_id,
     new_snapshot_id,
     new_tool_call_id,
     new_work_unit_id,
+    new_workspace_id,
 )
 from prp_runtime.tools.models import (
     MAX_TOOL_ARGUMENT_BYTES,
     MAX_TOOL_OUTPUT_BYTES,
+    BridgeClaim,
     ToolCall,
     ToolResult,
 )
@@ -175,6 +178,44 @@ def test_unknown_and_interrupted_are_first_class_terminal_results(
     )
     assert result.status is status
     assert result.error == error
+
+
+def test_bridge_claim_uses_registered_client_and_snapshot_not_free_text() -> None:
+    client_id = new_client_id()
+    snapshot_id = new_snapshot_id()
+    claim = BridgeClaim(
+        call_id=new_tool_call_id(),
+        run_id=new_run_id(),
+        session_id=new_session_id(),
+        workspace_id=new_workspace_id(),
+        snapshot_id=snapshot_id,
+        owner_id="prn_owner",
+        client_id=client_id,
+        idempotency_key="claim-key",
+        fingerprint="a" * 64,
+        claimed_at=T0,
+        expires_at=T0 + timedelta(minutes=1),
+    )
+    assert claim.client_id == client_id
+    assert claim.snapshot_id == snapshot_id
+    assert claim.status is BridgeClaimStatus.ACTIVE
+    restored = BridgeClaim.model_validate_json(claim.model_dump_json())
+    assert restored == claim
+    with pytest.raises(ValidationError):
+        BridgeClaim(
+            call_id=new_tool_call_id(),
+            run_id=new_run_id(),
+            session_id=new_session_id(),
+            workspace_id=new_workspace_id(),
+            snapshot_id=snapshot_id,
+            owner_id="prn_owner",
+            client_id="bridge-client",
+            idempotency_key="claim-key",
+            fingerprint="a" * 64,
+            claimed_at=T0,
+            expires_at=T0 + timedelta(minutes=1),
+        )
+    assert "claimant_id" not in claim.model_dump()
 
 
 def test_result_cannot_be_created_before_a_running_call() -> None:

@@ -21,6 +21,8 @@ class FakeBridge:
         self.kwargs = kwargs
         self.state = SimpleNamespace(session_id=None, run_id=None)
         self.sessions: list[dict[str, object]] = []
+        self.registrations: list[object] = []
+        self.handshakes: list[object] = []
         self.loop_calls: list[object] = []
         FakeBridge.instances.append(self)
 
@@ -29,6 +31,19 @@ class FakeBridge:
 
     async def __aexit__(self, *args: object) -> None:
         return None
+
+    async def register_client(self, payload: object) -> dict[str, object]:
+        self.registrations.append(payload)
+        return {"status": "ACTIVE"}
+
+    async def handshake(self, payload: object) -> dict[str, object]:
+        self.handshakes.append(payload)
+        return {
+            "accepted": True,
+            "client_id": "cli_bootstrap01",
+            "protocol_version": "0.0.4",
+            "fingerprint": "a" * 64,
+        }
 
     async def create_session(self, workspace_id: str, **kwargs: object) -> dict[str, object]:
         self.state.session_id = "sess-1"
@@ -285,3 +300,146 @@ def test_serve_help_explains_loopback(capsys: pytest.CaptureFixture[str]) -> Non
     assert "127.0.0.1" in help_text
     assert "create_app" in help_text
     assert "Local run does not use this command" in help_text
+
+
+def test_bootstrap_is_model_free_and_keeps_root_local(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PRP_TOKEN", "do-not-print")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--workspace-root",
+            str(root),
+            "bootstrap",
+            "ws_project",
+        ]
+    )
+    assert args.command == "bootstrap"
+    assert not hasattr(args, "model")
+    assert not hasattr(args, "provider")
+    local = parser.parse_args(["local", "run", "hello"])
+    assert local.command == "local"
+    assert local.command != args.command
+
+    assert (
+        cli.main(
+            [
+                "--base-url",
+                "https://bridge.test",
+                "--workspace-root",
+                str(root),
+                "bootstrap",
+                "ws_project",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert '"accepted": true' in output.lower() or '"accepted": True' in output or '"accepted": true' in output
+    assert "do-not-print" not in output
+    assert str(root) not in output
+    bridge = FakeBridge.instances[0]
+    assert bridge.registrations
+    assert bridge.handshakes
+    payload = bridge.handshakes[0]
+    registration = bridge.registrations[0]
+    assert "capabilities" in registration
+    assert registration["fingerprint"] == payload["fingerprint"]
+    assert "strategy" not in str(payload)
+    assert "token" not in str(payload).lower() or "fingerprint" in str(payload)
+
+
+def test_watch_rejects_negative_reconnects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PRP_TOKEN", "do-not-print")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    assert cli.main(["--workspace-root", str(root), "watch", "--max-reconnects", "-1"]) == 1
+    assert "finite" in capsys.readouterr().err
+
+
+def test_watch_approval_pause_is_not_terminal_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PRP_TOKEN", "do-not-print")
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    class ApprovalBridge(FakeBridge):
+        async def run_tool_loop(self, executor: object, **kwargs: object) -> object:
+            self.loop_calls.append((executor, kwargs))
+            return SimpleNamespace(
+                phase=BridgeToolLoopPhase.WAITING_APPROVAL,
+                pending_call_ids=("tc_one",),
+            )
+
+    monkeypatch.setattr(cli, "Bridge", ApprovalBridge)
+    assert cli.main(["--workspace-root", str(root), "watch"]) == 1
+    captured = capsys.readouterr()
+    assert "approve/deny" in captured.err
+    assert "SUCCEEDED" not in captured.out
+    assert "do-not-print" not in captured.out + captured.err
+
+
+def test_approve_and_deny_are_scoped_and_omit_secrets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PRP_TOKEN", "do-not-print")
+
+    class SessionBridge(FakeBridge):
+        def __init__(self, base_url: str, token: str, **kwargs: object) -> None:
+            super().__init__(base_url, token, **kwargs)
+            self.state.session_id = "sess-1"
+            self.decisions: list[object] = []
+
+        async def _request(self, *args: object, **kwargs: object) -> dict[str, object]:
+            self.decisions.append((args, kwargs))
+            return {"outcome": kwargs["body"]["outcome"]}  # type: ignore[index]
+
+    monkeypatch.setattr(cli, "Bridge", SessionBridge)
+    assert cli.main(["approve", "apr_one", "--reason", "ok"]) == 0
+    assert cli.main(["deny", "apr_one", "--reason", "no"]) == 0
+    output = capsys.readouterr().out
+    assert '"outcome": "APPROVE"' in output
+    assert '"outcome": "DENY"' in output
+    assert "do-not-print" not in output
+    assert SessionBridge.instances[0].state.session_id == "sess-1"
+
+
+def test_resume_uses_watch_loop_without_model_flags() -> None:
+    parser = cli.build_parser()
+    resume = parser.parse_args(["resume", "--max-reconnects", "2"])
+    watch = parser.parse_args(["watch", "--max-reconnects", "2"])
+    assert resume.command == "resume"
+    assert watch.command == "watch"
+    assert resume.max_reconnects == watch.max_reconnects == 2
+    assert not hasattr(resume, "model")
+    assert not hasattr(resume, "provider")
+
+
+
+def test_watch_offline_wait_is_not_terminal_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PRP_TOKEN", "do-not-print")
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    class WaitingBridge(FakeBridge):
+        async def run_tool_loop(self, executor: object, **kwargs: object) -> object:
+            self.loop_calls.append((executor, kwargs))
+            return SimpleNamespace(
+                phase=BridgeToolLoopPhase.WAITING,
+                pending_call_ids=("tc_live",),
+            )
+
+    monkeypatch.setattr(cli, "Bridge", WaitingBridge)
+    assert cli.main(["--workspace-root", str(root), "watch"]) == 1
+    captured = capsys.readouterr()
+    assert "waiting" in captured.err
+    assert "SUCCEEDED" not in captured.out
+    assert "do-not-print" not in captured.out + captured.err

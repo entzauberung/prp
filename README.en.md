@@ -4,7 +4,7 @@
 
 PRP Runtime is a reference runtime for the Progressive Reasoning Protocol and a local-first Agent OS: controller, policy, tools, approval, evidence, budget and recovery run in one process. Any configured model can plug into the same loop. Model quality depends on the chosen provider, not on PRP itself.
 
-Current version: `0.0.3` · Python `3.12+` · single-instance SQLite · no Docker · Apache-2.0
+Current version: `0.0.4` · Python `3.12+` · single-instance SQLite · no Docker · Apache-2.0
 
 [简体中文](README.md)
 
@@ -56,7 +56,7 @@ The three execution locations stay distinct and are never silently translated:
 |---|---|
 | `LOCAL` | Controller, provider adapter, tools and workspace share one process; default `HOST` |
 | `CLOUD` | Controller and tools execute inside the server process |
-| `BRIDGE` | The server keeps planning; a model-free local client executes tools |
+| `BRIDGE` | The server owns models, planning, approval, evidence and merge; an assigned model-free client executes only its closed local tools |
 
 ## Three Directions
 

@@ -8,6 +8,7 @@ from prp_runtime.control.budget import (
     BudgetOutcome,
     check_attempt_budget,
     check_deadline,
+    check_role_dispatch,
     check_token_budget,
     check_token_budget_postflight,
     check_token_budget_preflight,
@@ -371,3 +372,65 @@ def test_reservation_settlement_keeps_unknown_usage_unknown_and_releases_delta()
         completed_at=T0 + timedelta(seconds=1),
     )
     assert reservation_delta(released).measured_usage is None
+
+
+def test_role_dispatch_stops_before_over_budget_provider_call() -> None:
+    budget = Budget(max_total_tokens=10, max_attempts=2, deadline=T0 + timedelta(hours=1))
+    allowed = check_role_dispatch(budget, _usage(total=1), attempt_count=0, now=T0)
+    assert allowed.allowed is True
+    tokens = check_role_dispatch(budget, _usage(total=10), attempt_count=0, now=T0)
+    assert tokens.allowed is False
+    assert tokens.dimension == "total_tokens"
+    attempts = check_role_dispatch(budget, _usage(total=1), attempt_count=2, now=T0)
+    assert attempts.allowed is False
+    deadline = check_role_dispatch(budget, _usage(total=1), attempt_count=0, now=T0 + timedelta(hours=1))
+    assert deadline.allowed is False
+
+
+def test_role_dispatch_enforces_context_output_and_elapsed_ceilings() -> None:
+    budget = Budget()
+    context = check_role_dispatch(
+        budget,
+        _usage(total=1),
+        attempt_count=0,
+        now=T0,
+        context_window_tokens=8,
+        declared_input_tokens=4,
+        declared_output_tokens=8,
+    )
+    assert context.allowed is False
+    assert context.dimension == "context_window_tokens"
+    output = check_role_dispatch(
+        budget,
+        _usage(total=1),
+        attempt_count=0,
+        now=T0,
+        max_output_tokens=4,
+        declared_output_tokens=8,
+    )
+    assert output.allowed is False
+    assert output.dimension == "max_output_tokens"
+    timeout = check_role_dispatch(
+        budget,
+        Usage(input_tokens=1, elapsed_ms=2_000),
+        attempt_count=0,
+        now=T0,
+        timeout_seconds=1.0,
+    )
+    assert timeout.allowed is False
+    assert timeout.dimension == "timeout"
+
+
+def test_deterministic_role_completion_does_not_consume_or_fabricate_usage() -> None:
+    decision = check_role_dispatch(
+        Budget(max_total_tokens=1, max_attempts=1, deadline=T0),
+        Usage(input_tokens=9, output_tokens=1, elapsed_ms=9_000),
+        attempt_count=9,
+        now=T0 + timedelta(hours=1),
+        deterministic=True,
+        declared_output_tokens=99,
+        context_window_tokens=1,
+        timeout_seconds=0.001,
+    )
+    assert decision.allowed is True
+    assert decision.dimension == "deterministic"

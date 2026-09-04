@@ -8,6 +8,7 @@ from prp_runtime.domain.values import ResourceClaim
 from prp_runtime.runtime.conflicts import (
     ConflictFacts,
     ConflictKind,
+    ConflictReport,
     classify_conflict,
     classify_facts,
     conflicts_from_changesets,
@@ -207,3 +208,20 @@ def test_missing_changeset_is_unknown_and_blocks_admission() -> None:
     )
 
     assert reports[("wu_left", "wu_right")].kind is ConflictKind.UNKNOWN
+
+
+def test_parallel_fake_client_changesets_are_explicit_and_durable() -> None:
+    left = change_set("src/main.py")
+    overlapping = change_set("src/main.py")
+    disjoint = change_set("src/other.py")
+
+    conflict = classify_conflict(left, overlapping, left_base_hash=BASE_HASH, right_base_hash=BASE_HASH)
+    compatible = classify_conflict(left, disjoint, left_base_hash=BASE_HASH, right_base_hash=BASE_HASH)
+
+    assert conflict.conflict is True
+    assert conflict.kind is ConflictKind.PATH
+    assert compatible.kind is ConflictKind.NO_CONFLICT
+    restored = ConflictReport.model_validate_json(conflict.model_dump_json())
+    assert restored == conflict
+    assert restored.conflict is True
+

@@ -260,7 +260,7 @@ def parse_rg_json(output: bytes, *, max_results: int) -> SearchResult:
         data = event.get("data")
         if not isinstance(data, dict):
             raise SearchExecutionError("search backend emitted an invalid match")
-        path = _rg_text(data.get("path"))
+        path = _relative_search_path(_rg_text(data.get("path")))
         lines = _rg_text(data.get("lines"))
         line_number = data.get("line_number")
         submatches = data.get("submatches")
@@ -343,3 +343,16 @@ def _rg_text(value: object) -> str | None:
         return None
     text = value.get("text")
     return text if isinstance(text, str) else None
+
+
+def _relative_search_path(path: str | None) -> str | None:
+    """Keep search matches relative; never publish a host root."""
+    if path is None:
+        return None
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("/") or (len(normalized) > 1 and normalized[1] == ":"):
+        parts = [part for part in normalized.split("/") if part and part != ":"]
+        if not parts:
+            return None
+        return parts[-1]
+    return path

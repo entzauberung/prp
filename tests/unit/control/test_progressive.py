@@ -131,6 +131,18 @@ def test_progressive_round_state_requires_verified_snapshot_and_evidence() -> No
         )
 
 
+def test_model_request_alone_is_not_a_revision_trigger() -> None:
+    decision = decide_revision(
+        budget=Budget(max_plan_revisions=3),
+        revision_count=0,
+        graph_version=1,
+    )
+    assert decision.disposition is RevisionDisposition.STOP
+    assert decision.stop_reason is RevisionStopReason.NO_TRIGGER
+    assert decision.next_graph_version is None
+    assert decision.should_revise is False
+
+
 def test_pass_never_revises_even_when_revision_budget_is_zero() -> None:
     decision = decide_revision(
         budget=Budget(max_plan_revisions=0),
@@ -141,6 +153,17 @@ def test_pass_never_revises_even_when_revision_budget_is_zero() -> None:
     assert decision.disposition is RevisionDisposition.STOP
     assert decision.stop_reason is RevisionStopReason.PASS
     assert decision.reason is None
+    assert decision.should_revise is False
+
+
+def test_deterministic_pass_does_not_require_fabricated_usage() -> None:
+    decision = decide_revision(
+        budget=Budget(max_plan_revisions=1, max_total_tokens=1),
+        revision_count=0,
+        verification=report(VerificationResult.PASS),
+        usage=None,
+    )
+    assert decision.stop_reason is RevisionStopReason.PASS
     assert decision.should_revise is False
 
 
@@ -481,6 +504,92 @@ def test_reuse_requires_progressive_snapshot_merge_changeset_and_evidence_facts(
     )
     assert changed.disposition is ReuseDisposition.RECOMPUTE
     assert changed.reason is ReuseReason.CHANGE_SET_FACTS_MISSING_OR_CHANGED
+
+
+def test_reuse_recomputes_when_required_facts_are_missing_or_unproven() -> None:
+    matching = {
+        "historical_dependency_artifact_hashes": (),
+        "candidate_dependency_artifact_hashes": (),
+        "historical_base_snapshot_id": "snap_base",
+        "candidate_base_snapshot_id": "snap_base",
+        "historical_merged_snapshot_id": "snap_merged",
+        "candidate_merged_snapshot_id": "snap_merged",
+        "historical_merge_input_digest": "digest_same",
+        "candidate_merge_input_digest": "digest_same",
+        "historical_change_set_ids": ("cs_same",),
+        "candidate_change_set_ids": ("cs_same",),
+        "historical_evidence_ids": ("ev_same",),
+        "candidate_evidence_ids": ("ev_same",),
+        "historical_attempts_proven": True,
+    }
+    reused = decide_reuse(reuse_unit(), reuse_unit(), **matching)
+    assert reused.disposition is ReuseDisposition.REUSE
+    assert reused.reason is ReuseReason.ALL_FACTS_MATCH
+
+    missing_snapshot = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        **(matching | {"candidate_base_snapshot_id": None}),
+    )
+    assert missing_snapshot.disposition is ReuseDisposition.RECOMPUTE
+    assert missing_snapshot.reason is ReuseReason.SNAPSHOT_FACTS_MISSING_OR_CHANGED
+
+    missing_evidence = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        **(matching | {"candidate_evidence_ids": None}),
+    )
+    assert missing_evidence.disposition is ReuseDisposition.RECOMPUTE
+    assert missing_evidence.reason is ReuseReason.EVIDENCE_FACTS_MISSING_OR_CHANGED
+
+    unproven = decide_reuse(
+        reuse_unit(),
+        reuse_unit(),
+        **(matching | {"historical_attempts_proven": False}),
+    )
+    assert unproven.disposition is ReuseDisposition.RECOMPUTE
+    assert unproven.reason is ReuseReason.ATTEMPT_HISTORY_NOT_PROVEN
+
+    missing_fingerprint = decide_reuse(
+        reuse_unit(
+            lineage_key=None,
+            dependency_fingerprint=None,
+            content_fingerprint=None,
+        ),
+        reuse_unit(),
+        historical_dependency_artifact_hashes=(),
+        candidate_dependency_artifact_hashes=(),
+    )
+    assert missing_fingerprint.disposition is ReuseDisposition.RECOMPUTE
+    assert missing_fingerprint.reason is ReuseReason.MISSING_LINEAGE_OR_FINGERPRINT
+
+
+def test_candidate_acceptance_requires_pass_not_self_assertion() -> None:
+    passed = global_report(
+        VerificationResult.PASS,
+        round_id="round_" + "a" * 32,
+        evidence_ids=("ev_" + "1" * 32,),
+    )
+    failed = global_report(
+        VerificationResult.FAIL,
+        round_id="round_" + "b" * 32,
+        evidence_ids=("ev_" + "2" * 32,),
+    )
+    improved = compare_rounds(failed, passed)
+    assert improved.outcome is ComparisonOutcome.IMPROVED
+    assert improved.accepted is True
+    assert improved.rationale
+
+    no_gain = compare_rounds(passed, passed)
+    assert no_gain.outcome is ComparisonOutcome.NO_GAIN
+    assert no_gain.accepted is False
+    assert no_gain.rationale
+    assert no_gain.token_delta is None
+    assert no_gain.cost_delta is None
+
+    regression = compare_rounds(passed, failed)
+    assert regression.outcome is ComparisonOutcome.REGRESSION
+    assert regression.accepted is False
 
 
 @pytest.mark.parametrize(

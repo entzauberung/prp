@@ -136,3 +136,18 @@ def test_definition_is_frozen_after_build() -> None:
     definition = read_definition()
     with pytest.raises(ValidationError):
         definition.effect = ToolEffect.WRITE
+
+
+def test_registry_rejects_unknown_tool_and_keeps_handler_private() -> None:
+    registry = ToolRegistry((read_definition(),))
+    with pytest.raises(KeyError, match="unknown tool: run_shell"):
+        registry.get("run_shell")
+    catalog = json.dumps(
+        [item.model_dump(mode="json") for item in registry.provider_catalog],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert "handler" not in catalog
+    assert "max_output_bytes" not in catalog
+

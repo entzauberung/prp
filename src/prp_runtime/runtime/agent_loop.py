@@ -7,7 +7,8 @@ change runtime state directly.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+import re
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum, unique
 from typing import Protocol
@@ -31,6 +32,11 @@ from prp_runtime.domain.models import (
 from prp_runtime.domain.values import utc_now
 from prp_runtime.policy.models import DevScope, serialize_dev_evidence
 from prp_runtime.providers.base import ModelProfile, ProviderAdapter, ProviderRequest
+from prp_runtime.runtime.context import (
+    StaticFact,
+    render_static_facts,
+    select_relevant_facts,
+)
 
 __all__ = [
     "AgentHistoryItem",
@@ -38,6 +44,7 @@ __all__ = [
     "AgentLoop",
     "AgentLoopResult",
     "AgentLoopStatus",
+    "REMOTE_ASSIGNMENT_PENDING",
     "AgentToolCall",
     "AgentToolContext",
     "AgentToolExecution",
@@ -48,6 +55,30 @@ __all__ = [
 
 DEFAULT_MAX_TOOL_ROUNDS = 8
 DEFAULT_MAX_TOOL_ATTEMPTS = 16
+_ROOT_RE = re.compile(
+    r"(?:[A-Za-z]:)?(?:/|\\)(?:home|tmp|Users|root|var|etc|usr)(?:/|\\)[^\s'\"]+"
+)
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(api_key|apikey|authorization|credential|password|secret|token)\s*[:=]\s*\S+"
+)
+_PRIVATE_REASONING_RE = re.compile(
+    r"(?i)\b(chain_of_thought|private_reasoning|hidden_cot)\b"
+)
+_FORBIDDEN_JSON_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "chain_of_thought",
+        "cot",
+        "credential",
+        "password",
+        "provider_body",
+        "raw_provider_body",
+        "secret",
+        "token",
+    }
+)
 
 AgentHistoryWriter = Callable[[int, AgentHistoryItem], Awaitable[None]]
 
@@ -58,6 +89,7 @@ class AgentLoopStatus(StrEnum):
 
     COMPLETED = "COMPLETED"
     PAUSED = "PAUSED"
+    WAITING_REMOTE = "WAITING_REMOTE"
     EXHAUSTED = "EXHAUSTED"
 
 
@@ -71,24 +103,36 @@ class AgentToolContext(DomainModel):
     attempt_index: int = Field(ge=1)
 
 
+REMOTE_ASSIGNMENT_PENDING = "remote_assignment_pending"
+
+
 class AgentToolExecution(DomainModel):
-    """One executor decision, including an approval pause without fake failure."""
+    """One executor decision: result, approval pause, or remote-result wait."""
 
     call: AgentToolCall
     result: AgentToolResult | None = None
     awaiting_approval: bool = False
+    awaiting_remote_result: bool = False
     reason: str | None = None
 
     @model_validator(mode="after")
     def _shape_is_closed(self) -> AgentToolExecution:
-        if self.awaiting_approval == (self.result is not None):
+        states = (
+            int(self.result is not None),
+            int(self.awaiting_approval),
+            int(self.awaiting_remote_result),
+        )
+        if sum(states) != 1:
             raise ValueError(
-                "agent tool execution must contain a terminal result or approval pause"
+                "agent tool execution must contain a terminal result, approval pause "
+                "or remote wait"
             )
         if self.result is not None and self.result.call_id != self.call.call_id:
             raise ValueError("agent tool result call_id does not match the tool call")
         if self.awaiting_approval and self.reason is None:
             raise ValueError("approval pause requires a reason")
+        if self.awaiting_remote_result and self.reason is None:
+            raise ValueError("remote wait requires a reason")
         return self
 
 
@@ -122,7 +166,7 @@ class AgentLoopResult(DomainModel):
         if self.status is AgentLoopStatus.COMPLETED:
             if self.text is None or self.error is not None or self.pending_call_ids:
                 raise ValueError("completed agent loop must contain only final text")
-        elif self.status is AgentLoopStatus.PAUSED:
+        elif self.status in (AgentLoopStatus.PAUSED, AgentLoopStatus.WAITING_REMOTE):
             if self.text is not None or self.error is not None or not self.pending_call_ids:
                 raise ValueError("paused agent loop must contain pending tool calls")
         elif self.status is AgentLoopStatus.EXHAUSTED:
@@ -186,10 +230,13 @@ class AgentLoop:
         history_writer: AgentHistoryWriter | None = None,
         resume_pending_call: AgentToolCall | None = None,
         replay_results: Mapping[str, AgentToolResult] | None = None,
+        static_facts: Sequence[StaticFact | Mapping[str, object]] = (),
     ) -> AgentLoopResult:
         """Execute one bounded sequence, returning facts suitable for settlement."""
         rounds_limit = self._bounded_limit(max_tool_rounds, self._max_tool_rounds)
         attempts_limit = self._bounded_limit(max_attempts, self._max_attempts)
+        input = self._public_model_input(input, static_facts, work_unit_id=work_unit_id)
+        instructions = _sanitize_public_text(instructions) if instructions else None
         current_history = list(history)
         if len(current_history) > MAX_AGENT_HISTORY_ITEMS:
             return self._exhausted(
@@ -316,6 +363,18 @@ class AgentLoop:
         tool_rounds = 0
         attempts = 0
 
+        for call_id, persisted_result in persisted_replays.items():
+            if call_id in seen_results:
+                continue
+            seen_results[call_id] = persisted_result
+            current_history.append(persisted_result)
+            if history_writer is not None:
+                await history_writer(len(current_history), persisted_result)
+            if persisted_result.status is ToolCallStatus.FAILED:
+                failed_tool_names.add(seen_calls[call_id].tool_name)
+            else:
+                failed_tool_names.discard(seen_calls[call_id].tool_name)
+
         if resume_pending_call is not None:
             previous_call = seen_calls.get(resume_pending_call.call_id)
             if previous_call is None or previous_call != resume_pending_call:
@@ -343,7 +402,7 @@ class AgentLoop:
                             message="provider requested a tool but no tool executor is configured",
                         ),
                     )
-                execution = await self._tool_executor.execute(
+                execution = await self._execute_public_tool(
                     resume_pending_call,
                     context=AgentToolContext(
                         run_id=run_id,
@@ -353,16 +412,17 @@ class AgentLoop:
                         attempt_index=1,
                     ),
                 )
-                if execution.awaiting_approval:
-                    return AgentLoopResult(
-                        status=AgentLoopStatus.PAUSED,
-                        history=tuple(current_history),
-                        usage=total_usage,
-                        provider_request_id=last_request_id,
-                        tool_rounds=tool_rounds,
-                        attempts=attempts,
-                        pending_call_ids=(resume_pending_call.call_id,),
-                    )
+                paused = self._pause_if_waiting(
+                    execution,
+                    current_history=current_history,
+                    total_usage=total_usage,
+                    last_request_id=last_request_id,
+                    tool_rounds=tool_rounds,
+                    attempts=attempts,
+                    call_id=resume_pending_call.call_id,
+                )
+                if paused is not None:
+                    return paused
                 assert execution.result is not None
                 seen_results[resume_pending_call.call_id] = execution.result
                 if execution.result.status is ToolCallStatus.FAILED:
@@ -418,7 +478,9 @@ class AgentLoop:
                     input=input,
                     instructions=instructions,
                     json_schema=json_schema,
-                    history=tuple(current_history),
+                    history=tuple(
+                        _sanitize_history_item(item) for item in current_history
+                    ),
                     tools=tool_catalog,
                 )
             except (DomainValidationError, ValueError):
@@ -579,7 +641,7 @@ class AgentLoop:
                     continue
 
                 seen_calls[call.call_id] = call
-                execution = await self._tool_executor.execute(
+                execution = await self._execute_public_tool(
                     call,
                     context=AgentToolContext(
                         run_id=run_id,
@@ -589,16 +651,17 @@ class AgentLoop:
                         attempt_index=attempts,
                     ),
                 )
-                if execution.awaiting_approval:
-                    return AgentLoopResult(
-                        status=AgentLoopStatus.PAUSED,
-                        history=tuple(current_history),
-                        usage=total_usage,
-                        provider_request_id=last_request_id,
-                        tool_rounds=tool_rounds,
-                        attempts=attempts,
-                        pending_call_ids=(call.call_id,),
-                    )
+                paused = self._pause_if_waiting(
+                    execution,
+                    current_history=current_history,
+                    total_usage=total_usage,
+                    last_request_id=last_request_id,
+                    tool_rounds=tool_rounds,
+                    attempts=attempts,
+                    call_id=call.call_id,
+                )
+                if paused is not None:
+                    return paused
                 assert execution.result is not None
                 seen_results[call.call_id] = execution.result
                 if execution.result.status is ToolCallStatus.FAILED:
@@ -646,6 +709,20 @@ class AgentLoop:
         return deadline is not None and utc_now() >= deadline
 
     @staticmethod
+    def _public_model_input(
+        raw_input: str,
+        static_facts: Sequence[StaticFact | Mapping[str, object]],
+        *,
+        work_unit_id: str,
+    ) -> str:
+        selected = select_relevant_facts(static_facts, work_unit_id=work_unit_id)
+        rendered = render_static_facts(selected)
+        text = raw_input
+        if rendered and rendered not in text:
+            text = f"{text}\n\n{rendered}"
+        return _sanitize_public_text(text)
+
+    @staticmethod
     def _validate_history(history: list[AgentHistoryItem]) -> str | None:
         """Reject orphaned or conflicting public history before provider dispatch."""
         calls: dict[str, AgentToolCall] = {}
@@ -669,6 +746,57 @@ class AgentLoop:
             results[item.call_id] = item
         return None
 
+    async def _execute_public_tool(
+        self,
+        call: AgentToolCall,
+        *,
+        context: AgentToolContext,
+    ) -> AgentToolExecution:
+        """Execute one public call and map a remote assignment into a wait."""
+
+        assert self._tool_executor is not None
+        try:
+            return await self._tool_executor.execute(call, context=context)
+        except Exception as error:
+            from prp_runtime.tools.executor import RemoteToolAssignmentPending
+
+            if isinstance(error, RemoteToolAssignmentPending):
+                return AgentToolExecution(
+                    call=call,
+                    awaiting_remote_result=True,
+                    reason=REMOTE_ASSIGNMENT_PENDING,
+                )
+            raise
+
+    @staticmethod
+    def _pause_if_waiting(
+        execution: AgentToolExecution,
+        *,
+        current_history: list[AgentHistoryItem],
+        total_usage: Usage | None,
+        last_request_id: str | None,
+        tool_rounds: int,
+        attempts: int,
+        call_id: str,
+    ) -> AgentLoopResult | None:
+        """Return a distinct pause for approval or remote wait, never a fake result."""
+
+        if execution.awaiting_approval:
+            status = AgentLoopStatus.PAUSED
+        elif execution.awaiting_remote_result:
+            status = AgentLoopStatus.WAITING_REMOTE
+        else:
+            return None
+        return AgentLoopResult(
+            status=status,
+            history=tuple(current_history),
+            usage=total_usage,
+            provider_request_id=last_request_id,
+            tool_rounds=tool_rounds,
+            attempts=attempts,
+            pending_call_ids=(call_id,),
+        )
+
     @staticmethod
     def _exhausted(
         history: list[AgentHistoryItem],
@@ -687,3 +815,48 @@ class AgentLoop:
             attempts=attempts,
             error=error,
         )
+
+
+def _sanitize_public_text(text: str) -> str:
+    """Strip host roots, credentials and private reasoning from model text."""
+    redacted = _ROOT_RE.sub("[redacted-root]", text)
+    redacted = _SECRET_ASSIGN_RE.sub(lambda match: f"{match.group(1)}=[redacted]", redacted)
+    return _PRIVATE_REASONING_RE.sub("[redacted]", redacted)
+
+
+def _sanitize_json(value: object) -> object:
+    if isinstance(value, dict):
+        cleaned: dict[str, object] = {}
+        for key, nested in value.items():
+            if str(key).lower() in _FORBIDDEN_JSON_KEYS:
+                cleaned[key] = "[redacted]"
+            else:
+                cleaned[key] = _sanitize_json(nested)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_json(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_public_text(value)
+    return value
+
+
+def _sanitize_history_item(item: AgentHistoryItem) -> AgentHistoryItem:
+    if isinstance(item, AgentTurn):
+        updates: dict[str, object] = {}
+        if item.text is not None:
+            updates["text"] = _sanitize_public_text(item.text)
+        if item.tool_calls:
+            updates["tool_calls"] = tuple(
+                call.model_copy(
+                    update={"arguments": _sanitize_json(call.arguments)}  # type: ignore[arg-type]
+                )
+                for call in item.tool_calls
+            )
+        return item.model_copy(update=updates) if updates else item
+    updates = {}
+    if item.output:
+        updates["output"] = _sanitize_public_text(item.output)
+    if item.result is not None:
+        updates["result"] = _sanitize_json(item.result)
+    return item.model_copy(update=updates) if updates else item
+

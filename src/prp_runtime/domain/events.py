@@ -28,7 +28,11 @@ __all__ = [
     "payload_from_model",
     "payload_from_agent_history",
     "payload_from_bridge_claim",
+    "payload_from_bridge_client_skip",
+    "payload_from_bridge_result_wake",
     "payload_from_merge_ledger",
+    "payload_from_remote_assignment",
+    "payload_from_remote_wait",
     "payload_from_tool_call",
     "payload_from_tool_result",
 ]
@@ -118,6 +122,8 @@ class EventType(StrEnum):
     BRIDGE_CLAIM_EXPIRED = "BRIDGE_CLAIM_EXPIRED"
     BRIDGE_CLAIM_SETTLED = "BRIDGE_CLAIM_SETTLED"
     BRIDGE_CLAIM_RELEASED = "BRIDGE_CLAIM_RELEASED"
+    BRIDGE_CLIENT_SKIPPED = "BRIDGE_CLIENT_SKIPPED"
+    BRIDGE_RESULT_WAKE = "BRIDGE_RESULT_WAKE"
 
 
 _WORK_UNIT = frozenset({"work_unit_id"})
@@ -222,17 +228,19 @@ EVENT_REQUIRED_KEYS: Mapping[EventType, frozenset[str]] = MappingProxyType(
             {"sequence", "kind", "idempotency_key"}
         ),
         EventType.BRIDGE_CLAIM_CREATED: frozenset(
-            {"claim_id", "call_id", "status", "expires_at"}
+            {"claim_id", "call_id", "client_id", "status", "expires_at"}
         ),
         EventType.BRIDGE_CLAIM_EXPIRED: frozenset(
-            {"claim_id", "call_id", "status", "expires_at"}
+            {"claim_id", "call_id", "client_id", "status", "expires_at"}
         ),
         EventType.BRIDGE_CLAIM_SETTLED: frozenset(
-            {"claim_id", "call_id", "status", "expires_at"}
+            {"claim_id", "call_id", "client_id", "status", "expires_at"}
         ),
         EventType.BRIDGE_CLAIM_RELEASED: frozenset(
-            {"claim_id", "call_id", "status", "expires_at"}
+            {"claim_id", "call_id", "client_id", "status", "expires_at"}
         ),
+        EventType.BRIDGE_CLIENT_SKIPPED: frozenset({"call_id", "client_id", "reason"}),
+        EventType.BRIDGE_RESULT_WAKE: frozenset({"call_id", "status"}),
     }
 )
 
@@ -385,16 +393,65 @@ def payload_from_agent_history(record: BaseModel) -> dict[str, JsonValue]:
 def payload_from_bridge_claim(claim: BaseModel) -> dict[str, JsonValue]:
     """Project a Bridge claim to public lifecycle metadata.
 
-    Claim fingerprints and claimant identity are intentionally omitted from the
-    event payload; lifecycle events need only correlate the call and lease.
+    Fingerprints, roots and secrets stay out of the event payload. The assigned
+    client identity is included so assignment facts survive without private data.
     """
     data = claim.model_dump(mode="json")
     return {
         "claim_id": data["claim_id"],
         "call_id": data["call_id"],
+        "client_id": data["client_id"],
         "status": data["status"],
         "expires_at": data["expires_at"],
     }
+
+
+def payload_from_bridge_client_skip(
+    *, call_id: str, client_id: str, reason: str
+) -> dict[str, JsonValue]:
+    """Project one bounded skip reason for a concrete call."""
+    return {"call_id": call_id, "client_id": client_id, "reason": reason}
+
+
+def payload_from_bridge_result_wake(*, call_id: str, status: str) -> dict[str, JsonValue]:
+    """Project one result-wake without roots, credentials or private authority."""
+    return {"call_id": call_id, "status": status}
+
+
+def payload_from_remote_wait(facts: BaseModel) -> dict[str, JsonValue]:
+    """Project a remote wait without approval, result or private authority."""
+
+    data = facts.model_dump(mode="json")
+    payload: dict[str, JsonValue] = {
+        "call_id": data["call_id"],
+        "reason": data["reason"],
+    }
+    tool_call_id = data.get("tool_call_id")
+    if tool_call_id:
+        payload["tool_call_id"] = tool_call_id
+    workspace_id = data.get("workspace_id")
+    if workspace_id:
+        payload["workspace_id"] = workspace_id
+    client_id = data.get("client_id")
+    if client_id:
+        payload["client_id"] = client_id
+    return payload
+
+
+def payload_from_remote_assignment(assignment: BaseModel) -> dict[str, JsonValue]:
+    """Project a remote assignment without roots, credentials or provider data."""
+
+    data = assignment.model_dump(mode="json")
+    payload: dict[str, JsonValue] = {
+        "call_id": data["call_id"],
+        "status": data["status"],
+        "tool_name": data["tool_name"],
+        "workspace_id": data["workspace_id"],
+    }
+    client_id = data.get("client_id")
+    if client_id:
+        payload["client_id"] = client_id
+    return payload
 
 
 def payload_from_tool_call(call: BaseModel) -> dict[str, JsonValue]:

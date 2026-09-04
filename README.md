@@ -4,7 +4,7 @@
 
 PRP Runtime 是 Progressive Reasoning Protocol 的参考运行时，也是一个本地优先的 Agent OS：控制器、策略、工具、审批、证据、预算和恢复在同一进程中执行。任意已配置的模型都可以接入同一套循环；模型质量取决于所选 provider，而不是 PRP 本身。
 
-当前版本：`0.0.3` · Python `3.12+` · 单实例 SQLite · 无 Docker · Apache-2.0
+当前版本：`0.0.4` · Python `3.12+` · 单实例 SQLite · 无 Docker · Apache-2.0
 
 [English](README.en.md)
 
@@ -56,7 +56,7 @@ prp serve
 |---|---|
 | `LOCAL` | 控制器、provider 适配器、工具和工作区在同一进程；默认 `HOST` |
 | `CLOUD` | 控制器和工具在服务进程内执行 |
-| `BRIDGE` | 服务保留规划；无模型本地客户端执行工具 |
+| `BRIDGE` | 服务器拥有模型、规划、审批、证据和合并；指定的无模型客户端只执行本地封闭工具 |
 
 ## 三个方向
 

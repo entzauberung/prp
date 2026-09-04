@@ -4,11 +4,13 @@ from enum import StrEnum, unique
 
 from pydantic import Field, model_validator
 
-from prp_runtime.domain.enums import ExecutionStrategy, RoutingPolicy
+from prp_runtime.domain.enums import ExecutionStrategy, ModelRole, RoutingPolicy
 from prp_runtime.domain.models import DomainModel, NativeRunRequest
 from prp_runtime.domain.transitions import control_strength
 
 __all__ = [
+    "RoleDecision",
+    "RoleFacts",
     "RouteFacts",
     "RouteRejection",
     "RouteRejectionCode",
@@ -17,6 +19,7 @@ __all__ = [
     "escalate",
     "facts_from_request",
     "route",
+    "route_role",
 ]
 
 
@@ -48,6 +51,83 @@ class RoutingFacts(DomainModel):
 
 
 RouteFacts = RoutingFacts
+
+
+class RoleFacts(DomainModel):
+    """Server-owned facts that select a model role.
+
+    These facts are never taken from a client payload, profile, URL or
+    credential. Exactly one purpose must be named.
+    """
+
+    planning: bool = False
+    work: bool = False
+    analysis: bool = False
+    verification: bool = False
+    deterministic_analysis: bool = False
+    deterministic_verification: bool = False
+
+    @model_validator(mode="after")
+    def _one_server_purpose(self) -> "RoleFacts":
+        purposes = (self.planning, self.work, self.analysis, self.verification)
+        if sum(purposes) != 1:
+            raise ValueError("role facts must name exactly one server purpose")
+        if self.deterministic_analysis and not self.analysis:
+            raise ValueError("deterministic analysis requires the analysis purpose")
+        if self.deterministic_verification and not self.verification:
+            raise ValueError("deterministic verification requires the verification purpose")
+        return self
+
+
+class RoleDecision(DomainModel):
+    """One server role choice or a deterministic provider bypass."""
+
+    role: ModelRole | None = None
+    deterministic: bool = False
+    reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _outcome_is_closed(self) -> "RoleDecision":
+        if self.role is None and not self.deterministic:
+            raise ValueError("role decision must select a role or a deterministic bypass")
+        if self.deterministic and self.role is not None:
+            raise ValueError("deterministic bypass cannot select a provider role")
+        if self.role is ModelRole.WORKER and self.deterministic:
+            raise ValueError("WORKER cannot be a deterministic alias")
+        return self
+
+
+def route_role(facts: RoleFacts) -> RoleDecision:
+    """Select Planner, Worker, Analyzer or Verifier from server facts only."""
+    if facts.planning:
+        return RoleDecision(
+            role=ModelRole.PLANNER,
+            reason="server selected PLANNER for plan proposal",
+        )
+    if facts.work:
+        return RoleDecision(
+            role=ModelRole.WORKER,
+            reason="server selected WORKER for work-unit execution",
+        )
+    if facts.analysis:
+        if facts.deterministic_analysis:
+            return RoleDecision(
+                deterministic=True,
+                reason="deterministic analysis facts suffice without a provider",
+            )
+        return RoleDecision(
+            role=ModelRole.ANALYZER,
+            reason="server selected ANALYZER; it is not a Worker alias",
+        )
+    if facts.deterministic_verification:
+        return RoleDecision(
+            deterministic=True,
+            reason="deterministic verification facts suffice without a provider",
+        )
+    return RoleDecision(
+        role=ModelRole.VERIFIER,
+        reason="server selected VERIFIER; it is not a Worker alias",
+    )
 
 
 def facts_from_request(request: NativeRunRequest) -> RoutingFacts:

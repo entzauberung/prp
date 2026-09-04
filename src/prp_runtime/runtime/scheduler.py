@@ -19,12 +19,17 @@ from prp_runtime.workspace.changes import ChangeSet
 from prp_runtime.workspace.isolation import IsolationBackend, SlotContext
 
 __all__ = [
+    "BridgeClientCandidate",
+    "BridgeClientSelection",
+    "BridgeWaveClaim",
+    "assign_bridge_wave_claims",
     "PlannedExecutor",
     "SlotAwarePlannedExecutor",
     "SlotDispatcher",
     "BatchSelection",
     "Scheduler",
     "StartDecision",
+    "select_bridge_client",
     "select_non_conflicting_batch",
     "select_non_conflicting_batch_with_reasons",
     "WaveOutcome",
@@ -260,6 +265,138 @@ def select_non_conflicting_batch(
         actual_changesets=actual_changesets,
     )
     return result.selected, result.deferred
+
+
+class BridgeClientCandidate(DomainModel):
+    """Public eligibility facts for one model-free Bridge client."""
+
+    client_id: str
+    workspace_id: str
+    tools: tuple[str, ...] = ()
+    effects: tuple[str, ...] = ()
+    liveness: str
+    snapshot_id: str | None = None
+    status: str = "ACTIVE"
+    fingerprint: str | None = None
+    active_claims: int = Field(default=0, ge=0)
+    max_active_claims: int = Field(default=1, ge=1)
+
+
+class BridgeClientSelection(DomainModel):
+    """Deterministic client choice plus skipped ineligible reasons."""
+
+    selected: BridgeClientCandidate | None = None
+    skipped: tuple[tuple[str, str], ...] = ()
+
+
+def select_bridge_client(
+    *,
+    workspace_id: str,
+    tool_name: str,
+    candidates: Sequence[BridgeClientCandidate],
+    claimed_call_ids: Collection[str] = (),
+    call_id: str | None = None,
+    effect: str | None = None,
+    snapshot_id: str | None = None,
+) -> BridgeClientSelection:
+    """Choose one live, scoped, capacity-ready client without client authority."""
+    skipped: list[tuple[str, str]] = []
+    if call_id is not None and call_id in claimed_call_ids:
+        for candidate in sorted(candidates, key=lambda item: item.client_id):
+            skipped.append((candidate.client_id, "duplicate active claim"))
+        return BridgeClientSelection(selected=None, skipped=tuple(skipped))
+    eligible: list[BridgeClientCandidate] = []
+    for candidate in sorted(candidates, key=lambda item: item.client_id):
+        if str(candidate.status).upper() == "DISABLED":
+            skipped.append((candidate.client_id, "client is disabled"))
+            continue
+        if candidate.liveness != "LIVE":
+            skipped.append((candidate.client_id, "client is not live"))
+            continue
+        if candidate.workspace_id != workspace_id:
+            skipped.append((candidate.client_id, "workspace scope mismatch"))
+            continue
+        if tool_name not in candidate.tools:
+            skipped.append((candidate.client_id, "tool capability mismatch"))
+            continue
+        if effect is not None and candidate.effects and effect not in candidate.effects:
+            skipped.append((candidate.client_id, "effect capability mismatch"))
+            continue
+        if (
+            snapshot_id is not None
+            and candidate.snapshot_id is not None
+            and candidate.snapshot_id != snapshot_id
+        ):
+            skipped.append((candidate.client_id, "stale snapshot"))
+            continue
+        if candidate.active_claims >= candidate.max_active_claims:
+            skipped.append((candidate.client_id, "lease capacity exhausted"))
+            continue
+        eligible.append(candidate)
+    selected = eligible[0] if eligible else None
+    return BridgeClientSelection(selected=selected, skipped=tuple(skipped))
+
+
+
+class BridgeWaveClaim(DomainModel):
+    """Server-owned claim facts for one ready Progressive work unit."""
+
+    run_id: str
+    work_unit_id: str
+    graph_version: int = Field(ge=1)
+    snapshot_id: str
+    workspace_id: str
+    tool_name: str
+    client_id: str
+
+
+def assign_bridge_wave_claims(
+    ready_work_unit_ids: Sequence[str],
+    *,
+    run_id: str,
+    graph_version: int,
+    snapshot_id: str,
+    workspace_id: str,
+    tool_name: str,
+    candidates: Sequence[BridgeClientCandidate],
+    claimed_call_ids: Collection[str] = (),
+    call_ids: Mapping[str, str] | None = None,
+) -> tuple[tuple[BridgeWaveClaim, ...], tuple[tuple[str, str], ...]]:
+    """Assign each ready unit to at most one live scoped client."""
+    pool = list(candidates)
+    claims: list[BridgeWaveClaim] = []
+    skipped: list[tuple[str, str]] = []
+    mapping = call_ids or {}
+    for work_unit_id in ready_work_unit_ids:
+        selection = select_bridge_client(
+            workspace_id=workspace_id,
+            tool_name=tool_name,
+            candidates=pool,
+            claimed_call_ids=claimed_call_ids,
+            call_id=mapping.get(work_unit_id),
+            snapshot_id=snapshot_id,
+        )
+        skipped.extend(selection.skipped)
+        if selection.selected is None:
+            continue
+        claims.append(
+            BridgeWaveClaim(
+                run_id=run_id,
+                work_unit_id=work_unit_id,
+                graph_version=graph_version,
+                snapshot_id=snapshot_id,
+                workspace_id=workspace_id,
+                tool_name=tool_name,
+                client_id=selection.selected.client_id,
+            )
+        )
+        pool = [
+            candidate.model_copy(update={"active_claims": candidate.active_claims + 1})
+            if candidate.client_id == selection.selected.client_id
+            else candidate
+            for candidate in pool
+        ]
+    return tuple(claims), tuple(skipped)
 
 
 class Scheduler:

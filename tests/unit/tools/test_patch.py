@@ -26,9 +26,16 @@ from prp_runtime.tools.patch import (
     PatchStaleError,
     PatchValidationError,
     build_patch_definition,
+    materialize_patched_contents,
 )
 from prp_runtime.workspace import WorkspaceBackend, WorkspaceBackendError
-from prp_runtime.workspace.changes import ChangeSet, Patch
+from prp_runtime.workspace.changes import (
+    ChangeSet,
+    FileChange,
+    FileChangeAction,
+    FileContent,
+    Patch,
+)
 from prp_runtime.workspace.models import Snapshot, SnapshotManifest, SnapshotStatus
 
 T0 = datetime(2026, 8, 14, tzinfo=UTC)
@@ -56,10 +63,16 @@ class RecordingStore:
             raise
 
     async def create_snapshot(
-        self, snapshot: Snapshot, manifest: SnapshotManifest, *, owner_id: str
+        self,
+        snapshot: Snapshot,
+        manifest: SnapshotManifest,
+        *,
+        owner_id: str,
+        file_contents: object | None = None,
     ) -> Snapshot:
         assert owner_id == OWNER_ID
         assert snapshot.file_count == len(manifest.entries)
+        del file_contents
         self.snapshots.append(snapshot)
         return snapshot
 
@@ -451,3 +464,29 @@ def test_patch_is_a_write_tool_and_plan_mode_denies_it(tmp_path: Path) -> None:
     assert definition.effect is ToolEffect.WRITE
     assert decision.outcome is PolicyOutcome.DENY
     assert decision.reason_code is PolicyReasonCode.PLAN_SIDE_EFFECT
+
+
+def test_materialize_patched_contents_applies_diff_without_a_live_root() -> None:
+    previous = {"src/main.py": "old\n", "kept.txt": "keep\n"}
+    patch = Patch(
+        base_snapshot_id="snap_" + "a" * 32,
+        unified_diff=(
+            "--- a/src/main.py\n"
+            "+++ b/src/main.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        ),
+    )
+    files = (
+        FileChange(
+            path="src/main.py",
+            action=FileChangeAction.MODIFY,
+            before=FileContent(sha256=hashlib.sha256(b"old\n").hexdigest(), size=4),
+            after=FileContent(sha256=hashlib.sha256(b"new\n").hexdigest(), size=4),
+        ),
+    )
+    assert materialize_patched_contents(previous, patch, files) == {
+        "src/main.py": "new\n",
+        "kept.txt": "keep\n",
+    }

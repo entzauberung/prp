@@ -5,14 +5,17 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
 from prp_runtime.app import create_app
 from prp_runtime.control.controller import RunController
-from prp_runtime.domain.enums import ExecutionStrategy, ModelRole, RoutingPolicy, RunStatus
-from prp_runtime.domain.events import EventType
-from prp_runtime.domain.models import Budget, NativeRunRequest, Run, Usage
+from prp_runtime.domain.enums import AgentMode, ExecutionLocation, ExecutionStrategy, IsolationMode, ModelRole, RoutingPolicy, RunStatus
+from prp_runtime.domain.events import EventType, RunEvent, assert_sequence_chain
+from prp_runtime.domain.models import AgentRequestOptions, Budget, NativeRunRequest, Run, Usage
+from prp_runtime.domain.values import new_run_id, utc_now
+from prp_runtime.domain.errors import StateError
 from prp_runtime.providers.base import FinishReason, ModelProfile, ProviderRequest, ProviderResponse
 from prp_runtime.settings import Settings
 from prp_runtime.storage.sqlite import SqliteStore
@@ -239,3 +242,121 @@ def test_public_auto_capability_failure_is_not_silently_downgraded(
     assert events.status_code == 200
     assert final.json()["status"] == RunStatus.FAILED.value
     assert worker.requests == []
+
+def test_locations_strategies_and_modes_remain_distinct() -> None:
+    assert set(ExecutionLocation) == {
+        ExecutionLocation.CLOUD,
+        ExecutionLocation.BRIDGE,
+        ExecutionLocation.LOCAL,
+    }
+    assert set(ExecutionStrategy) == {
+        ExecutionStrategy.DIRECT,
+        ExecutionStrategy.CASCADE,
+        ExecutionStrategy.PLANNED,
+        ExecutionStrategy.PROGRESSIVE,
+    }
+    assert set(AgentMode) == {
+        AgentMode.NORMAL,
+        AgentMode.AUTO,
+        AgentMode.PLAN,
+        AgentMode.YOLO,
+    }
+    assert set(IsolationMode) == {IsolationMode.SANDBOXED, IsolationMode.HOST}
+    cloud = AgentRequestOptions()
+    local = AgentRequestOptions(execution_location=ExecutionLocation.LOCAL)
+    bridge = AgentRequestOptions(execution_location=ExecutionLocation.BRIDGE)
+    assert cloud.execution_location is ExecutionLocation.CLOUD
+    assert {cloud.execution_location, local.execution_location, bridge.execution_location} == set(
+        ExecutionLocation
+    )
+    assert NativeRunRequest(input="hello").agent_options.execution_location is ExecutionLocation.CLOUD
+
+
+def test_public_events_are_monotonic_redacted_and_traceable(tmp_path: Path) -> None:
+    adapter = FixedAdapter()
+    app = create_app(
+        _settings(tmp_path / "event-redaction.db"),
+        adapters={"planner": adapter, "worker": adapter},  # type: ignore[arg-type]
+    )
+    with TestClient(app) as client:
+        created = client.post("/v1/runs", json={"input": "route this request"})
+        assert created.status_code == 201
+        run_id = created.json()["run_id"]
+        events = client.get(f"/v1/runs/{run_id}/events")
+        body = client.get(f"/v1/runs/{run_id}").json()
+    assert body["status"] == RunStatus.SUCCEEDED.value
+    records = [
+        json.loads(line.removeprefix("data: "))
+        for line in events.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    sequences = [record["sequence"] for record in records]
+    assert sequences == list(range(1, len(sequences) + 1))
+    assert all(record["run_id"] == run_id for record in records)
+    assert_sequence_chain(
+        tuple(
+            RunEvent(
+                run_id=record["run_id"],
+                sequence=record["sequence"],
+                event_type=EventType(record["event_type"]),
+                timestamp=record["timestamp"],
+                payload=record.get("payload") or {},
+            )
+            for record in records
+        )
+    )
+    forbidden = {
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "reasoning",
+        "root",
+        "credential",
+        "authorization",
+        "raw_response",
+        "provider_body",
+    }
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                assert key.lower() not in forbidden
+                walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk(nested)
+
+    for record in records:
+        walk(record.get("payload") or {})
+    serialized = events.text
+    assert "https://models.invalid" not in serialized
+    assert "sk-secret" not in serialized
+    with pytest.raises(ValidationError, match="reasoning"):
+        RunEvent(
+            run_id=new_run_id(),
+            sequence=1,
+            event_type=EventType.RUN_STARTED,
+            timestamp=utc_now(),
+            payload={"reasoning": "private thought"},
+        )
+    with pytest.raises(StateError):
+        assert_sequence_chain(
+            (
+                RunEvent(
+                    run_id=run_id,
+                    sequence=1,
+                    event_type=EventType.RUN_CREATED,
+                    timestamp=utc_now(),
+                    payload={"request": {"input": "hello"}},
+                ),
+                RunEvent(
+                    run_id=run_id,
+                    sequence=3,
+                    event_type=EventType.RUN_STARTED,
+                    timestamp=utc_now(),
+                    payload={},
+                ),
+            )
+        )
+
