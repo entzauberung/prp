@@ -1,0 +1,17 @@
+Progressive Reasoning Protocol
+Copyright 2026 PRP Protocol Authors
+
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE-APACHE).
+
+This repository is the protocol, not a cloud-local agent product.
+A runtime that executes tools, talks to model providers, or schedules
+work across machines is an implementation, not this specification.
+
+Apache-2.0 does not grant rights to use the PRP or Progressive Reasoning
+Protocol names to imply origin, sponsorship, or endorsement.
+
+Third-party notices
+-------------------
+
+No third-party runtime dependency is bundled at this version.
