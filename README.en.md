@@ -1,6 +1,6 @@
 # Progressive Reasoning Protocol
 
-[English](README.en.md)
+[简体中文](README.md)
 
 > Evidence-gated reasoning for work that must be inspectable, revisable, and stoppable.
 
