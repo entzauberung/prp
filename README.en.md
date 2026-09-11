@@ -6,6 +6,8 @@
 
 Progressive Reasoning Protocol (PRP) is an independent open protocol and research kernel for turning a model-driven task into a sequence of public, verifiable facts.
 
+**Use this repository if you are designing or studying the protocol.** If you need a cloud controller, model provider integration, approval service, or local tool client, use [Iskrov Agent](https://github.com/entzauberung/iskrov-agent) instead.
+
 PRP does not define a cloud topology, model API, or tool runtime. It defines how a task advances:
 
 ```text
@@ -93,6 +95,8 @@ Other runtimes can implement PRP without using Iskrov Agent. Iskrov Agent can ev
 ## Research Status
 
 This repository contains a reference kernel and conformance tests. The hypotheses and evaluation questions are documented in [paper/thesis.md](paper/thesis.md). Related papers are context, not claims that PRP reproduces their methods or results.
+
+The current kernel is intentionally small. It is a protocol reference and an executable set of laws, not a claim of production readiness or benchmark superiority.
 
 ## License
 
