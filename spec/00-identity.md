@@ -3,12 +3,13 @@
 ## Object
 
 Progressive Reasoning Protocol (PRP) specifies how a reasoning process
-advances. It does not specify where the process runs, which model is
+advances through evidence-backed graph versions. Progressive revision is the
+protocol object. It does not specify where the process runs, which model is
 called, or which operating-system tools are available.
 
 ## Normative layers
 
-1. Vocabulary: closed enumerations for strategy, status, verdict, and stop.
+1. Vocabulary: closed enumerations for status, verdict, comparison, and stop.
 2. Facts: immutable records whose shape is part of the protocol.
 3. Machines: legal status transitions. Illegal transitions are errors.
 4. Revision: whether a new graph version may be created.

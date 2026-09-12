@@ -11,6 +11,10 @@ This protocol does not specify:
 - Compatibility with Codex, Claude Code, MCP, or A2A
 - Training, fine-tuning, or leaderboard claims
 
+`DIRECT`, `CASCADE`, and `PLANNED` are runtime routing strategies. They may
+appear in an implementation's compatibility vocabulary, but PRP defines no
+algorithm for them. The only protocol-level strategy is Progressive revision.
+
 An agent product may need all of the above. PRP does not.
 
 ## Research non-claims

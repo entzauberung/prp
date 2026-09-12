@@ -1,80 +1,44 @@
 # Progressive Reasoning Protocol
 
-[English](README.en.md)
+> Evidence-gated revision for Agent work that must be inspectable, revisable, and stoppable.
 
-> Evidence-gated reasoning for work that must be inspectable, revisable, and stoppable.
+Progressive Reasoning Protocol (PRP) is a small, independent protocol and research kernel. It defines when an execution graph may advance to a new version based on public facts and evidence. It does not define a model, provider, transport, tool runtime, or cloud topology.
 
-Progressive Reasoning Protocol (PRP) is an independent open protocol and research kernel for turning a model-driven task into a sequence of public, verifiable facts.
+Use this repository to study or implement evidence-gated progressive execution. Use [Iskrov Agent](https://github.com/entzauberung/iskrov-agent) when you need a complete cloud-controlled Agent runtime.
 
-**Use this repository if you are designing or studying the protocol.** If you need a cloud controller, model provider integration, approval service, or local tool client, use [Iskrov Agent](https://github.com/entzauberung/iskrov-agent) instead.
-
-PRP does not define a cloud topology, model API, or tool runtime. It defines how a task advances:
+## Protocol lifecycle
 
 ```text
-plan -> execute -> observe -> verify -> revise or stop
+graph version N
+      |
+      v
+public facts -> deterministic verification -> comparison
+                                      |
+              PASS / NO_GAIN / REGRESSION / BUDGET -> STOP
+                                      |
+              trigger + declared budget -> graph version N + 1
 ```
 
-## What PRP Specifies
+Progressive revision is not an instruction to ask a model again. A revision requires a recorded trigger, a finite revision budget, available resources, and a comparison that has not regressed. `INCONCLUSIVE` remains its own verdict and cannot be treated as success.
 
-- **Vocabulary**: closed values for strategies, lifecycle states, verdicts, and stop reasons.
-- **Facts**: typed records for runs, work units, attempts, artifacts, evidence, and events.
-- **State machines**: legal transitions with immutable terminal history.
-- **Revision laws**: deterministic rules for opening a new graph version or stopping.
+## What the protocol defines
 
-The protocol does not store private reasoning traces. It stores the facts needed to audit what was allowed, what was produced, what verified it, and why the process continued or stopped.
+- Closed vocabulary for lifecycle states, verification, comparison, revision, reuse, and stop reasons.
+- Public facts for runs, work units, attempts, artifacts, evidence, and events.
+- State machines whose terminal states cannot return to running states.
+- Immutable graph versions: revision creates new facts and does not rewrite historical work.
+- Conservative reuse based on lineage, fingerprints, dependency facts, round facts, and proven attempt history.
 
-## The Progressive Principle
+`DIRECT`, `CASCADE`, and `PLANNED` are runtime routing strategies that may host PRP. They are compatibility vocabulary, not protocol research objects.
 
-Progressive reasoning is not “ask the model again”. A new graph version requires a recorded trigger, an explicit revision budget, and sufficient remaining resources.
+## Reference implementation
 
-```text
-current graph -> verification or provider fact
-                       |
-                       +--> PASS / NO_GAIN / REGRESSION / BUDGET -> STOP
-                       |
-                       +--> deterministic or retryable failure -> new graph version
-```
-
-`INCONCLUSIVE` is a first-class verdict. A check that cannot decide is neither silently accepted nor misclassified as a failure.
-
-## Core Invariants
-
-1. A terminal state cannot return to a running state.
-2. A revision creates a new graph version; it does not rewrite history.
-3. A successful result may be reused only when its public lineage, fingerprints, and dependency facts match.
-4. Missing evidence or malformed fingerprints force recomputation.
-5. Cancellation, budget exhaustion, no gain, and regression are explicit stop reasons.
-6. Planner proposals are bounded, closed graphs; a proposal is not execution.
-
-## Strategies
-
-| Strategy | Role |
-|---|---|
-| `DIRECT` | One work unit and one verification |
-| `CASCADE` | Move to a fallback after a retryable failure |
-| `PLANNED` | Execute a bounded dependency graph |
-| `PROGRESSIVE` | Compare evidence across graph versions and revise within limits |
-
-The research focus of this repository is `PROGRESSIVE`. The other values define implementation boundaries and conformance vocabulary.
-
-## Repository Layout
-
-```text
-spec/     normative protocol notes and boundaries
-paper/    thesis, hypotheses, and related work
-src/prp/  dependency-free reference kernel
-tests/    conformance tests for protocol laws
-```
-
-The kernel intentionally contains no HTTP server, database, CLI, provider adapter, bridge client, workspace tool, or scheduler.
-
-## Minimal Example
+The package is a dependency-free Python reference kernel:
 
 ```python
-from prp.revision import decide_revision
-from prp.vocabulary import VerificationResult
+from prp import VerificationResult, decide_progressive
 
-decision = decide_revision(
+decision = decide_progressive(
     verification_result=VerificationResult.FAIL,
     revision_count=0,
     graph_version=1,
@@ -84,19 +48,32 @@ decision = decide_revision(
 assert decision.next_graph_version == 2
 ```
 
-This is a pure decision: it performs no model call and changes no files.
+The function is pure: it performs no model call, file write, network request, or persistence operation.
 
-## PRP and Iskrov Agent
+## Repository layout
 
-PRP is an independent protocol project. [Iskrov Agent](https://github.com/entzauberung/iskrov-agent) is a separate AGPL-3.0-only product that implements an agent runtime and uses progressive execution as one of its strategies.
+```text
+spec/     normative protocol identity, facts, machines, and boundaries
+paper/    thesis, hypotheses, and related work
+src/prp/  dependency-free reference kernel
+tests/    conformance tests for protocol laws
+```
 
-Other runtimes can implement PRP without using Iskrov Agent. Iskrov Agent can evolve its product topology without changing the identity of this protocol.
+The repository intentionally contains no HTTP server, database, provider adapter, Bridge client, workspace tool, scheduler, or private reasoning trace.
 
-## Research Status
+## Research status
 
-This repository contains a reference kernel and conformance tests. The hypotheses and evaluation questions are documented in [paper/thesis.md](paper/thesis.md). Related papers are context, not claims that PRP reproduces their methods or results.
+PRP 0.0.2 is a reference kernel and executable set of laws. Its hypotheses are documented in [paper/thesis.md](paper/thesis.md); related work is context, not a reproduction or benchmark claim. The project makes no production SLA or model-quality claim.
 
-The current kernel is intentionally small. It is a protocol reference and an executable set of laws, not a claim of production readiness or benchmark superiority.
+## Development
+
+```bash
+python -m pip install -e '.[dev]'
+pytest -q
+ruff check .
+```
+
+Python 3.12 or newer is required.
 
 ## License
 

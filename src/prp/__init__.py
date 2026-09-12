@@ -11,6 +11,7 @@ from prp.machines import (
     can_transition_work_unit,
 )
 from prp.revision import RevisionDecision, decide_reuse, decide_revision
+from prp.progressive import ComparisonOutcome, ProgressiveDecision, decide_progressive
 from prp.vocabulary import (
     AttemptStatus,
     ExecutionStrategy,
@@ -33,6 +34,7 @@ __all__ = [
     "ReuseDisposition",
     "ReuseReason",
     "RevisionDecision",
+    "ProgressiveDecision",
     "RevisionDisposition",
     "RevisionStopReason",
     "RunStatus",
@@ -44,6 +46,8 @@ __all__ = [
     "can_transition_work_unit",
     "decide_reuse",
     "decide_revision",
+    "decide_progressive",
+    "ComparisonOutcome",
 ]
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"

@@ -4,15 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prp-protocol"
-version = "0.0.1"
+version = "0.0.2"
 description = "Progressive Reasoning Protocol: specification and pure kernel"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE-APACHE", "NOTICE"]
 authors = [{ name = "PRP Protocol Authors" }]
-
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/entzauberung/prp"
+Issues = "https://github.com/entzauberung/prp/issues"
+Documentation = "https://github.com/entzauberung/prp#readme"
 
 [project.optional-dependencies]
 dev = [

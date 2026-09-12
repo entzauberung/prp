@@ -24,6 +24,11 @@ That distinction is the research object:
 - PRP revises a persistent graph only when a deterministic trigger,
   a finite budget, and a non-regressing comparison all hold.
 
+The protocol intentionally leaves model routing, tool execution, storage, and
+transport to an Agent runtime. This keeps the research claim testable: a
+runtime can be replaced without changing the law that decides whether the
+next graph version is allowed.
+
 ## Hypotheses
 
 H1. Evidence-gated revision reduces undetected false completion relative
