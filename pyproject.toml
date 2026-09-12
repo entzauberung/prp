@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "prp-protocol"
 version = "0.0.2"
-description = "Progressive Reasoning Protocol: specification and pure kernel"
+description = "Evidence-gated progressive revision protocol and dependency-free Python reference kernel"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
